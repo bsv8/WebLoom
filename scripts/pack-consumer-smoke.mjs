@@ -132,7 +132,7 @@ function isLocalAbsolutePath(value) {
 }
 
 function assertPackMetadata(packInfo, tarball) {
-  if (!packInfo || packInfo.name !== "webloom") {
+  if (!packInfo || packInfo.name !== "webloom-framework") {
     throw new Error(`npm pack 返回了意外的包名：${packInfo?.name ?? "<unknown>"}`);
   }
   if (!Array.isArray(packInfo.files) || packInfo.files.length === 0) {
@@ -265,9 +265,9 @@ try {
 
   // core-only 消费者不安装 React；同时用 tsc 验证公开核心声明。
   const coreConsumer = join(smokeRoot, "core-consumer");
-  installConsumer(coreConsumer, "webloom-core-consumer", { webloom: dependency });
+  installConsumer(coreConsumer, "webloom-core-consumer", { "webloom-framework": dependency });
   writeTypeSmoke(coreConsumer, `
-    import { createPluginHost, type PluginManifest, type PluginSetup } from "webloom";
+    import { createPluginHost, type PluginManifest, type PluginSetup } from "webloom-framework";
 
     const setup: PluginSetup = (context) => {
       context.provide("demo.service", { value: 1 });
@@ -292,17 +292,17 @@ try {
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(coreConsumer);
   runRuntimeSmoke(coreConsumer, `
-    const core = await import("webloom");
-    if (typeof core.createPluginHost !== "function") throw new Error("webloom core entry is unavailable");
-    const testing = await import("webloom/testing");
-    if (typeof testing.createFakePluginHost !== "function") throw new Error("webloom/testing entry is unavailable");
+    const core = await import("webloom-framework");
+    if (typeof core.createPluginHost !== "function") throw new Error("webloom-framework core entry is unavailable");
+    const testing = await import("webloom-framework/testing");
+    if (typeof testing.createFakePluginHost !== "function") throw new Error("webloom-framework/testing entry is unavailable");
     console.log("core-only consumer smoke passed");
   `);
 
-  // React 消费者安装 React 和声明包，验证 webloom/react 的运行时及类型边界。
+  // React 消费者安装 React 和声明包，验证 webloom-framework/react 的运行时及类型边界。
   const reactConsumer = join(smokeRoot, "react-consumer");
   installConsumer(reactConsumer, "webloom-react-consumer", {
-    webloom: dependency,
+    "webloom-framework": dependency,
     react: "18.3.1",
     "react-dom": "18.3.1",
   }, {
@@ -311,8 +311,8 @@ try {
   });
   writeTypeSmoke(reactConsumer, `
     import { createElement, type ReactElement } from "react";
-    import { createPluginHost } from "webloom";
-    import { PluginHostProvider, usePluginRuntime } from "webloom/react";
+    import { createPluginHost } from "webloom-framework";
+    import { PluginHostProvider, usePluginRuntime } from "webloom-framework/react";
 
     const host = createPluginHost();
     function Probe(): ReactElement {
@@ -327,20 +327,20 @@ try {
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(reactConsumer);
   runRuntimeSmoke(reactConsumer, `
-    const react = await import("webloom/react");
-    if (typeof react.PluginHostProvider !== "function") throw new Error("webloom/react entry is unavailable");
-    const testing = await import("webloom/testing");
-    if (typeof testing.createFakePluginHost !== "function") throw new Error("webloom/testing entry is unavailable");
+    const react = await import("webloom-framework/react");
+    if (typeof react.PluginHostProvider !== "function") throw new Error("webloom-framework/react entry is unavailable");
+    const testing = await import("webloom-framework/testing");
+    if (typeof testing.createFakePluginHost !== "function") throw new Error("webloom-framework/testing entry is unavailable");
     await import("react-dom");
     console.log("react consumer smoke passed");
   `);
 
   // Worker 消费者不安装 React；其声明只使用 ES2022 + WebWorker lib。
   const workerConsumer = join(smokeRoot, "worker-consumer");
-  installConsumer(workerConsumer, "webloom-worker-consumer", { webloom: dependency });
+  installConsumer(workerConsumer, "webloom-worker-consumer", { "webloom-framework": dependency });
   writeTypeSmoke(workerConsumer, `
     /// <reference lib="webworker" />
-    import { createPluginHost, type PluginHost } from "webloom";
+    import { createPluginHost, type PluginHost } from "webloom-framework";
 
     const workerScope: WorkerGlobalScope = self;
     const host: PluginHost = createPluginHost();
@@ -350,7 +350,7 @@ try {
   typecheckConsumer(workerConsumer);
   writeFileSync(join(workerConsumer, "worker-runtime.mjs"), [
     'import { parentPort } from "node:worker_threads";',
-    'const core = await import("webloom");',
+    'const core = await import("webloom-framework");',
     'parentPort?.postMessage(typeof core.createPluginHost === "function");',
   ].join("\n"));
   runRuntimeSmoke(workerConsumer, `
@@ -361,7 +361,7 @@ try {
       worker.once("error", reject);
     });
     await worker.terminate();
-    if (available !== true) throw new Error("webloom core entry is unavailable in a Worker");
+    if (available !== true) throw new Error("webloom-framework core entry is unavailable in a Worker");
     console.log("worker consumer smoke passed");
   `);
 

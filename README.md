@@ -5,21 +5,21 @@ WebLoom 是一个与产品领域无关的前端插件生命周期框架。它管
 ## 安装
 
 ```bash
-pnpm add webloom
+pnpm add webloom-framework
 ```
 
 WebLoom 是 ESM 单包，提供三个入口：
 
-- `webloom`：纯 TypeScript/Worker 可用的核心，不加载 React；
-- `webloom/react`：Provider、capability、Host、Registry 和 Resource Hooks；
-- `webloom/testing`：无产品语义的假 Host、假传输和测试辅助。
+- `webloom-framework`：纯 TypeScript/Worker 可用的核心，不加载 React；
+- `webloom-framework/react`：Provider、capability、Host、Registry 和 Resource Hooks；
+- `webloom-framework/testing`：无产品语义的假 Host、假传输和测试辅助。
 
-React 是可选 peer dependency。只使用 `webloom` 时不需要安装 React。
+React 是可选 peer dependency。只使用 `webloom-framework` 时不需要安装 React。
 
 ## 最小 Host
 
 ```ts
-import { createPluginHost, type PluginSetup } from "webloom";
+import { createPluginHost, type PluginSetup } from "webloom-framework";
 
 const helloSetup: PluginSetup = (ctx) => {
   ctx.provide("hello.service", { value: "world" });
