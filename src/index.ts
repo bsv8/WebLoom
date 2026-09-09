@@ -10,6 +10,15 @@ export * from "./host/pluginGraph.js";
 export * from "./host/createPluginHost.js";
 export * from "./host/runtimeUnitImplementationRegistry.js";
 
+export * from "./authoring/definePlugin.js";
+export * from "./runtime/pluginDefinitions.js";
+
+export * from "./runtime/runtimeTypes.js";
+export * from "./runtime/runtimeProtocol.js";
+export * from "./runtime/windowRuntime.js";
+export * from "./runtime/sharedWorkerHost.js";
+export * from "./runtime/connectSharedWorker.js";
+
 export * from "./messaging/messageBus.js";
 
 export * from "./lifecycle/resourceScope.js";

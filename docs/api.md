@@ -1,29 +1,171 @@
 # WebLoom API 说明
 
-## 依赖和运行单元
+## 浏览器 Runtime
 
-`PluginManifest` 描述一个产品，`RuntimeUnitDescriptor` 描述该产品在某个 `execution` 环境中的运行单元。`pluginId` 是产品级稳定身份，`unitId` 是单元级稳定身份，`instanceId` 是每次启动新生成的实例身份。运行单元依赖必须同时声明 `capability`、`contractVersion`、`sourceExecution` 和 `scope`，Host 不根据 capability 名猜测远端服务。可执行 setup 必须由宿主的 `runtimeUnitImplementationRegistry` 按 `pluginId + unitId` 提供，静态清单不携带函数。
+WebLoom v1 只支持两个真实 JavaScript realm：`window-main` 和
+`shared-worker`。`runtime` 是受限的 `RuntimeKind`，不是可自由填写的环境标签；
+不支持的 runtime 在装配边界 fail closed。v1 不实现 Server、Service Worker 或
+其它服务端 PluginHost。
 
-`meta.defaultEnabled` 是初始启用意图，`PluginState.kind` 是实际运行状态。两者必须分开读取：依赖缺失时可以得到 `blocked`，同时保留 `desiredEnabled: true`。
+一次 Runtime 启动会生成不可复用的 `runtimeInstanceId`。每个插件运行单元启动
+会生成不可复用的 `unitInstanceId`（在 Host 的兼容状态接口中表现为
+`instanceId`）。同一 SharedWorker 接收多个 Window 连接时，Worker 单元仍只有
+一个实例；每条端口连接拥有独立的 `connectionId`、请求和取消空间。
 
-## Context 和 Scope
+## 普通插件 API
 
-`PluginContext` 的基础字段只包含插件身份、实例身份、Scope、取消信号、权限租约、MessageBus、配置和 capability 访问。产品服务通过 `contextExtension` 注入，扩展属性按只读对象处理。
+```ts
+import { createWindowApp, definePlugin } from "webloom-framework";
 
-`LifecycleScope.revoke()` 是同步安全边界：它先阻止新资源、撤销权限租约并触发 `AbortSignal`；`dispose()` 再等待清理。清理失败和超时通过 `LifecycleDisposeResult` 暴露，不能被包装成成功。异步创建在撤权后才返回时，资源会立即释放且不会进入旧实例。
+const hello = definePlugin({
+  id: "hello",
+  provides: ["hello.service"],
+  setup(ctx) {
+    ctx.provide("hello.service", { value: "world" });
+    ctx.onDispose(() => {
+      // 释放本插件登记的资源。
+    });
+  },
+});
 
-## 权限
+const app = await createWindowApp({ plugins: [hello] });
+const service = app.capability<{ value: string }>("hello.service");
+```
 
-权限租约把插件申请、可信批准和会话约束求交集。`permissions` 只是 Context 视图，最终远端调用或持久化写入仍需使用 `verifyPermissionLease()` 和 `assertBinding()` 做 fail-closed 检查。`attributes` 参与租约身份比较，但不作为任意数据仓库。
+`definePlugin()` 将静态 `manifest/descriptor` 与当前 realm 的 `setup` 分开保存。
+静态 descriptor 可用于验证和快照，不携带函数。`createWindowApp()` 自动固定
+`window-main`、生成实例身份、创建内部 Implementation Registry、批量注册并
+等待初始启动；使用者不需要手工 `register()`。
+
+`createWindowApp()` 的 Promise 只有在必需插件成功后才成功。失败会抛出包含
+`pluginId`、`unitId` 和 `phase` 的 `RuntimeInitializationError`。非必需插件的
+失败保留在 Runtime 快照中，不会被伪装为 running。
+
+## SharedWorker
+
+Worker 入口：
+
+```ts
+import { definePlugin, startSharedWorkerApp } from "webloom-framework";
+
+const storage = definePlugin({
+  id: "storage",
+  provides: ["storage.service"],
+  setup(ctx) {
+    ctx.provide("storage.service", {
+      handle(request: { key: string }) {
+        return { key: request.key };
+      },
+    });
+  },
+});
+
+startSharedWorkerApp({ id: "coordinator", plugins: [storage] });
+```
+
+Window 入口：
+
+```ts
+// Vite emits a hashed JavaScript SharedWorker asset from this importer.
+import coordinatorWorkerUrl from "./coordinator.worker.ts?sharedworker&url";
+import { connectSharedWorker } from "webloom-framework";
+
+const runtime = await connectSharedWorker({
+  id: "coordinator",
+  url: coordinatorWorkerUrl,
+});
+
+const storage = runtime.capability("storage.service");
+await storage.call({ key: "hello" });
+```
+
+连接入口必须创建真实的 `new SharedWorker(url, { type: "module" })`。握手成功
+后必须先收到完整 baseline；后续快照 revision 必须连续。断线、revision gap、
+Worker 重启或 Provider 实例变化都会同步撤销旧代理。重连只建立新连接和新代理，
+不会重放可能产生外部副作用的调用，也不会静默替换旧代理的绑定。
+
+这里的 `url` 必须是 Bundler 产出的 JavaScript Worker URL。Vite 使用
+`?sharedworker&url` 或等价的独立 Rollup entry；不要把
+`new URL("./coordinator.worker.ts", import.meta.url)` 作为普通参数传入框架，
+因为框架内部的 `new SharedWorker()` 不会让 Vite 重新发现调用方源码入口。
+
+`RuntimeHandle` 提供：
+
+| 成员 | 语义 |
+| --- | --- |
+| `runtimeId` | Worker 的逻辑标识 |
+| `runtimeInstanceId` | 当前 Worker 物理启动身份 |
+| `connectionId` | 当前 Window 物理连接身份 |
+| `state()` | `connecting / ready / disconnected / failed / disposed` 快照 |
+| `ready()` | 等待握手和完整 baseline；不可自动重连的断线、failed 或 disposed 后持续拒绝 `RuntimeUnavailableError`，自动重连时只等待新的 readiness generation |
+| `capability()` | 获取绑定 Runtime、Provider、契约版本和 revision 的代理 |
+| `subscribe()` | 观察 Runtime/Unit/服务快照 |
+| `dispose()` | 同步撤销本句柄，异步关闭连接资源 |
+
+### Window 投影 Worker capability
+
+Window Host 不会根据 Worker manifest 创建假运行单元。需要使用 Worker capability
+的页面插件应把已经 `ready` 的句柄传给 Window App：
+
+```ts
+const app = await createWindowApp({
+  remoteRuntime: runtime,
+  plugins: [definePlugin({
+    id: "window-consumer",
+    dependencies: [{
+      capability: "coordinator.service",
+      contractVersion: "coordinator.service.v1",
+      sourceRuntime: "shared-worker",
+    }],
+    async setup(ctx) {
+      const coordinator = ctx.serviceBridge?.requireProxy({
+        capabilityId: "coordinator.service",
+        contractVersion: "coordinator.service.v1",
+        runtime: "shared-worker",
+      }, ctx.scope);
+      ctx.provide("window.coordinator", await coordinator.call({ type: "health" }));
+    },
+  })],
+});
+```
+
+`remoteRuntime` 只向 Host 投影当前 baseline/revision 中的服务和单元状态；setup
+函数不会进入 Worker。断线时 Host 同步撤销页面插件的 Scope 和远程代理，重连后的
+新代理必须重新取得，不会静默重绑旧引用。
+
+## 生命周期和 Scope
+
+RuntimeUnit 实例存在的条件是：目标 Runtime 存活、插件启用意图为 true、硬依赖
+已就绪并且当前 Runtime 已装配实现。每个实例仍由框架创建一个内部
+`ResourceScope`，用于 `AbortSignal`、capability ownership、task/subscription
+ownership 和 cleanup callbacks；这个 Scope 不再从用户声明的生命周期分类推导。
+
+停用顺序固定为：同步阻止新 capability 和调用、撤销旧引用、触发 Scope
+`AbortSignal`、执行 setup teardown 与 `ctx.onDispose()`，最后发布停止/清理状态。
+`revoke()` 先形成安全边界，`dispose()` 再等待异步收尾；清理失败和超时通过
+`LifecycleDisposeResult` 暴露。
+
+领域状态（例如 owner、session epoch、Vault lock/unlock、桶世代和最终 I/O
+fence）不属于 WebLoom Runtime 生命周期。应用自己的 Coordinator/服务控制器
+负责推进领域状态，再通过新的服务快照让旧代理失效。
+
+## 依赖和契约
+
+跨 Runtime 依赖必须声明精确的 `contractVersion` 和 `sourceRuntime`。本地
+capability 可以使用 `runtimeCapabilityContractVersion()` 或
+`defineRuntimeUnitProvidedContracts()` 生成默认 v1 版本；框架不会根据 capability
+名称猜测远端服务。`providedContracts`、Provider 实例身份、Runtime 启动身份和
+快照 revision 都参与代理绑定。
 
 ## 服务桥和 wire codec
 
-`createServiceBridge()` 只接受同一连接、权威身份、连续快照和精确契约版本。旧 revision、revision gap、Provider 实例重建和断线都会使旧代理永久失效。传输层每次调用生成独立 `callId`；业务 `operationId` 可以重用，两者不混淆。
+低层 `createServiceBridge()` 仍可用于复杂打包和协议扩展。它只接受同一连接、
+权威身份、连续快照和精确契约版本；传输层每次调用生成独立 `callId`，业务
+`operationId` 可以复用但不参与响应关联。默认消息 codec 生成
+`webloom.remote-service.*`；迁移旧协议时可传入显式前缀。
 
-`createRemoteServiceMessageCodec()` 默认生成 `webloom.remote-service.*` 消息名。产品迁移旧协议时可以传入旧前缀，编码、解码和版本仍由 codec 集中负责。
-
-## 宿主扩展点
-
-`CreatePluginHostOptions` 提供 `capabilities`、`contextExtension`、`manifestValidator`、`scopeResolver`、`permissionPolicy`、`configStore`、`pluginIntentCoordinator`、`runtimeSnapshots`、`contributionAdapters` 和 `serviceBridgeForPlugin`。WebLoom 不创建产品 Registry、日志、存储或身份状态机。
-
-贡献适配器返回的 `ContributionHandle` 支持 `revoke()` 和 `dispose()`：前者用于同步撤下入口，后者用于等待异步收尾。任何贡献都必须绑定当前 `instanceId` 和 Scope。
+普通插件不需要接触 `MessagePort`、握手或 codec。测试中的 `MessageChannel` 只
+证明 transport simulation；真实浏览器验收仍需确认 `Window` 与
+`SharedWorkerGlobalScope` 的 realm marker、setup 次数和多页面连接行为。
+仓库提供 `scripts/browser-runtime-fixture/` 与 `pnpm run test:browser`；缺少
+Playwright/Chromium 时脚本明确报告 unsupported，不回退为 Node 或同页面模拟。

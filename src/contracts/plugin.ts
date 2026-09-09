@@ -7,11 +7,10 @@
 import type { MessageBus } from "./messageBus.js";
 import type {
   LifecycleScope,
-  PluginExecution,
-  PluginLifetime,
   PluginPermission,
   PermissionLease,
   RemoteServiceBridge,
+  RuntimeKind,
   ScopedTaskScheduler,
 } from "./lifecycle.js";
 
@@ -68,21 +67,22 @@ export interface PluginContext<
   readonly config?: TConfig;
 }
 
-/** 产品级依赖描述；简单插件可使用，跨环境单元应使用严格依赖。 */
-export interface PluginDependency {
+/** v1 运行时依赖；跨 Runtime 绑定必须使用精确契约版本和来源 Runtime。 */
+export interface RuntimeDependency {
   /** 依赖的 capability 标识。 */
   capability: string;
-  /** 精确契约版本；跨环境依赖不得省略。 */
+  /** 精确契约版本；跨 Runtime 依赖必须显式填写，本地可由 helper 推导。 */
   contractVersion?: string;
-  /** 提供者代码所在执行环境；由宿主定义。 */
-  sourceExecution?: PluginExecution;
-  /** 提供者允许存在的生命周期；由宿主定义。 */
-  scope?: PluginLifetime;
+  /** 提供者实际运行空间；省略时由当前 Runtime 补齐。 */
+  sourceRuntime?: RuntimeKind;
   /** 可选的人类可读诊断说明。 */
   reason?: string;
   /** 缺失时只关闭局部能力，不阻止主体运行。 */
   optional?: boolean;
 }
+
+/** 简单插件的产品级依赖别名。 */
+export type PluginDependency = RuntimeDependency;
 
 /** 运行单元的严格依赖描述。 */
 export interface RuntimeUnitDependency {
@@ -90,15 +90,19 @@ export interface RuntimeUnitDependency {
   capability: string;
   /** 精确契约版本；第一阶段只接受完全匹配。 */
   contractVersion: string;
-  /** 提供者实际运行环境。 */
-  sourceExecution: PluginExecution;
-  /** 提供者允许存在的生命周期。 */
-  scope: PluginLifetime;
+  /** 提供者实际运行空间；跨 Runtime 依赖在 materialize/validate 边界必须补齐。 */
+  sourceRuntime: RuntimeKind;
   /** 可选的人类可读诊断说明。 */
   reason?: string;
   /** 缺失时只关闭局部能力；未填写表示硬依赖。 */
   optional?: boolean;
 }
+
+/** 作者入口的未归一化 unit 依赖；进入 Host 前必须补齐版本和来源 Runtime。 */
+export type RuntimeUnitDependencyInput = Omit<RuntimeUnitDependency, "contractVersion" | "sourceRuntime"> & {
+  contractVersion?: string;
+  sourceRuntime?: RuntimeKind;
+};
 
 /** 返回稳定的 capability 契约版本。 */
 export function runtimeCapabilityContractVersion(capability: string): string {
@@ -108,13 +112,12 @@ export function runtimeCapabilityContractVersion(capability: string): string {
 /** 将依赖清单补齐为严格运行单元依赖。 */
 export function defineRuntimeUnitDependencies(
   dependencies: readonly Pick<PluginDependency, "capability" | "reason" | "optional">[],
-  defaults: Partial<Pick<RuntimeUnitDependency, "sourceExecution" | "scope">> = {},
+  defaults: { sourceRuntime: RuntimeKind },
 ): RuntimeUnitDependency[] {
   return dependencies.map((dependency) => ({
     capability: dependency.capability,
     contractVersion: runtimeCapabilityContractVersion(dependency.capability),
-    sourceExecution: defaults.sourceExecution ?? "default",
-    scope: defaults.scope ?? "root",
+    sourceRuntime: defaults.sourceRuntime,
     ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
     ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
   }));
@@ -132,22 +135,14 @@ export function defineRuntimeUnitProvidedContracts(
 /** 插件在产品清单中的启动要求。 */
 export type PluginStartupMode = "required" | "optional";
 
-/** 插件展示元数据；kind、group 和 execution 都由宿主或产品定义。 */
+/** 插件装配元数据；v1 不解释产品分类字段。 */
 export interface PluginMeta {
-  /** 产品自定义分类，不由 WebLoom 解释。 */
-  kind?: string;
   /** 首次装配时默认是否启用。 */
   defaultEnabled: boolean;
   /** 是否允许产品控制面禁用。 */
   canDisable: boolean;
   /** 是否属于启动必需插件。 */
   startup?: PluginStartupMode;
-  /** 产品自定义展示分组。 */
-  displayGroup?: string;
-  /** 默认运行生命周期；未填写时使用宿主默认值。 */
-  lifetime?: PluginLifetime;
-  /** 默认执行环境；不从 UI 或实现类型推断。 */
-  execution?: PluginExecution;
 }
 
 /** 插件 setup 返回的清理函数。 */
@@ -176,10 +171,8 @@ export interface RuntimeUnitDescriptor<
 > {
   /** 稳定运行单元标识。 */
   id: string;
-  /** 运行代码所在环境。 */
-  execution: PluginExecution;
-  /** 依附的作用域寿命。 */
-  lifetime: PluginLifetime;
+  /** 运行代码所在真实 Runtime。 */
+  runtime: RuntimeKind;
   /** 本单元所需的精确 capability 契约。 */
   dependencies?: RuntimeUnitDependency[];
   /** 本单元提供的 capability。 */
@@ -193,6 +186,15 @@ export interface RuntimeUnitDescriptor<
   /** 单元专属只读配置声明或装配默认值。 */
   config?: TConfig;
 }
+
+/** 作者入口的未归一化运行单元；runtime 可由 createWindowApp/startSharedWorkerApp 注入。 */
+export type RuntimeUnitDescriptorInput<
+  TContribution = PluginContribution,
+  TConfig extends PluginConfig = PluginConfig,
+> = Omit<RuntimeUnitDescriptor<TContribution, TConfig>, "runtime" | "dependencies"> & {
+  runtime?: RuntimeKind;
+  dependencies?: readonly RuntimeUnitDependencyInput[];
+};
 
 /** 插件清单；插件作者导出的唯一静态描述。 */
 export interface PluginManifest<
@@ -221,6 +223,15 @@ export interface PluginManifest<
   /** 简单插件的只读配置。 */
   config?: TConfig;
 }
+
+/** 作者入口的未归一化静态清单；进入 Host 前必须 materialize 成 PluginManifest。 */
+export type PluginManifestInput<
+  TContribution = PluginContribution,
+  TConfig extends PluginConfig = PluginConfig,
+  TExtension extends PluginContextExtension = PluginContextExtension,
+> = Omit<PluginManifest<TContribution, TConfig, TExtension>, "units"> & {
+  units?: readonly RuntimeUnitDescriptorInput<TContribution, TConfig>[];
+};
 
 /** 插件运行状态类别；registered 不代表已经运行。 */
 export type PluginStateKind =
@@ -269,8 +280,8 @@ export interface PluginUnitState {
   pluginId: string;
   /** 稳定运行单元标识。 */
   unitId: string;
-  /** 运行环境。 */
-  execution: PluginExecution;
+  /** 真实运行空间。 */
+  runtime: RuntimeKind;
   /** 当前运行实例。 */
   instanceId?: string;
   /** 当前意图修订。 */
@@ -321,8 +332,8 @@ export interface PluginUnitGraph {
   pluginId: string;
   /** 稳定运行单元标识。 */
   unitId: string;
-  /** 运行环境。 */
-  execution: PluginExecution;
+  /** 真实运行空间。 */
+  runtime: RuntimeKind;
   /** capability 依赖。 */
   dependencies: string[];
   /** 精确依赖描述。 */
@@ -354,6 +365,8 @@ export interface StartupCapabilityErrorDetails {
 export interface StartupPluginErrorDetails {
   /** 产品标识。 */
   pluginId: string;
+  /** 失败的运行单元。 */
+  unitId?: string;
   /** 能力列表。 */
   capabilities: string[];
   /** 当前状态。 */

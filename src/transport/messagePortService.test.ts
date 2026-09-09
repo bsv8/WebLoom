@@ -15,7 +15,7 @@ function reference(providerInstanceId = "provider-1"): RemoteServiceReference {
   return {
     capabilityId: "demo.service",
     providerInstanceId,
-    execution: "worker",
+    runtime: "shared-worker",
     contractVersion: "1.0.0",
     authorityInstanceId: "authority-1",
     scopeId: "scope-1",

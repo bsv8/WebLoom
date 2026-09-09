@@ -74,15 +74,11 @@ describe("WebLoom Plugin Host", () => {
     await host.dispose();
   });
 
-  it("通过 Scope Resolver、Context Extension 和权限策略隔离实例", async () => {
+  it("通过 Runtime 实例 Scope、Context Extension 和权限策略隔离实例", async () => {
     let seenScopeId = "";
     let seenExtension: Readonly<Record<string, unknown>> | undefined;
     const fixture = createFixtureHost({
-      scopeResolver: {
-        resolve() {
-          return { available: true, attributes: { tenant: "alpha" }, key: "tenant:alpha" };
-        },
-      },
+      rootAttributes: { tenant: "alpha" },
       contextExtension: ({ scope }) => ({
         service: { scopeId: scope.identity.scopeId },
       }),
@@ -94,7 +90,7 @@ describe("WebLoom Plugin Host", () => {
     fixture.register("isolated", (ctx) => {
       seenScopeId = ctx.scope.identity.scopeId;
       seenExtension = ctx.extension;
-      expect(ctx.scope.identity.attributes).toEqual({ tenant: "alpha" });
+      expect(ctx.scope.identity.attributes).toMatchObject({ tenant: "alpha" });
       expect(ctx.permissions).toEqual(["read"]);
       expect(() => ctx.permissionLease.assert("write")).toThrow();
     });

@@ -93,9 +93,10 @@ function referenceKey(reference: RemoteServiceReference): string {
   return [
     reference.capabilityId,
     reference.providerInstanceId,
-    reference.execution,
+    reference.runtime,
     reference.contractVersion,
     reference.authorityInstanceId,
+    reference.connectionId ?? "local",
     reference.scopeId,
     reference.handoverGeneration,
     stableAttributes(reference.attributes),
@@ -111,7 +112,7 @@ function lookupMatches(reference: RemoteServiceReference, lookup: RemoteServiceL
   return reference.status === "ready"
     && reference.capabilityId === lookup.capabilityId
     && reference.contractVersion === lookup.contractVersion
-    && (lookup.execution === undefined || reference.execution === lookup.execution)
+    && (lookup.runtime === undefined || reference.runtime === lookup.runtime)
     && (lookup.scopeId === undefined || reference.scopeId === lookup.scopeId);
 }
 
@@ -269,6 +270,7 @@ export function createServiceBridge(options: CreateServiceBridgeOptions): Remote
         // 不自洽的条目按 fail-closed 处理：忽略它，而不是猜测兼容版本。
         if (
           reference.authorityInstanceId !== currentAuthorityInstanceId
+          || reference.connectionId !== undefined && reference.connectionId !== snapshot.connectionId
           || reference.snapshotRevision !== snapshot.snapshotRevision
         ) continue;
         next.set(referenceKey(reference), Object.freeze({ ...reference }));

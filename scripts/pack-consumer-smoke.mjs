@@ -31,6 +31,7 @@ const allowedPackFiles = [
   /^LICENSE$/,
   /^README\.md$/,
   /^docs\/(?:api|migration-baseline)\.md$/,
+  /^docs\/proposals\/browser-runtime-v1\/(?:requirements|implementation-plan|verification)\.md$/,
   /^dist\/(?:index|react|testing)\.(?:js|d\.ts|js\.map)$/,
   /^dist\/chunk-[A-Za-z0-9_-]+\.js(?:\.map)?$/,
   /^dist\/(?:createPluginHost|resourceRegistry)-[A-Za-z0-9_-]+\.d\.ts$/,
@@ -267,28 +268,18 @@ try {
   const coreConsumer = join(smokeRoot, "core-consumer");
   installConsumer(coreConsumer, "webloom-core-consumer", { "webloom-framework": dependency });
   writeTypeSmoke(coreConsumer, `
-    import { createPluginHost, type PluginManifest, type PluginSetup } from "webloom-framework";
+    import { createWindowApp, definePlugin } from "webloom-framework";
 
-    const setup: PluginSetup = (context) => {
-      context.provide("demo.service", { value: 1 });
-    };
-    const manifest: PluginManifest = {
+    const demo = definePlugin({
       id: "demo",
-      name: "Demo",
-      meta: { defaultEnabled: true, canDisable: true },
-      units: [{
-        id: "demo.window",
-        execution: "window",
-        lifetime: "root",
-        provides: ["demo.service"],
-      }],
-    };
-    const host = createPluginHost({
-      runtimeUnitImplementationRegistry: {
-        get: (pluginId, unitId) => pluginId === "demo" && unitId === "demo.window" ? setup : undefined,
+      provides: ["demo.service"],
+      setup: (context) => {
+        context.provide("demo.service", { value: 1 });
       },
     });
-    void host.register(manifest);
+    const app = await createWindowApp({ plugins: [demo] });
+    if (app.runtimeKind !== "window-main") throw new Error("Window Runtime API is unavailable");
+    await app.dispose();
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(coreConsumer);
   runRuntimeSmoke(coreConsumer, `

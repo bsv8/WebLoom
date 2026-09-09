@@ -16,7 +16,7 @@ function reference(
   return {
     capabilityId: "owner-store.v1",
     providerInstanceId,
-    execution: "coordinator-worker" as const,
+    runtime: "shared-worker" as const,
     contractVersion: "owner-store.v1",
     authorityInstanceId: "authority:1",
     scopeId: `provider-scope:${providerInstanceId}`,

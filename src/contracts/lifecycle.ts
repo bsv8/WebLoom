@@ -8,11 +8,8 @@ export type LifecycleScopeKind = string;
 /** 作用域状态；stopping 表示已撤权但异步收尾还未结束。 */
 export type LifecycleScopeState = "active" | "stopping" | "stopped";
 
-/** 插件默认存活范围；名称由宿主定义，单次请求可由宿主派生。 */
-export type PluginLifetime = string;
-
-/** 插件运行代码所在环境；名称由宿主定义。 */
-export type PluginExecution = string;
+/** 浏览器中由 WebLoom 管理的真实 JavaScript 运行空间。 */
+export type RuntimeKind = "window-main" | "shared-worker";
 
 /** 权限动作名称；权限集合和最终 I/O allowlist 由宿主定义。 */
 export type PluginPermission = string;
@@ -218,8 +215,8 @@ export interface RemoteServiceReference {
   capabilityId: string;
   /** 提供该服务的运行实例；实例重建后必须变化。 */
   providerInstanceId: string;
-  /** 提供者所在执行环境。 */
-  execution: PluginExecution;
+  /** 提供者所在真实 Runtime。 */
+  runtime: RuntimeKind;
   /** 服务契约版本；第一阶段要求精确匹配。 */
   contractVersion: string;
   /** 提供环境的启动身份；重启后变化。 */
@@ -232,6 +229,8 @@ export interface RemoteServiceReference {
   attributes: Readonly<Record<string, unknown>>;
   /** 当前服务目录状态。 */
   status: "starting" | "ready" | "unavailable" | "failed";
+  /** 该引用所属的物理端口连接；本地服务可省略。 */
+  connectionId?: string;
   /** 当前权威目录流修订号。 */
   snapshotRevision: number;
   /** 可选的外部授权标识；引用不是授权本身，Provider 仍需查权威状态。 */
@@ -349,8 +348,8 @@ export interface RemoteServiceLookup {
   capabilityId: string;
   /** 要求的精确契约版本。 */
   contractVersion: string;
-  /** 可选的预期提供环境。 */
-  execution?: PluginExecution;
+  /** 可选的预期提供 Runtime。 */
+  runtime?: RuntimeKind;
   /** 可选的预期作用域。 */
   scopeId?: string;
 }

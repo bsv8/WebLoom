@@ -1,6 +1,9 @@
 # WebLoom
 
-WebLoom 是一个与产品领域无关的前端插件生命周期框架。它管理插件产品、运行单元、实例、依赖图、生命周期 Scope、权限租约、消息总线、服务桥和资源缓存；路由、存储、日志、国际化等产品能力通过宿主适配器注入。
+WebLoom 是一个只面向浏览器的插件 Runtime 框架。v1 管理真实的
+`window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、
+依赖图、ResourceScope、权限租约、服务桥和资源缓存；路由、存储、日志、
+国际化等产品能力由插件或下游应用注入。
 
 ## 安装
 
@@ -10,67 +13,109 @@ pnpm add webloom-framework
 
 WebLoom 是 ESM 单包，提供三个入口：
 
-- `webloom-framework`：纯 TypeScript/Worker 可用的核心，不加载 React；
+- `webloom-framework`：浏览器核心，提供 Window/SharedWorker Runtime，不加载 React；
 - `webloom-framework/react`：Provider、capability、Host、Registry 和 Resource Hooks；
 - `webloom-framework/testing`：无产品语义的假 Host、假传输和测试辅助。
 
 React 是可选 peer dependency。只使用 `webloom-framework` 时不需要安装 React。
 
-## 最小 Host
+## 最小 Window Runtime
 
 ```ts
-import { createPluginHost, type PluginSetup } from "webloom-framework";
+import { createWindowApp, definePlugin } from "webloom-framework";
 
-const helloSetup: PluginSetup = (ctx) => {
-  ctx.provide("hello.service", { value: "world" });
-  ctx.onDispose(() => {
-    // 这里释放本插件登记的资源。
-  });
-};
-
-const host = createPluginHost({
-  runtimeUnitImplementationRegistry: {
-    get(pluginId, unitId) {
-      return pluginId === "hello" && unitId === "hello.window" ? helloSetup : undefined;
-    },
-  },
-  contextExtension: ({ scope }) => ({
-    // 宿主只读扩展；不能替换 pluginId、unitId 或 instanceId。
-    scopeKind: scope.identity.kind,
-  }),
-});
-
-await host.register({
+const hello = definePlugin({
   id: "hello",
-  name: "Hello",
-  meta: { defaultEnabled: true, canDisable: true },
-  units: [{
-    id: "hello.window",
-    execution: "window",
-    lifetime: "root",
-    provides: ["hello.service"],
-  }],
+  provides: ["hello.service"],
+  setup(ctx) {
+    ctx.provide("hello.service", { value: "world" });
+  },
 });
+
+const app = await createWindowApp({ plugins: [hello] });
+const service = app.capability<{ value: string }>("hello.service");
+console.log(service.value); // world
+
+await app.dispose();
 ```
 
-生产插件必须把 `execution`、`lifetime`、`dependencies`、`provides` 和 `permissions` 写在 `units` 中，并通过 `runtimeUnitImplementationRegistry` 按 `pluginId + unitId` 解析 setup。静态 Manifest 不携带可执行函数。
+`createWindowApp()` 会固定创建一个 `window-main` Runtime、生成新的
+`runtimeInstanceId`、装配实现并等待初始插件启动。普通插件不需要手工创建
+Implementation Registry 或调用 `host.register()`；`definePlugin()` 返回的静态
+manifest 不包含 `setup` 函数。
+
+## SharedWorker Runtime
+
+Worker 入口只在 Worker realm 中装配插件：
+
+```ts
+// coordinator.worker.ts
+import { definePlugin, startSharedWorkerApp } from "webloom-framework";
+
+const coordinator = definePlugin({
+  id: "coordinator",
+  provides: ["coordinator.service"],
+  setup(ctx) {
+    ctx.provide("coordinator.service", {
+      handle(request: { type: string }) {
+        return { type: request.type, instanceId: ctx.instanceId };
+      },
+    });
+  },
+});
+
+startSharedWorkerApp({ id: "coordinator", plugins: [coordinator] });
+```
+
+Window 侧只连接 Worker，不创建第二套 Worker 插件生命周期：
+
+```ts
+// Vite: this query emits a real, hashed JavaScript SharedWorker chunk.
+// Do not pass the source `.ts` URL to connectSharedWorker in a production build.
+import coordinatorWorkerUrl from "./coordinator.worker.ts?sharedworker&url";
+import { connectSharedWorker } from "webloom-framework";
+
+const runtime = await connectSharedWorker({
+  id: "coordinator",
+  url: coordinatorWorkerUrl,
+});
+const service = runtime.capability("coordinator.service");
+await service.call({ type: "health" });
+```
+
+句柄统一处理 module `SharedWorker`、握手、完整 baseline、连续 revision、
+断线和重连。旧代理不会静默换绑到新 Worker；Worker 重启后
+`runtimeInstanceId` 与 `unitInstanceId` 都会变化。
+
+Vite 项目必须把 Worker 入口交给 Vite 的 Worker importer（例如
+`?sharedworker&url`），再把构建后导出的 URL 传给框架。框架内部的
+`new SharedWorker(url, { type: "module" })` 只负责运行时连接，不能替调用方的
+Bundler 发现源码 `.ts` 入口。其它 Bundler 应使用等价的独立 SharedWorker
+Rollup entry。仓库的 `pnpm run test:browser` 会先执行生产构建，再从 dist 启动
+真实浏览器验收。
+
+Window 插件依赖 Worker capability 时，把已连接的 `RuntimeHandle` 传给
+`createWindowApp({ remoteRuntime: runtime, plugins })`，并在 setup 中通过
+`ctx.serviceBridge.requireProxy()` 获取精确版本的远程代理。Worker 断线时，Window
+Host 会把相关单元置为 `blocked`；新 baseline 到达后按原启用意图重新协调。
 
 ## 公共字段中文语义
 
 | 字段 | 中文含义 |
 | --- | --- |
 | `pluginId` | 插件产品的稳定标识；用于用户启停和依赖图身份。 |
-| `unitId` | 产品在一种执行环境中的稳定运行单元标识。 |
+| `unitId` | 产品在一个 Runtime 中的稳定运行单元标识。 |
 | `instanceId` | 某运行单元一次启动生成的唯一实例标识；重启不得复用。 |
-| `execution` | 运行代码所在环境标签，由宿主定义。 |
-| `lifetime` | 实例依附的生命周期标签，由宿主定义。 |
+| `runtime` | 真实 JavaScript 运行空间；v1 仅为 `window-main/shared-worker`。 |
+| `runtimeInstanceId` | 某个 Window 或 SharedWorker 启动生成的不可复用身份。 |
+| `connectionId` | Window 与 SharedWorker 之间一条物理连接的不可复用身份。 |
 | `scopeId` | 本次生命周期 Scope 的唯一标识。 |
 | `capability` | 插件提供或依赖的服务契约标识。 |
 | `contractVersion` | capability 的精确契约版本。 |
 | `permission` | 字符串形式的权限动作；具体集合由宿主批准。 |
 | `attributes` | 宿主绑定的只读扩展元数据，不包含私密材料。 |
 | `desiredEnabled` | 用户或控制面希望产品启用的持久意图。 |
-| `state` | 当前运行实例的实际状态，不等于启用意图。 |
+| `state` | 当前 Runtime/运行实例的实际状态，不等于启用意图。 |
 | `blockedBy` | 实例无法启动时缺失的依赖或 Scope 原因。 |
 
 ## 开发与验收
@@ -82,6 +127,8 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm run pack:consumer
+# 会安装/校验 Playwright Chromium，再执行生产 dist fixture
+pnpm run test:browser
 ```
 
 `pack:consumer` 会在不访问本仓库源码的临时项目中安装 tarball，分别执行

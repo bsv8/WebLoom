@@ -12,13 +12,13 @@ import type {
   RuntimeUnitDependency,
   RuntimeUnitDescriptor,
 } from "../contracts/plugin.js";
-import type { PluginExecution, PluginLifetime } from "../contracts/lifecycle.js";
+import type { RuntimeKind } from "../contracts/lifecycle.js";
 
 export interface BuildPluginGraphOptions {
   /** 当前真正运行的插件；不传时使用 manifest.meta.defaultEnabled。 */
   enabledPluginIds?: ReadonlySet<string>;
-  /** 当前 Host 实际执行环境；未选中的 Worker/Window 单元不会进入图。 */
-  execution?: PluginExecution;
+  /** 当前 Host 的真实 Runtime；未选中的 Window/Worker 单元不会进入图。 */
+  runtime?: RuntimeKind;
 }
 
 export interface ValidatePluginGraphOptions extends BuildPluginGraphOptions {
@@ -28,6 +28,11 @@ export interface ValidatePluginGraphOptions extends BuildPluginGraphOptions {
   multiProviderCapabilities?: ReadonlySet<string>;
   /** Host 分批注册时允许 provider 尚未注册；真正装配前仍会进入 blocked。 */
   allowMissingDependencies?: boolean;
+  /**
+   * 允许依赖当前图之外的另一个真实 Runtime；实际是否 ready 由运行时
+   * snapshot 和 RemoteServiceBridge 在 Host reconcile 时决定。
+   */
+  externalRuntimeDependencies?: boolean;
 }
 
 export interface PluginGraphDiagnostic {
@@ -39,6 +44,7 @@ export interface PluginGraphDiagnostic {
     | "plugin.dependency_cycle"
     | "plugin.dependency_contract_invalid"
     | "plugin.dependency_contract_unavailable"
+    | "plugin.runtime_invalid"
     | "plugin.runtime_declaration_at_product_level";
   /** 相关插件或 capability。 */
   ids: string[];
@@ -62,12 +68,8 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-function isPluginExecution(value: unknown): value is PluginExecution {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function isPluginLifetime(value: unknown): value is PluginLifetime {
-  return typeof value === "string" && value.trim().length > 0;
+function isRuntimeKind(value: unknown): value is RuntimeKind {
+  return value === "window-main" || value === "shared-worker";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,11 +172,11 @@ export function validateRuntimeUnitDependencyContracts(
         if (typeof dependency.contractVersion !== "string" || dependency.contractVersion.trim() === "") {
           errors.push("contractVersion（契约版本）不能为空");
         }
-        if (!isPluginExecution(dependency.sourceExecution)) {
-          errors.push("sourceExecution（提供者运行环境）无效");
+        if (!isRuntimeKind(dependency.sourceRuntime)) {
+          errors.push("sourceRuntime（提供者 Runtime）无效");
         }
-        if (!isPluginLifetime(dependency.scope)) {
-          errors.push("scope（提供者作用域）无效");
+        if (unitValue.runtime !== undefined && !isRuntimeKind(unitValue.runtime)) {
+          errors.push("runtime（目标 Runtime）无效");
         }
         if (dependency.reason !== undefined && typeof dependency.reason !== "string") {
           errors.push("reason（依赖说明）必须是字符串");
@@ -194,19 +196,44 @@ export function validateRuntimeUnitDependencyContracts(
       });
     });
   }
+  for (const manifest of manifests) {
+    for (const unit of manifest.units ?? []) {
+      if (!isRuntimeKind(unit.runtime)) {
+        diagnostics.push({
+          code: "plugin.runtime_invalid",
+          ids: [manifest.id, unit.id],
+          message: `插件 "${manifest.id}" 的运行单元 "${unit.id}" 声明了不支持的 Runtime；v1 仅支持 window-main/shared-worker`,
+        });
+      }
+    }
+  }
   return diagnostics;
+}
+
+function unitRuntime(unit: RuntimeUnitDescriptor): RuntimeKind | undefined {
+  return unit.runtime;
+}
+
+function isRuntimeUnit(
+  unit: RuntimeUnitDescriptor,
+): unit is RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } {
+  return typeof unit.id === "string"
+    && unit.id.length > 0
+    && isRuntimeKind(unit.runtime);
 }
 
 function selectedRuntimeUnits(
   manifest: PluginManifest,
-  execution?: PluginExecution
-): Array<RuntimeUnitDescriptor & { id: string }> {
+  runtime?: RuntimeKind,
+): Array<RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }> {
   const units = manifest.units ?? [];
   if (units.length === 0) return [];
-  if (execution !== undefined) return units.filter((unit) => unit.execution === execution);
-  // 兼容旧的单单元 manifest；多环境 manifest 没有执行环境上下文时
-  // fail closed，不能把所有单元的 capability 合并成一个假 Provider。
-  return units.length === 1 ? [...units] : [];
+  if (runtime !== undefined) return units.filter((unit): unit is RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } =>
+    isRuntimeUnit(unit) && unit.runtime === runtime
+  );
+  // 多环境 manifest 没有 Runtime 上下文时 fail closed，不能把所有单元的
+  // capability 合并成一个假 Provider。
+  return units.length === 1 && isRuntimeUnit(units[0]!) ? [units[0]!] : [];
 }
 
 /**
@@ -215,7 +242,7 @@ function selectedRuntimeUnits(
  */
 export function dependenciesOfManifest(
   manifest: PluginManifest,
-  execution?: PluginExecution
+  runtime?: RuntimeKind,
 ): PluginDependency[] {
   const byCapability = new Map<string, PluginDependency>();
   const add = (dependency: PluginDependency) => {
@@ -225,8 +252,8 @@ export function dependenciesOfManifest(
     }
   };
   const units = manifest.units ?? [];
-  if (units.length > 1 && execution === undefined) return [];
-  const selectedUnits = selectedRuntimeUnits(manifest, execution);
+  if (units.length > 1 && runtime === undefined) return [];
+  const selectedUnits = selectedRuntimeUnits(manifest, runtime);
   if (units.length > 0 && selectedUnits.length === 0) return [];
   if (units.length === 0) {
     for (const dependency of manifest.dependencies ?? []) add(dependency);
@@ -239,29 +266,22 @@ export function dependenciesOfManifest(
 }
 
 /** 返回当前执行环境提供的 capability；显式单元不会继承产品级摘要。 */
-export function providesOfManifest(manifest: PluginManifest, execution?: PluginExecution): string[] {
+export function providesOfManifest(
+  manifest: PluginManifest,
+  runtime?: RuntimeKind,
+): string[] {
   const units = manifest.units ?? [];
-  if (units.length > 1 && execution === undefined) return [];
+  if (units.length > 1 && runtime === undefined) return [];
   return unique([
     ...(units.length === 0 ? (manifest.provides ?? []) : []),
-    ...selectedRuntimeUnits(manifest, execution).flatMap((unit) => unit.provides ?? []),
+    ...selectedRuntimeUnits(manifest, runtime).flatMap((unit) => unit.provides ?? []),
   ]);
-}
-
-function dependencyKey(dependency: PluginDependency | RuntimeUnitDependency): string {
-  return [
-    dependency.capability,
-    dependency.contractVersion ?? "",
-    dependency.sourceExecution ?? "",
-    dependency.scope ?? "",
-  ].join("\u0000");
 }
 
 interface RuntimeUnitProvider {
   pluginId: string;
   unitId: string;
-  execution: PluginExecution;
-  lifetime: PluginLifetime;
+  runtime: RuntimeKind;
   contractVersion?: string;
 }
 
@@ -274,11 +294,11 @@ function runtimeUnitProviders(
   for (const manifest of manifests) {
     for (const unit of manifest.units ?? []) {
       if (!unit.provides?.includes(capability)) continue;
+      if (!isRuntimeUnit(unit)) continue;
       providers.push({
         pluginId: manifest.id,
         unitId: unit.id,
-        execution: unit.execution,
-        lifetime: unit.lifetime,
+        runtime: unit.runtime,
         contractVersion: unit.providedContracts?.[capability],
       });
     }
@@ -291,20 +311,19 @@ function matchingRuntimeUnitProviders(
   dependency: RuntimeUnitDependency
 ): RuntimeUnitProvider[] {
   return runtimeUnitProviders(manifests, dependency.capability).filter((provider) =>
-    provider.execution === dependency.sourceExecution
-    && provider.lifetime === dependency.scope
+    provider.runtime === dependency.sourceRuntime
     && provider.contractVersion === dependency.contractVersion
   );
 }
 
 function runtimeDependenciesForValidation(
   manifest: PluginManifest,
-  execution?: PluginExecution
+  runtime?: RuntimeKind,
 ): RuntimeUnitDependency[] {
   const units = manifest.units ?? [];
-  const selected = execution === undefined
+  const selected = runtime === undefined
     ? units
-    : units.filter((unit) => unit.execution === execution);
+    : units.filter((unit) => unitRuntime(unit) === runtime);
   return selected.flatMap((unit) => unit.dependencies ?? []);
 }
 
@@ -322,9 +341,9 @@ export function buildPluginGraph(
   const enabled = options.enabledPluginIds;
 
   for (const manifest of manifests) {
-    const selectedUnits = selectedRuntimeUnits(manifest, options.execution);
-    const provided = providesOfManifest(manifest, options.execution);
-    const dependencyEntries = dependenciesOfManifest(manifest, options.execution);
+    const selectedUnits = selectedRuntimeUnits(manifest, options.runtime);
+    const provided = providesOfManifest(manifest, options.runtime);
+    const dependencyEntries = dependenciesOfManifest(manifest, options.runtime);
     dependencyDetails[manifest.id] = dependencyEntries.map((dependency) => ({ ...dependency }));
     const deps = unique(dependencyEntries.map((dependency) => dependency.capability));
     optionalDependencies[manifest.id] = unique(
@@ -339,7 +358,7 @@ export function buildPluginGraph(
       unitGraph[unitKey] = {
         pluginId: manifest.id,
         unitId: unit.id,
-        execution: unit.execution,
+        runtime: unit.runtime,
         dependencies: unique((unit.dependencies ?? []).map((dependency) => dependency.capability)),
         dependencyDetails: (unit.dependencies ?? []).map((dependency) => ({ ...dependency })),
         provides: unique(unit.provides ?? []),
@@ -399,7 +418,7 @@ export function buildPluginGraph(
       visited.add(pluginId);
       return;
     }
-    for (const dependency of dependenciesOfManifest(manifest, options.execution)) {
+    for (const dependency of dependenciesOfManifest(manifest, options.runtime)) {
       if (dependency.optional) continue;
       const provider = firstProvider.get(dependency.capability);
       if (provider) visit(provider);
@@ -454,13 +473,21 @@ export function validatePluginGraph(
     }
   }
   // 运行单元依赖不能沿用产品级“同名 capability 即可”的兼容规则。
-  // Provider 必须同时声明 execution、lifetime 和 providedContracts 版本；
-  // sourceExecution 可以指向当前图之外的 Worker，因此这里故意在完整
+  // Provider 必须同时声明 Runtime 和 providedContracts 版本；
+  // sourceRuntime 可以指向当前图之外的 Worker，因此这里故意在完整
   // manifest 集合上查找，而不是只看当前 Window Host 的 providers。
   for (const manifest of manifests) {
-    const strictDependencies = runtimeDependenciesForValidation(manifest, options.execution);
+    const strictDependencies = runtimeDependenciesForValidation(manifest, options.runtime);
     for (const dependency of strictDependencies) {
       if (dependency.optional) continue;
+      // Window Host 不应因为 Worker manifest 不在本地 bundle 而在注册阶段
+      // 失败。这里仅放过“来源 Runtime 不同”的依赖；精确 capability、版本和
+      // 当前 provider 身份仍由 remoteServiceReferences/bridge 在运行时检查。
+      if (options.externalRuntimeDependencies
+        && options.runtime !== undefined
+        && dependency.sourceRuntime !== options.runtime) {
+        continue;
+      }
       const matches = matchingRuntimeUnitProviders(manifests, dependency);
       if (matches.length > 0) {
         if (matches.length > 1 && !multiProvider.has(dependency.capability)) {
@@ -495,9 +522,9 @@ export function validatePluginGraph(
   }
   for (const manifest of manifests) {
     const strictDependencyCapabilities = new Set(
-      runtimeDependenciesForValidation(manifest, options.execution).map((dependency) => dependency.capability)
+      runtimeDependenciesForValidation(manifest, options.runtime).map((dependency) => dependency.capability)
     );
-    for (const dependency of dependenciesOfManifest(manifest, options.execution)) {
+    for (const dependency of dependenciesOfManifest(manifest, options.runtime)) {
       if (dependency.optional) continue;
       // 上面的严格运行单元校验已经处理了精确契约；这里仅保留没有
       // units 的简单插件 product-level dependencies 兼容逻辑。

@@ -28,8 +28,9 @@ import type {
   PermissionLeaseBinding,
   PluginIntentCoordinator,
   PluginIntentSubmissionResult,
-  PluginLifetime,
   PluginPermission,
+  RemoteServiceReference,
+  RuntimeKind,
   ScopedTaskScheduler,
 } from "../contracts/lifecycle.js";
 import {
@@ -93,40 +94,6 @@ export function createInMemoryPluginConfigStore(
       return () => listeners.delete(listener);
     },
   };
-}
-
-/** ScopeResolver 的输入；宿主可以基于当前状态决定 Scope 是否存在。 */
-export interface ScopeResolverInput {
-  /** 产品标识。 */
-  pluginId: string;
-  /** 稳定运行单元标识。 */
-  unitId: string;
-  /** 当前单元声明的生命周期标签。 */
-  lifetime: PluginLifetime;
-  /** 完整静态清单。 */
-  manifest: PluginManifest;
-}
-
-/** 一个运行单元当前是否可以挂载。 */
-export interface ScopeResolution {
-  /** 是否允许创建实例 Scope。 */
-  available: boolean;
-  /** 不可用时的稳定诊断原因。 */
-  reason?: string;
-  /** 父 Scope；未提供时使用 Host 根 Scope。 */
-  parent?: LifecycleScope;
-  /** Scope 身份的只读扩展属性。 */
-  attributes?: Readonly<Record<string, unknown>>;
-  /** 宿主用于检测身份变化的稳定键。 */
-  key?: string;
-}
-
-/** Scope 状态变化订阅端口。 */
-export interface ScopeResolver {
-  /** 解析当前单元是否具备可用父 Scope。 */
-  resolve(input: ScopeResolverInput): ScopeResolution;
-  /** 状态变化后通知 Host 重新协调；可选。 */
-  subscribe?(listener: () => void): () => void;
 }
 
 /** 权限策略输入；申请、批准和会话约束必须分开计算。 */
@@ -201,14 +168,33 @@ export interface ContributionAdapter {
     | Promise<void | ContributionHandle | (() => void | Promise<void>)>;
 }
 
+/** 运行单元可用性检查；返回稳定原因表示当前实例不能装配。 */
+export interface RuntimeUnitAvailabilityInput {
+  /** 产品标识。 */
+  pluginId: string;
+  /** 运行单元标识。 */
+  unitId: string;
+  /** 真实 Runtime。 */
+  runtime: RuntimeKind;
+}
+
+/** 新运行单元 Scope 的身份属性输入。 */
+export interface RuntimeUnitAttributesInput extends RuntimeUnitAvailabilityInput {
+  /** 静态产品清单。 */
+  manifest: PluginManifest;
+}
+
+/** 为运行单元选择父 Scope；未提供时运行单元直接挂在 Host 根 Scope。 */
+export type RuntimeUnitParentScopeInput = RuntimeUnitAttributesInput;
+
 /** 通用运行单元快照；用于展示远端单元未知/恢复状态。 */
 export interface RuntimeUnitSnapshot {
   /** 产品标识。 */
   pluginId: string;
   /** 单元标识。 */
   unitId: string;
-  /** 执行环境。 */
-  execution: string;
+  /** 真实 Runtime。 */
+  runtime: RuntimeKind;
   /** 远端实例标识。 */
   instanceId?: string;
   /** 远端当前状态。 */
@@ -216,10 +202,8 @@ export interface RuntimeUnitSnapshot {
 }
 
 export interface CreatePluginHostOptions {
-  /** 当前 Host 所在执行环境；用于选择运行单元。 */
-  execution?: string;
-  /** 默认插件生命周期。 */
-  defaultLifetime?: string;
+  /** 当前 Host 所在真实 Runtime。 */
+  runtime?: RuntimeKind;
   /** 根 Scope 的宿主只读属性。 */
   rootAttributes?: Readonly<Record<string, unknown>>;
   /** 预注入的内建 capability；不归属于任何插件实例。 */
@@ -234,8 +218,6 @@ export interface CreatePluginHostOptions {
   contextExtension?: (input: ContextExtensionInput) => Readonly<Record<string, unknown>>;
   /** 校验产品清单中的宿主扩展字段。 */
   manifestValidator?: (manifest: PluginManifest) => void;
-  /** 解析当前生命周期是否存在以及其父 Scope。 */
-  scopeResolver?: ScopeResolver;
   /** 计算权限批准与会话交集。 */
   permissionPolicy?: (input: PermissionPolicyInput) => PermissionPolicyResult;
   /** 启停意图持久化端口。 */
@@ -248,12 +230,22 @@ export interface CreatePluginHostOptions {
   serviceBridgeForPlugin?: (pluginId: string, instanceId: string) => import("../contracts/lifecycle.js").RemoteServiceBridge | undefined;
   /** 当前执行环境的运行单元实现注册表。 */
   runtimeUnitImplementationRegistry?: RuntimeUnitImplementationRegistry;
+  /** 当前身份/授权不允许装配时返回稳定的 blockedBy 原因。 */
+  runtimeUnitAvailability?: (input: RuntimeUnitAvailabilityInput) => string | undefined;
+  /** 为每次新建运行单元 Scope 生成当前绑定的只读属性。 */
+  runtimeUnitAttributes?: (input: RuntimeUnitAttributesInput) => Readonly<Record<string, unknown>> | undefined;
+  /** 为每次新建运行单元 Scope 选择生命周期父级；返回 undefined 使用 Host 根 Scope。 */
+  runtimeUnitParentScope?: (input: RuntimeUnitParentScopeInput) => LifecycleScope | undefined;
   /** 贡献适配器集合。 */
   contributionAdapters?: readonly ContributionAdapter[];
   /** 允许每一项清理等待的时间。 */
   lifecycleCleanupTimeoutMs?: number;
   /** 读取远端单元真实状态。 */
   runtimeSnapshots?: () => readonly RuntimeUnitSnapshot[];
+  /** 读取其它真实 Runtime 当前已接受的服务目录。 */
+  remoteServiceReferences?: () => readonly RemoteServiceReference[];
+  /** 允许来源 Runtime 不同且尚未出现在本地 manifest 集合中的依赖。 */
+  externalRuntimeDependencies?: boolean;
 }
 
 interface ContributionRuntime {
@@ -270,7 +262,6 @@ interface PluginRecord {
   scope?: LifecycleScope;
   instanceId?: string;
   unitId?: string;
-  scopeKey?: string;
   teardown?: PluginTeardown;
   disposeCallbacks: Array<PluginTeardown>;
   capabilities: Set<string>;
@@ -317,26 +308,31 @@ function lifecycleStateFor(state: PluginStateKind, desired: boolean): NonNullabl
 
 function selectedUnit(
   manifest: PluginManifest,
-  execution: string | undefined,
-  defaultLifetime: string,
-): (RuntimeUnitDescriptor & { id: string }) | undefined {
+  runtime: RuntimeKind | undefined,
+): (RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }) | undefined {
   const units = manifest.units ?? [];
   if (units.length > 1) {
-    const matches = execution === undefined ? [] : units.filter((unit) => unit.execution === execution);
+    const matches = runtime === undefined
+      ? []
+      : units.filter((unit): unit is RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } =>
+        unit.runtime === runtime
+      );
     return matches.length === 1 ? matches[0] : undefined;
   }
   if (units.length === 1) {
-    return execution === undefined || units[0]?.execution === execution ? units[0] : undefined;
+    const unit = units[0];
+    return unit && (runtime === undefined || unit.runtime === runtime) && unit.runtime !== undefined
+      ? unit as RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }
+      : undefined;
   }
+  const targetRuntime = runtime ?? "window-main";
   return {
     id: manifest.id,
-    execution: manifest.meta.execution ?? execution ?? "default",
-    lifetime: manifest.meta.lifetime ?? defaultLifetime,
+    runtime: targetRuntime,
     dependencies: manifest.dependencies?.map((dependency) => ({
       capability: dependency.capability,
       contractVersion: dependency.contractVersion ?? `${dependency.capability}.v1`,
-      sourceExecution: dependency.sourceExecution ?? "default",
-      scope: dependency.scope ?? defaultLifetime,
+      sourceRuntime: dependency.sourceRuntime ?? targetRuntime,
       ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
       ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
     })),
@@ -347,8 +343,11 @@ function selectedUnit(
   };
 }
 
-function dependenciesFor(manifest: PluginManifest, execution: string | undefined): PluginDependency[] {
-  return dependenciesOfManifest(manifest, execution);
+function dependenciesFor(
+  manifest: PluginManifest,
+  runtime?: RuntimeKind,
+): PluginDependency[] {
+  return dependenciesOfManifest(manifest, runtime);
 }
 
 function setupFor(
@@ -357,14 +356,6 @@ function setupFor(
   options: CreatePluginHostOptions,
 ): PluginSetup | undefined {
   return options.runtimeUnitImplementationRegistry?.get(manifest.id, unit.id);
-}
-
-function stableValue(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, item]) => `${JSON.stringify(key)}:${stableValue(item)}`).join(",")}}`;
 }
 
 export class StartupCapabilityError extends Error {
@@ -387,6 +378,9 @@ export class StartupPluginError extends Error {
 
 /** 创建一个只包含通用生命周期核心的 Plugin Host。 */
 export function createPluginHost(options: CreatePluginHostOptions = {}): PluginHost {
+  // 未指定 Runtime 时只允许唯一运行单元自动选择；多单元产品必须由
+  // 真实 Window/SharedWorker Host 显式指定执行环境。
+  const runtimeKind = options.runtime;
   const listeners = new Set<HostListener>();
   let versionCounter = 0;
   let hostDisposed = false;
@@ -436,7 +430,6 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
   let intentSnapshot = options.pluginIntentCoordinator?.snapshot();
   let removeConfigSubscription = (): void => undefined;
   let removeIntentSubscription = (): void => undefined;
-  let removeScopeSubscription = (): void => undefined;
   let reconcilePromise: Promise<void> | undefined;
 
   const desiredEnabledFor = (pluginId: string, manifest?: PluginManifest): boolean => {
@@ -451,10 +444,12 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
 
   const desiredRevisionFor = (pluginId: string): number | undefined => intentSnapshot?.desiredRevision[pluginId];
 
-  const selected = (manifest: PluginManifest): (RuntimeUnitDescriptor & { id: string }) | undefined =>
-    selectedUnit(manifest, options.execution, options.defaultLifetime ?? "plugin-instance");
+  const selected = (manifest: PluginManifest): (RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }) | undefined =>
+    selectedUnit(manifest, runtimeKind);
 
-  const graph = (): PluginGraph => buildPluginGraph([...knownManifests.values()], { execution: options.execution, enabledPluginIds: enabledSet });
+  const graph = (): PluginGraph => buildPluginGraph([
+    ...knownManifests.values(),
+  ], { runtime: runtimeKind, enabledPluginIds: enabledSet });
 
   const validateManifest = (manifest: PluginManifest): void => {
     if (!manifest || typeof manifest.id !== "string" || manifest.id.trim() === "") throw new Error("Plugin id must be a non-empty string");
@@ -466,12 +461,17 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       throw new Error(`Plugin "${manifest.id}" required startup metadata is inconsistent`);
     }
     if (manifest.units !== undefined && !Array.isArray(manifest.units)) throw new Error(`Plugin "${manifest.id}" units must be an array`);
+    if ((manifest.units?.length ?? 0) > 1 && runtimeKind === undefined) {
+      throw new Error(`Plugin "${manifest.id}" runtime must be explicit for multi-unit manifests`);
+    }
     if (manifest.units && manifest.units.length > 0) {
       const ids = new Set<string>();
       for (const unit of manifest.units) {
         if (!unit.id || ids.has(unit.id)) throw new Error(`Plugin "${manifest.id}" has duplicate or empty unit id`);
         ids.add(unit.id);
-        if (!unit.execution || !unit.lifetime) throw new Error(`Plugin "${manifest.id}" unit "${unit.id}" must define execution and lifetime`);
+        if (unit.runtime !== "window-main" && unit.runtime !== "shared-worker") {
+          throw new Error(`Plugin "${manifest.id}" unit "${unit.id}" declares an unsupported Runtime`);
+        }
       }
     }
     options.manifestValidator?.(manifest);
@@ -481,9 +481,23 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
 
   const missingDependencies = (manifest: PluginManifest): string[] => {
     const missing: string[] = [];
-    for (const dependency of dependenciesFor(manifest, options.execution)) {
+    const selectedUnitForDependencies = selected(manifest);
+    const localRuntime = selectedUnitForDependencies?.runtime ?? runtimeKind;
+    for (const dependency of dependenciesFor(manifest, runtimeKind)) {
       if (dependency.optional) continue;
-      if (!capabilities.has(dependency.capability)) missing.push(dependency.capability);
+      const sourceRuntime = dependency.sourceRuntime ?? localRuntime;
+      const contractVersion = dependency.contractVersion ?? `${dependency.capability}.v1`;
+      if (sourceRuntime !== undefined && sourceRuntime !== localRuntime) {
+        const available = options.remoteServiceReferences?.().some((reference) => (
+          reference.status === "ready"
+          && reference.runtime === sourceRuntime
+          && reference.capabilityId === dependency.capability
+          && reference.contractVersion === contractVersion
+        )) ?? false;
+        if (!available) missing.push(dependency.capability);
+      } else if (!capabilities.has(dependency.capability)) {
+        missing.push(dependency.capability);
+      }
     }
     return [...new Set(missing)];
   };
@@ -492,27 +506,21 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     const unit = selected(manifest);
     if (!unit) {
       const units = manifest.units ?? [];
-      if (units.length > 0 && options.execution !== undefined && !units.some((item) => item.execution === options.execution)) {
+      if (units.length > 0 && runtimeKind !== undefined && !units.some((item) => item.runtime === runtimeKind)) {
         const snapshots = runtimeSnapshots?.() ?? [];
         if (snapshots.some((item) => item.pluginId === manifest.id)) return `runtime:${manifest.id}:unknown`;
       }
       return units.length > 0 ? `runtime:${manifest.id}:unit-unavailable` : undefined;
     }
+    const unavailable = options.runtimeUnitAvailability?.({
+      pluginId: manifest.id,
+      unitId: unit.id,
+      runtime: unit.runtime,
+    });
+    if (unavailable) return unavailable;
     if (!setupFor(manifest, unit, options)) return `runtime:${manifest.id}:${unit.id}:implementation-unavailable`;
     return undefined;
   };
-
-  const resolveScope = (record: PluginRecord, unit: RuntimeUnitDescriptor): ScopeResolution => {
-    const resolver = options.scopeResolver;
-    if (!resolver) return { available: true, parent: rootScope, attributes: rootAttributes, key: stableValue(rootAttributes) };
-    return resolver.resolve({ pluginId: record.manifest.id, unitId: unit.id, lifetime: unit.lifetime, manifest: record.manifest });
-  };
-
-  const scopeKeyForResolution = (
-    resolution: ScopeResolution,
-    unit: RuntimeUnitDescriptor,
-  ): string => resolution.key
-    ?? `${resolution.parent?.identity.scopeId ?? "root"}:${unit.lifetime}:${stableValue(resolution.attributes ?? rootAttributes)}`;
 
   const revokeContributions = (record: PluginRecord): void => {
     for (const contribution of record.contributions) {
@@ -834,19 +842,25 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
         bumpVersion();
         return;
       }
-      const resolution = resolveScope(record, unit);
-      if (!resolution.available) {
-        record.state = "blocked";
-        record.blockedBy = [resolution.reason ?? `scope:${unit.lifetime}:unavailable`];
-        bumpVersion();
-        return;
-      }
       const instanceId = makeInstanceId(record.manifest.id, unit.id);
       let scope: LifecycleScope;
       try {
-        const parent = resolution.parent ?? rootScope;
-        const attributes = Object.freeze({ ...(resolution.attributes ?? rootAttributes) });
-        scope = parent.child(unit.lifetime || "plugin-instance", { pluginId: record.manifest.id, attributes });
+        const attributes = Object.freeze({
+          ...rootAttributes,
+          ...(options.runtimeUnitAttributes?.({
+            pluginId: record.manifest.id,
+            unitId: unit.id,
+            runtime: unit.runtime,
+            manifest: record.manifest,
+          }) ?? {}),
+        });
+        const parent = options.runtimeUnitParentScope?.({
+          pluginId: record.manifest.id,
+          unitId: unit.id,
+          runtime: unit.runtime,
+          manifest: record.manifest,
+        }) ?? rootScope;
+        scope = parent.child("runtime-unit", { pluginId: record.manifest.id, attributes });
       } catch (error) {
         record.state = "blocked";
         record.blockedBy = [errorMessage(error)];
@@ -858,7 +872,6 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       record.instanceId = instanceId;
       record.unitId = unit.id;
       instanceAttributes.set(instanceId, scope.identity.attributes);
-      record.scopeKey = scopeKeyForResolution(resolution, unit);
       record.error = undefined;
       record.blockedBy = undefined;
       bumpVersion();
@@ -869,7 +882,7 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
         const result = await setup(context);
         record.teardown = typeof result === "function" ? result : undefined;
         await registerContribution(record, unit, instanceId, scope);
-        const declared = providesOfManifest(record.manifest, options.execution);
+        const declared = providesOfManifest(record.manifest, runtimeKind);
         const missingDeclarations = declared.filter((key) => !record.capabilities.has(key));
         if (missingDeclarations.length > 0) {
           throw new Error(`Plugin "${record.manifest.id}" did not provide declared capabilities: ${missingDeclarations.join(", ")}`);
@@ -900,7 +913,13 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
         record.instanceId = undefined;
         record.unitId = undefined;
         bumpVersion();
-        throw new StartupPluginError({ pluginId: record.manifest.id, capabilities: providesOfManifest(record.manifest, options.execution), state: record.state, error: record.error });
+        throw new StartupPluginError({
+          pluginId: record.manifest.id,
+          unitId: unit.id,
+          capabilities: providesOfManifest(record.manifest, runtimeKind),
+          state: record.state,
+          error: record.error,
+        });
       }
     })();
     starting.set(pluginId, task);
@@ -937,36 +956,31 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     if (reconcilePromise) return reconcilePromise;
     reconcilePromise = (async () => {
       const manifests = [...knownManifests.values()];
-      const ordered = orderManifestsByDependencies(manifests, options.execution);
-      // ScopeResolver 的状态变化代表整批实例身份可能已经改变。先按反向
-      // 依赖同步撤权，再等待清理，避免消费者在 Provider 换代过程中继续
-      // 看见旧 capability；之后同一轮 reconcile 会按最新 Scope 重建实例。
-      const rotationTargets = manifests.filter((manifest) => {
-        const record = records.get(manifest.id);
-        if (!record || !desiredEnabledFor(manifest.id, manifest)
-          || (record.state !== "enabled" && record.state !== "starting")) return false;
-        const unit = selected(record.manifest);
-        if (!unit || !options.scopeResolver) return false;
-        const resolution = resolveScope(record, unit);
-        return !resolution.available || record.scopeKey !== scopeKeyForResolution(resolution, unit);
-      });
-      const rotationPlan: PluginRecord[] = [];
-      const planned = new Set<string>();
-      for (const target of rotationTargets) {
-        for (const item of collectDisablePlan(target.id)) {
-          if (planned.has(item.manifest.id)) continue;
-          planned.add(item.manifest.id);
-          rotationPlan.push(item);
-        }
-      }
-      for (const item of rotationPlan) {
-        await stopPlugin(item, "scope resolution changed", true);
-      }
+      const ordered = orderManifestsByDependencies(manifests, runtimeKind);
       for (const manifest of ordered) {
         const record = records.get(manifest.id);
         if (!record) continue;
+        if (record && (record.state === "enabled" || record.state === "starting")) {
+          const missing = missingDependencies(manifest);
+          const unavailable = runtimeUnavailable(manifest);
+          if (missing.length > 0 || unavailable) {
+            await stopPlugin(
+              record,
+              "runtime dependency unavailable",
+              true,
+              [...new Set([...missing, ...(unavailable ? [unavailable] : [])])],
+            );
+          }
+        }
         if (desiredEnabledFor(manifest.id, manifest) && record.state !== "enabled" && record.state !== "starting") {
-          await enable(manifest.id);
+          try {
+            await enable(manifest.id);
+          } catch (error) {
+            // Optional startup failure is represented in the Host state and
+            // must not prevent unrelated required units from starting.
+            if (!isRequired(manifest)) continue;
+            throw error;
+          }
         }
       }
       for (const manifest of manifests) {
@@ -979,10 +993,17 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     return reconcilePromise;
   };
 
-  function orderManifestsByDependencies(manifests: readonly PluginManifest[], execution: string | undefined): PluginManifest[] {
+  function orderManifestsByDependencies(
+    manifests: readonly PluginManifest[],
+    runtime?: RuntimeKind,
+  ): PluginManifest[] {
     const byId = new Map(manifests.map((manifest) => [manifest.id, manifest]));
     const providers = new Map<string, string>();
-    for (const manifest of manifests) for (const capability of providesOfManifest(manifest, execution)) if (!providers.has(capability)) providers.set(capability, manifest.id);
+    for (const manifest of manifests) {
+      for (const capability of providesOfManifest(manifest, runtime)) {
+        if (!providers.has(capability)) providers.set(capability, manifest.id);
+      }
+    }
     const visited = new Set<string>();
     const visiting = new Set<string>();
     const ordered: PluginManifest[] = [];
@@ -990,7 +1011,7 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       if (visited.has(manifest.id)) return;
       if (visiting.has(manifest.id)) return;
       visiting.add(manifest.id);
-      for (const dependency of dependenciesFor(manifest, execution)) {
+      for (const dependency of dependenciesFor(manifest, runtime)) {
         if (dependency.optional) continue;
         const provider = providers.get(dependency.capability);
         const providerManifest = provider ? byId.get(provider) : undefined;
@@ -1029,7 +1050,14 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
         ...(record.unitId ? { unitId: record.unitId } : {}),
         ...(record.blockedBy ? { blockedBy: [...record.blockedBy] } : {}),
         ...(record.cleanup ? { cleanup: record.cleanup } : {}),
-        units: unit ? [{ pluginId, unitId: unit.id, execution: unit.execution, kind: record.state, ...(record.instanceId ? { instanceId: record.instanceId } : {}), ...(record.error ? { error: record.error } : {}) }] : [],
+        units: unit ? [{
+          pluginId,
+          unitId: unit.id,
+          runtime: unit.runtime,
+          kind: record.state,
+          ...(record.instanceId ? { instanceId: record.instanceId } : {}),
+          ...(record.error ? { error: record.error } : {}),
+        }] : [],
       };
     },
     scope: (pluginId) => records.get(pluginId)?.scope,
@@ -1042,7 +1070,14 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     reverseDeps(pluginId) { return graph().reverse[pluginId] ?? []; },
     validateManifestSet(manifests) {
       for (const manifest of manifests) validateManifest(manifest);
-      validatePluginGraph([...manifests], { execution: options.execution, builtinCapabilities: new Set(capabilities.keys()) });
+      validatePluginGraph([...manifests], {
+        runtime: runtimeKind,
+        builtinCapabilities: new Set([
+          ...capabilities.keys(),
+          ...(options.remoteServiceReferences?.() ?? []).map((reference) => reference.capabilityId),
+        ]),
+        externalRuntimeDependencies: options.externalRuntimeDependencies,
+      });
     },
     provide<T>(key: string, value: T) {
       if (hostDisposed) throw new LifecycleScopeRevokedError("Plugin host is disposed");
@@ -1065,7 +1100,15 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
         validateManifest(manifest);
         if (knownManifests.has(manifest.id)) throw new Error(`Plugin "${manifest.id}" is already registered`);
       }
-      validatePluginGraph(current, { execution: options.execution, builtinCapabilities: new Set(capabilities.keys()), allowMissingDependencies: false });
+      validatePluginGraph(current, {
+        runtime: runtimeKind,
+        builtinCapabilities: new Set([
+          ...capabilities.keys(),
+          ...(options.remoteServiceReferences?.() ?? []).map((reference) => reference.capabilityId),
+        ]),
+        allowMissingDependencies: false,
+        externalRuntimeDependencies: options.externalRuntimeDependencies,
+      });
       for (const manifest of current) {
         knownManifests.set(manifest.id, manifest);
         records.set(manifest.id, { manifest, state: "registered", disposeCallbacks: [], capabilities: new Set(), contributions: [] });
@@ -1131,6 +1174,15 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       );
       return { ok: true } as const;
     },
+    suspend: async (pluginId, reason = "runtime identity changed") => {
+      const record = records.get(pluginId);
+      if (!record) return;
+      if (record.state !== "enabled" && record.state !== "starting") return;
+      // suspend 不改变用户/权威控制面的 desiredEnabled；它只撤销当前
+      // Scope，避免身份切换把永久启用的系统插件写成 disabled。
+      beginStop(record, reason, true);
+      await stopPlugin(record, reason, true);
+    },
     unregister: async (pluginId) => {
       const record = records.get(pluginId);
       if (!record) return;
@@ -1146,7 +1198,6 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       hostDisposed = true;
       removeConfigSubscription();
       removeIntentSubscription();
-      removeScopeSubscription();
       disposePromise = (async () => {
         for (const record of [...records.values()].reverse()) {
           if (record.state === "enabled" || record.state === "starting") {
@@ -1195,13 +1246,6 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     void reconcile().catch(() => undefined);
     bumpVersion();
   });
-  if (options.scopeResolver?.subscribe) {
-    removeScopeSubscription = options.scopeResolver.subscribe(() => {
-      void reconcile().catch(() => undefined);
-      resourceStore.refreshRuntimeBindings();
-      bumpVersion();
-    });
-  }
   return host;
 }
 
@@ -1256,6 +1300,8 @@ export interface PluginHost {
   submitIntent(pluginId: string, desiredEnabled: boolean): Promise<PluginIntentSubmissionResult>;
   /** 停止一个插件及其反向依赖者。 */
   disable(pluginId: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** 暂停当前实例但保留启用意图；供宿主身份世代切换时撤权重建。 */
+  suspend(pluginId: string, reason?: string): Promise<void>;
   /** 从 Host 删除一个插件。 */
   unregister(pluginId: string): Promise<void>;
   /** 停止所有实例并释放根 Scope。 */

@@ -14,7 +14,7 @@ function makeReference(overrides: Partial<{
   return {
     capabilityId: "asset.service",
     providerInstanceId: overrides.providerInstanceId ?? "provider:1",
-    execution: "coordinator-worker" as const,
+    runtime: "shared-worker" as const,
     contractVersion: "1",
     authorityInstanceId: "authority:1",
     scopeId: "scope:provider",

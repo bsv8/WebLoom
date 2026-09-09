@@ -1,6 +1,6 @@
 {
   "name": "webloom-framework",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "通用前端插件生命周期框架",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -42,6 +42,8 @@
     "test": "vitest run",
     "build": "tsup",
     "lint:boundaries": "node scripts/check-boundaries.mjs",
+    "test:browser:install": "playwright install chromium",
+    "test:browser": "pnpm run test:browser:install && node scripts/real-browser-runtime-smoke.mjs",
     "prepack": "pnpm typecheck && pnpm test && pnpm build && pnpm lint:boundaries",
     "pack": "npm pack",
     "pack:consumer": "pnpm run prepack && node scripts/pack-consumer-smoke.mjs"
@@ -59,6 +61,7 @@
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",
     "jsdom": "25.0.1",
+    "playwright": "1.63.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "tsup": "8.5.1",
