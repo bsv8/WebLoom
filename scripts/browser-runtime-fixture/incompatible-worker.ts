@@ -5,15 +5,16 @@ const scope = globalThis as unknown as {
 scope.onconnect = (event) => {
   const port = event.ports[0];
   if (!port) return;
-  port.addEventListener("message", (message) => {
-    if (message.data?.type !== "webloom.runtime.hello") return;
-    port.postMessage({
-      type: "webloom.runtime.error",
-      protocolVersion: "webloom.runtime.v0",
-      code: "runtime.protocol_mismatch",
-      message: "Browser fixture intentionally uses an incompatible protocol",
-      phase: "handshake",
-    });
+  port.postMessage({
+    type: "webloom.runtime.snapshot",
+    protocolVersion: "webloom.runtime.v0",
+    runtimeId: "browser-fixture-runtime",
+    runtimeKind: "shared-worker",
+    runtimeInstanceId: "incompatible:1",
+    revision: 0,
+    state: "ready",
+    units: [],
+    services: [],
   });
   port.start();
 };

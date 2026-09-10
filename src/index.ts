@@ -17,7 +17,14 @@ export * from "./runtime/runtimeTypes.js";
 export * from "./runtime/runtimeProtocol.js";
 export * from "./runtime/windowRuntime.js";
 export * from "./runtime/sharedWorkerHost.js";
-export * from "./runtime/connectSharedWorker.js";
+export {
+  connectSharedWorker,
+} from "./runtime/connectSharedWorker.js";
+export type {
+  ConnectSharedWorkerOptions,
+  SharedWorkerConnectionContext,
+  SharedWorkerLike,
+} from "./runtime/connectSharedWorker.js";
 
 export * from "./messaging/messageBus.js";
 

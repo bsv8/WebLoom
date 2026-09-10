@@ -1,6 +1,6 @@
 {
   "name": "webloom-framework",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "通用前端插件生命周期框架",
   "license": "AGPL-3.0-only",
   "repository": {

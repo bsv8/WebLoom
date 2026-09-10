@@ -213,86 +213,44 @@ export interface PermissionLease {
 export interface RemoteServiceReference {
   /** 服务契约标识。 */
   capabilityId: string;
-  /** 提供该服务的运行实例；实例重建后必须变化。 */
-  providerInstanceId: string;
+  /** 要求精确匹配的服务契约版本。 */
+  contractVersion: string;
   /** 提供者所在真实 Runtime。 */
   runtime: RuntimeKind;
-  /** 服务契约版本；第一阶段要求精确匹配。 */
-  contractVersion: string;
   /** 提供环境的启动身份；重启后变化。 */
-  authorityInstanceId: string;
-  /** 提供者作用域身份。 */
-  scopeId: string;
-  /** 提供者所在 Coordinator 的升级接管世代；旧 Worker 引用不能跨世代使用。 */
-  handoverGeneration: number;
-  /** 宿主绑定的只读服务属性；服务桥不解释其业务含义。 */
-  attributes: Readonly<Record<string, unknown>>;
+  runtimeInstanceId: string;
+  /** 服务实例身份；撤销后永不复用。 */
+  serviceInstanceId: string;
   /** 当前服务目录状态。 */
   status: "starting" | "ready" | "unavailable" | "failed";
-  /** 该引用所属的物理端口连接；本地服务可省略。 */
-  connectionId?: string;
-  /** 当前权威目录流修订号。 */
-  snapshotRevision: number;
+  /** 宿主绑定的只读服务属性；服务桥不解释其业务含义。 */
+  attributes: Readonly<Record<string, unknown>>;
   /** 可选的外部授权标识；引用不是授权本身，Provider 仍需查权威状态。 */
   grantId?: string;
   /** 服务端授权策略修订；策略变化时旧引用必须失效。 */
   authorizationRevision?: number;
 }
 
-/** 服务桥握手输入；connectionId 必须由实际端口连接生成。 */
-export interface RemoteServiceHandshake {
-  /** 当前端口 / MessagePort 连接标识。 */
-  connectionId: string;
-  /** 对端提供环境的启动身份。 */
-  authorityInstanceId: string;
-  /** 桥协议版本。 */
-  protocolVersion: string;
-}
-
-/** 一次服务目录基线或增量快照。 */
+/** 传给服务桥的完整目录快照；Runtime Host 是它的唯一权威发布者。 */
 export interface RemoteServiceSnapshot {
-  /** 快照来自哪条端口连接。 */
-  connectionId: string;
-  /** 快照来自哪个权威启动身份。 */
-  authorityInstanceId: string;
-  /** 同一启动身份、同一订阅范围内单调递增。 */
-  snapshotRevision: number;
-  /** 是否为包含完整订阅范围的基线。 */
-  baseline: boolean;
-  /** 当前订阅范围内的服务引用。 */
+  /** 快照协议版本；解析成功但版本不匹配时不得当成可用目录。 */
+  protocolVersion: string;
+  /** 权威 Runtime 的逻辑标识；独立服务桥可省略。 */
+  runtimeId?: string;
+  /** 权威 Runtime 类型；独立服务桥可省略。 */
+  runtimeKind?: RuntimeKind;
+  /** 每次 Worker 启动唯一的 Runtime 身份。 */
+  runtimeInstanceId: string;
+  /** 当前完整目录修订；同一 Runtime 只接受严格递增值。 */
+  revision: number;
+  /** Runtime 当前状态。 */
+  state?: "starting" | "ready" | "stopping" | "failed" | "disposed";
+  /** 当前完整服务目录。 */
   services: readonly RemoteServiceReference[];
 }
 
-/** 服务桥在独立 MessagePort 上发送的控制消息。 */
-export type RemoteServicePortControlMessage =
-  | {
-      /** 控制消息类型由 codec 绑定，核心不固定产品前缀。 */
-      type: string;
-      handshake: RemoteServiceHandshake;
-    }
-  | {
-      type: string;
-      snapshot: RemoteServiceSnapshot;
-    }
-  | {
-      type: string;
-      reason?: string;
-    }
-  | {
-      type: string;
-      reason?: string;
-    };
-
-/** MessagePort 服务消息类别；具体字符串由 codec 统一编码。 */
-export type RemoteServiceMessageKind =
-  | "call"
-  | "result"
-  | "error"
-  | "cancel"
-  | "handshake"
-  | "snapshot"
-  | "invalidate"
-  | "disconnect";
+/** MessagePort 服务消息类别；codec 只承载调用生命周期。 */
+export type RemoteServiceMessageKind = "call" | "result" | "error" | "cancel";
 
 /** 服务桥 wire codec；负责类型名、编解码和协议版本，不让传输层散落字符串判断。 */
 export interface RemoteServiceMessageCodec {
@@ -306,22 +264,18 @@ export interface RemoteServiceMessageCodec {
   decode(input: unknown): Record<string, unknown> | undefined;
 }
 
-/** 创建默认 WebLoom codec；产品可用同一工厂绑定旧协议前缀。 */
+/** 创建 WebLoom v2 codec；产品可以只替换 wire 前缀，不能恢复控制消息。 */
 export function createRemoteServiceMessageCodec(options: {
   prefix?: string;
   protocolVersion?: string;
 } = {}): RemoteServiceMessageCodec {
   const prefix = options.prefix ?? "webloom.remote-service";
-  const protocolVersion = options.protocolVersion ?? "1";
+  const protocolVersion = options.protocolVersion ?? "webloom.remote-service.v2";
   const types = new Map<RemoteServiceMessageKind, string>([
     ["call", `${prefix}.call`],
     ["result", `${prefix}.result`],
     ["error", `${prefix}.error`],
     ["cancel", `${prefix}.cancel`],
-    ["handshake", `${prefix}.handshake`],
-    ["snapshot", `${prefix}.snapshot`],
-    ["invalidate", `${prefix}.invalidate`],
-    ["disconnect", `${prefix}.disconnect`],
   ]);
   return Object.freeze({
     protocolVersion,
@@ -350,22 +304,22 @@ export interface RemoteServiceLookup {
   contractVersion: string;
   /** 可选的预期提供 Runtime。 */
   runtime?: RuntimeKind;
-  /** 可选的预期作用域。 */
-  scopeId?: string;
 }
 
 /** 服务代理调用上下文；服务端必须在最终边界重新检查引用和租约。 */
 export interface RemoteServiceCallContext {
   /** 业务操作标识；可由调用方复用，用于审计和幂等，不作为传输关联键。 */
   operationId?: string;
-  /** 实际建立代理的端口连接标识。 */
-  connectionId: string;
   /** 创建代理时捕获的不可变引用。 */
   reference: RemoteServiceReference;
   /** 引用绑定的外部授权标识，供最终服务边界再次核验。 */
   grantId?: string;
   /** 同时受消费者作用域和本次请求控制的 signal。 */
   signal: AbortSignal;
+  /** 从调用开始计算的总 deadline；等待目录和远程执行共用它。 */
+  deadlineAt?: number;
+  /** 传输直调用时的总 timeout；桥调用会同时提供 deadlineAt。 */
+  timeoutMs?: number;
 }
 
 /** 跨环境传输实现；桥不负责自动重放有外部副作用的请求。 */
@@ -376,58 +330,94 @@ export interface RemoteServiceTransport {
   ): Promise<TResult>;
 }
 
-/** 已绑定服务引用的代理；提供者重建后旧代理永久失效。 */
+export interface RemoteServiceCallOptions {
+  signal?: AbortSignal;
+  operationId?: string;
+  /** 兼容旧业务命名；只作为 operationId，不作为传输 callId。 */
+  requestId?: string;
+  /** 覆盖 RuntimeHandle 的默认有限 deadline。 */
+  timeoutMs?: number;
+}
+
+/** 惰性服务代理；第一次成功调用后永久绑定一份服务引用。 */
 export interface RemoteServiceProxy {
-  readonly reference: RemoteServiceReference;
+  /** 未绑定时为 undefined；绑定后引用永远不换绑。 */
+  readonly reference?: RemoteServiceReference;
   readonly revoked: boolean;
   call<TRequest, TResult>(
     request: TRequest,
-    options?: { signal?: AbortSignal; operationId?: string; /** 旧 requestId 调用方别名；不作为传输 callId。 */ requestId?: string }
+    options?: RemoteServiceCallOptions,
   ): Promise<TResult>;
   revoke(reason?: string): void;
 }
 
-export type RemoteServiceBridgeState = "disconnected" | "handshaking" | "ready" | "stale";
+export type RemoteServiceBridgeState = "empty" | "ready" | "stale" | "disposed";
 
-/** 服务桥快照结果；调用方据此决定等待、重新握手或重新同步基线。 */
+/** 服务桥完整快照结果；旧/重复 revision 直接忽略，不清空当前目录。 */
 export type RemoteServiceSnapshotResult =
-  | { accepted: true; state: RemoteServiceBridgeState; snapshotRevision: number }
-  | { accepted: false; reason: "wrong-connection" | "wrong-authority" | "stale-revision" | "baseline-required" | "revision-gap"; expectedRevision?: number; receivedRevision: number };
+  | { accepted: true; state: RemoteServiceBridgeState; revision: number }
+  | { accepted: false; reason: "stale-revision" | "protocol-mismatch" | "invalid-snapshot" | "disposed"; receivedRevision?: number };
+
+/** WebLoom v2 调用错误的稳定码；业务 handler 可以附加自己的 code。 */
+export type RemoteServiceErrorCode =
+  | "transport_unavailable"
+  | "call_timeout"
+  | "runtime_initialization_failed"
+  | "protocol_mismatch"
+  | "capability_unavailable"
+  | "contract_version_mismatch"
+  | "service_stale"
+  | "service_revoked"
+  | "permission_denied"
+  | "request_cancelled"
+  | "request_clone_failed"
+  | "handler_failed"
+  | (string & {});
+
+export class RemoteServiceError extends Error {
+  readonly code: RemoteServiceErrorCode;
+  readonly details?: Readonly<Record<string, unknown>>;
+
+  constructor(
+    code: RemoteServiceErrorCode,
+    message: string,
+    details?: Readonly<Record<string, unknown>>,
+  ) {
+    super(message);
+    this.name = "RemoteServiceError";
+    this.code = code;
+    this.details = details;
+  }
+}
 
 /** 跨 Worker 服务桥最小本地契约。 */
 export interface RemoteServiceBridge {
   /** 当前端口连接状态。 */
   readonly state: RemoteServiceBridgeState;
-  /** 当前握手连接标识。 */
-  readonly connectionId?: string;
-  /** 当前权威启动身份。 */
-  readonly authorityInstanceId?: string;
-  /** 接受一次新握手；新连接会使旧代理全部失效。 */
-  handshake(input: RemoteServiceHandshake): { accepted: boolean; reason?: "protocol-mismatch" };
-  /** 应用基线或连续增量快照；乱序和旧连接快照会被丢弃。 */
+  /** 当前权威 Runtime 启动身份。 */
+  readonly runtimeInstanceId?: string;
+  /** 应用一份完整快照；第一次调用可以早于它到达。 */
   applySnapshot(snapshot: RemoteServiceSnapshot): RemoteServiceSnapshotResult;
-  /** 查询当前 ready 且版本精确匹配的服务代理。 */
+  /** 记录可解析但版本不兼容的对端；后续调用返回 protocol_mismatch。 */
+  markProtocolMismatch(reason?: string): void;
+  /** 记录权威 Runtime 初始化失败；后续调用返回 runtime_initialization_failed。 */
+  markInitializationFailed(reason?: string): void;
+  /** 总 deadline 默认值；必须是有限且大于零的毫秒数。 */
+  readonly defaultCallTimeoutMs: number;
+  /** 获取一个惰性、单次绑定代理；不得因当前目录为空同步失败。 */
   getProxy(lookup: RemoteServiceLookup, scope?: LifecycleScope): RemoteServiceProxy | undefined;
-  /** 查询代理失败时抛出稳定错误。 */
+  /** 获取惰性代理的显式别名；只在桥 disposed 后仍返回会失败的代理。 */
   requireProxy(lookup: RemoteServiceLookup, scope?: LifecycleScope): RemoteServiceProxy;
   /** 同步撤下全部代理；不等待远端。 */
   invalidate(reason?: string): void;
-  /** 端口断线；清除当前连接身份，后续快照必须等待新握手和基线。 */
+  /** 端口断线；旧代理永久失效，后续恢复必须创建新 RuntimeHandle。 */
   disconnect(reason?: string): void;
+  /** 永久销毁桥，并拒绝所有等待绑定和 pending call。 */
+  dispose(reason?: string): void;
   /** 订阅桥状态和服务目录变化。 */
   subscribe(listener: () => void): () => void;
   /** 只读当前有效服务引用。 */
   services(): readonly RemoteServiceReference[];
-}
-
-/** 服务桥未就绪或代理已失效。 */
-export class RemoteServiceUnavailableError extends Error {
-  readonly code = "service.unavailable" as const;
-
-  constructor(message = "Remote service is unavailable") {
-    super(message);
-    this.name = "RemoteServiceUnavailableError";
-  }
 }
 
 /** 首次发布采用的升级并存策略。冷切换要求旧环境先退出；两阶段允许

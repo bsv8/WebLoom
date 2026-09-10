@@ -1,75 +1,57 @@
-// 基于 MessagePort 的远程服务调用传输。
+// 基于 MessagePort 的 WebLoom v2 远程调用传输。
 //
-// 服务桥本身只负责“哪个引用可以变成代理”；本模块负责把代理调用
-// 接到真实 Worker / Window MessagePort。它不做寻址、重放或权限放大：
-// - 每个请求都携带桥已经校验过的 service reference；
-// - AbortSignal 只发送取消通知，不把一次有外部副作用的调用自动重试；
-// - Provider 仍必须在自己的 RPC handler 和最终 I/O 边界再次校验引用、
-//   owner、会话世代和权限租约。
+// wire 只保留 call/result/error/cancel。MessagePort 本身就是连接隔离边界，
+// 因此不传 connectionId，也不把完整 RemoteServiceReference 回显给 Provider。
 
 import type {
-  RemoteServiceMessageCodec,
   RemoteServiceCallContext,
+  RemoteServiceMessageCodec,
   RemoteServiceReference,
   RemoteServiceTransport,
 } from "../contracts/lifecycle.js";
 import {
   createRemoteServiceMessageCodec,
-  RemoteServiceUnavailableError,
+  RemoteServiceError,
 } from "../contracts/lifecycle.js";
 
-/** MessagePort 上的调用请求；request 内容由具体服务契约定义。 */
 export interface RemoteServicePortCallMessage {
-  /** 固定协议类型，避免与业务 MessageBus 事件混用。 */
-  /** codec 绑定的调用消息类型。 */
   type: string;
-  /** 由传输层生成的唯一关联键；不接受调用方提供的业务 ID。 */
+  protocolVersion: string;
   callId: string;
-  /** 实际端口连接标识。 */
-  connectionId: string;
-  /** 提供者运行实例；响应必须原样回显。 */
-  providerInstanceId: string;
-  /** 调用方可复用的业务操作标识；不参与 pending 映射。 */
+  capabilityId: string;
+  contractVersion: string;
+  serviceInstanceId: string;
   operationId?: string;
-  /** 外部授权标识；Provider 最终边界必须核验。 */
   grantId?: string;
-  /** Provider 必须在最终边界重新核验的服务引用。 */
-  reference: RemoteServiceReference;
-  /** 具体服务请求体；桥不解释也不重放。 */
   request: unknown;
 }
 
-/** MessagePort 上的成功响应。 */
 export interface RemoteServicePortResultMessage {
-  /** codec 绑定的成功消息类型。 */
   type: string;
+  protocolVersion: string;
   callId: string;
-  connectionId: string;
-  providerInstanceId: string;
+  serviceInstanceId: string;
   result: unknown;
 }
 
-/** MessagePort 上的失败响应；只传可序列化错误信息。 */
 export interface RemoteServicePortErrorMessage {
-  /** codec 绑定的失败消息类型。 */
   type: string;
+  protocolVersion: string;
   callId: string;
-  connectionId: string;
-  providerInstanceId: string;
+  serviceInstanceId: string;
   error: {
     name?: string;
     message: string;
-    code?: string;
+    code: string;
+    details?: Readonly<Record<string, unknown>>;
   };
 }
 
-/** 请求取消通知；Provider 仍需在最终提交前做自己的世代校验。 */
 export interface RemoteServicePortCancelMessage {
-  /** codec 绑定的取消消息类型。 */
   type: string;
+  protocolVersion: string;
   callId: string;
-  connectionId: string;
-  providerInstanceId: string;
+  serviceInstanceId: string;
 }
 
 export type RemoteServicePortResponseMessage =
@@ -82,56 +64,77 @@ export interface CreateMessagePortServiceTransportOptions {
   /** 可选 transferable 提取器；默认只发送结构化克隆数据。 */
   transferForRequest?: (
     request: unknown,
-    context: RemoteServiceCallContext
+    context: RemoteServiceCallContext,
   ) => readonly Transferable[];
   /** dispose 时是否关闭端口；默认不关闭，由端口所有者决定。 */
   closeOnDispose?: boolean;
-  /** wire 消息 codec；默认使用 webloom.remote-service.*。 */
+  /** wire 消息 codec；默认 webloom.remote-service.v2。 */
   codec?: RemoteServiceMessageCodec;
+  /** 直接使用 transport 时的默认总 deadline。 */
+  defaultCallTimeoutMs?: number;
 }
 
 interface PendingCall {
-  connectionId: string;
-  providerInstanceId: string;
+  protocolVersion: string;
+  serviceInstanceId: string;
   resolve(value: unknown): void;
   reject(error: unknown): void;
   removeAbort: () => void;
+  disposeDeadline: () => void;
 }
 
-// 调用 ID 属于传输协议，不属于业务请求。计数器放在模块级，确保同一
-// Worker / Window 内即使销毁并重建 transport，也不会重新使用旧 callId。
-// 业务 operationId / requestId 可以重试或复用，但不能参与响应关联。
 let nextTransportId = 0;
 let nextCallSequence = 0;
-
-function makeTransportId(): number {
-  nextTransportId += 1;
-  return nextTransportId;
-}
 
 function makeCallId(transportId: number): string {
   nextCallSequence += 1;
   return `remote-call:${transportId}:${nextCallSequence}`;
 }
 
-function errorFromWire(input: RemoteServicePortErrorMessage["error"]): Error {
-  const error = new Error(
-    typeof input?.message === "string" ? input.message : "Remote service call failed"
-  );
-  if (typeof input?.name === "string" && input.name.length > 0) error.name = input.name;
-  if (typeof input?.code === "string" && input.code.length > 0) {
-    Object.defineProperty(error, "code", {
-      configurable: true,
-      enumerable: true,
-      value: input.code,
-      writable: false,
-    });
-  }
-  return error;
+function finiteTimeout(value: number | undefined): number {
+  const timeout = value ?? 30_000;
+  if (!Number.isFinite(timeout) || timeout <= 0) throw new TypeError("Remote service timeout must be finite and greater than zero");
+  return timeout;
 }
 
-function abortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new RemoteServiceUnavailableError("Remote service request aborted");
+function errorFromWire(input: RemoteServicePortErrorMessage["error"]): RemoteServiceError {
+  return new RemoteServiceError(
+    typeof input?.code === "string" && input.code.length > 0 ? input.code : "handler_failed",
+    typeof input?.message === "string" ? input.message : "Remote service call failed",
+    input?.details,
+  );
+}
+
+function abortReason(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error && typeof (reason as Error & { code?: unknown }).code === "string") return reason;
+  if (reason instanceof Error) return new RemoteServiceError("request_cancelled", reason.message);
+  return new RemoteServiceError("request_cancelled", "Remote service request was cancelled");
+}
+
+function addMessageListener(port: MessagePort, listener: (event: MessageEvent) => void): () => void {
+  port.addEventListener("message", listener);
+  return () => port.removeEventListener("message", listener);
+}
+
+function postBestEffort(port: MessagePort, message: unknown, transfer: readonly Transferable[] = []): void {
+  try { port.postMessage(message, [...transfer]); } catch { /* 断线由 deadline / dispose 收敛 */ }
+}
+
+function postRequest(port: MessagePort, message: unknown, transfer: readonly Transferable[] = []): void {
+  try {
+    port.postMessage(message, [...transfer]);
+  } catch (error) {
+    const name = error && typeof error === "object" && typeof (error as { name?: unknown }).name === "string"
+      ? (error as { name: string }).name
+      : "DataCloneError";
+    const messageText = error instanceof Error ? error.message : String(error);
+    throw new RemoteServiceError(
+      "request_clone_failed",
+      `Remote service request could not be posted: ${messageText}`,
+      { name, message: messageText },
+    );
+  }
 }
 
 function isResponseMessage(
@@ -140,121 +143,162 @@ function isResponseMessage(
 ): input is RemoteServicePortResponseMessage {
   if (!input || typeof input !== "object") return false;
   const message = input as Partial<RemoteServicePortResponseMessage>;
-  return (
-    (message.type === codec.type("result") || message.type === codec.type("error"))
+  return (message.type === codec.type("result") || message.type === codec.type("error"))
+    && typeof message.protocolVersion === "string"
     && typeof message.callId === "string"
-    && typeof message.connectionId === "string"
-    && typeof message.providerInstanceId === "string"
-  );
+    && typeof message.serviceInstanceId === "string";
 }
 
-/**
- * 创建一个真实 MessagePort 传输。
- *
- * 返回对象的 `dispose()` 只关闭本端请求表和监听器；默认不关闭端口，
- * 以免误伤同一端口上的握手 / 快照订阅。需要独占端口时可显式设置
- * `closeOnDispose: true`。
- */
+/** 创建一条不携带连接身份、不会自动重放的 MessagePort transport。 */
 export function createMessagePortServiceTransport(
-  options: CreateMessagePortServiceTransportOptions
+  options: CreateMessagePortServiceTransportOptions,
 ): RemoteServiceTransport & { dispose(): void } {
   const pending = new Map<string, PendingCall>();
   let disposed = false;
-  const transportId = makeTransportId();
+  const transportId = ++nextTransportId;
   const codec = options.codec ?? createRemoteServiceMessageCodec();
+  const defaultCallTimeoutMs = finiteTimeout(options.defaultCallTimeoutMs);
 
-  const onMessage = (event: MessageEvent) => {
+  const rejectPending = (error: Error, sendCancel: boolean): void => {
+    for (const [callId, call] of pending) {
+      pending.delete(callId);
+      call.removeAbort();
+      call.disposeDeadline();
+      if (sendCancel) {
+        postBestEffort(options.port, codec.encode({
+          type: codec.type("cancel"),
+          protocolVersion: codec.protocolVersion,
+          callId,
+          serviceInstanceId: call.serviceInstanceId,
+        }));
+      }
+      call.reject(error);
+    }
+  };
+
+  const onMessage = (event: MessageEvent): void => {
     const decoded = codec.decode(event.data);
     if (!isResponseMessage(decoded, codec)) return;
     const call = pending.get(decoded.callId);
     if (!call) return;
-    // 迟到的旧连接/旧 Provider 响应必须被丢弃。callId 单独解决复用
-    // operationId 的问题，连接和 provider 身份再解决端口内的世代问题。
-    if (
-      decoded.connectionId !== call.connectionId
-      || decoded.providerInstanceId !== call.providerInstanceId
-    ) return;
+    if (decoded.serviceInstanceId !== call.serviceInstanceId) return;
     pending.delete(decoded.callId);
     call.removeAbort();
+    call.disposeDeadline();
+    if (decoded.protocolVersion !== codec.protocolVersion) {
+      call.reject(new RemoteServiceError("protocol_mismatch", "Remote service protocol version mismatch"));
+      return;
+    }
     if (decoded.type === codec.type("error")) {
-      call.reject(errorFromWire(decoded.error as RemoteServicePortErrorMessage["error"]));
+      call.reject(errorFromWire((decoded as RemoteServicePortErrorMessage).error));
     } else {
       call.resolve(decoded.result);
     }
   };
-
-  options.port.addEventListener("message", onMessage);
+  const onMessageError = (): void => rejectPending(new RemoteServiceError("transport_unavailable", "Remote service message could not be decoded"), false);
+  const removeMessage = addMessageListener(options.port, onMessage);
+  options.port.addEventListener("messageerror", onMessageError);
   options.port.start();
 
-  const dispose = () => {
+  const dispose = (): void => {
     if (disposed) return;
     disposed = true;
-    options.port.removeEventListener("message", onMessage);
-    for (const [callId, call] of pending) {
-      pending.delete(callId);
-      call.removeAbort();
-      call.reject(new RemoteServiceUnavailableError("Remote service transport disposed"));
+    removeMessage();
+    options.port.removeEventListener("messageerror", onMessageError);
+    rejectPending(new RemoteServiceError("transport_unavailable", "Remote service transport disposed"), true);
+    if (options.closeOnDispose) {
+      try { options.port.close(); } catch { /* noop */ }
     }
-    if (options.closeOnDispose) options.port.close();
   };
 
   const transport: RemoteServiceTransport & { dispose(): void } = {
     call<TRequest, TResult>(request: TRequest, context: RemoteServiceCallContext): Promise<TResult> {
-      if (disposed) return Promise.reject(new RemoteServiceUnavailableError("Remote service transport disposed"));
+      if (disposed) return Promise.reject(new RemoteServiceError("transport_unavailable", "Remote service transport disposed"));
       if (context.signal.aborted) return Promise.reject(abortReason(context.signal));
       const callId = makeCallId(transportId);
-      const providerInstanceId = context.reference.providerInstanceId;
+      const serviceInstanceId = context.reference.serviceInstanceId;
+      const timeoutMs = finiteTimeout(context.timeoutMs ?? defaultCallTimeoutMs);
+      const deadlineAt = context.deadlineAt ?? Date.now() + timeoutMs;
+      const timeoutController = new AbortController();
+      const remaining = Math.max(0, deadlineAt - Date.now());
+      const deadlineTimer = setTimeout(() => {
+        try { timeoutController.abort(new RemoteServiceError("call_timeout", "Remote service call timed out")); } catch { timeoutController.abort(); }
+      }, remaining);
+      const merged = (() => {
+        const controller = new AbortController();
+        const signals = [context.signal, timeoutController.signal];
+        const listeners = signals.map((signal) => {
+          const listener = () => {
+            try { controller.abort(signal.reason); } catch { controller.abort(); }
+          };
+          signal.addEventListener("abort", listener, { once: true });
+          return { signal, listener };
+        });
+        return {
+          signal: controller.signal,
+          dispose: () => listeners.forEach(({ signal, listener }) => signal.removeEventListener("abort", listener)),
+        };
+      })();
 
       return new Promise<TResult>((resolve, reject) => {
         let settled = false;
-        const finish = (callback: () => void) => {
+        const finish = (callback: () => void): void => {
           if (settled) return;
           settled = true;
           callback();
         };
-        const onAbort = () => {
+        const sendCancel = (): void => postBestEffort(options.port, codec.encode({
+          type: codec.type("cancel"),
+          protocolVersion: codec.protocolVersion,
+          callId,
+          serviceInstanceId,
+        }));
+        const onAbort = (): void => {
           if (!pending.delete(callId)) return;
-          finish(() => reject(abortReason(context.signal)));
-          try {
-            const cancel: RemoteServicePortCancelMessage = {
-              type: codec.type("cancel"),
-              callId,
-              connectionId: context.connectionId,
-              providerInstanceId,
-            };
-            options.port.postMessage(codec.encode(cancel as unknown as Record<string, unknown>));
-          } catch {
-            // 端口断开时调用已经失败；不能再用异常覆盖原取消结果。
-          }
+          sendCancel();
+          const reason = merged.signal.reason instanceof RemoteServiceError
+            ? merged.signal.reason
+            : merged.signal.reason?.code === "call_timeout"
+              ? merged.signal.reason
+              : abortReason(merged.signal);
+          finish(() => reject(reason));
+          merged.dispose();
+          clearTimeout(deadlineTimer);
         };
         const pendingCall: PendingCall = {
-          connectionId: context.connectionId,
-          providerInstanceId,
+          protocolVersion: codec.protocolVersion,
+          serviceInstanceId,
           resolve: (value) => finish(() => resolve(value as TResult)),
           reject: (error) => finish(() => reject(error)),
-          removeAbort: () => context.signal.removeEventListener("abort", onAbort),
+          removeAbort: () => merged.signal.removeEventListener("abort", onAbort),
+          disposeDeadline: () => {
+            merged.dispose();
+            clearTimeout(deadlineTimer);
+          },
         };
         pending.set(callId, pendingCall);
-        context.signal.addEventListener("abort", onAbort, { once: true });
+        merged.signal.addEventListener("abort", onAbort, { once: true });
+        const message: RemoteServicePortCallMessage = {
+          type: codec.type("call"),
+          protocolVersion: codec.protocolVersion,
+          callId,
+          capabilityId: context.reference.capabilityId,
+          contractVersion: context.reference.contractVersion,
+          serviceInstanceId,
+          ...(context.operationId ? { operationId: context.operationId } : {}),
+          ...(context.grantId ?? context.reference.grantId
+            ? { grantId: context.grantId ?? context.reference.grantId }
+            : {}),
+          request,
+        };
         try {
-          const message: RemoteServicePortCallMessage = {
-            type: codec.type("call"),
-            callId,
-            connectionId: context.connectionId,
-            providerInstanceId,
-            ...(context.operationId ? { operationId: context.operationId } : {}),
-            ...(context.grantId ?? context.reference.grantId
-              ? { grantId: context.grantId ?? context.reference.grantId }
-              : {}),
-            reference: context.reference,
-            request,
-          };
           const transfer = options.transferForRequest?.(request, context) ?? [];
-          options.port.postMessage(codec.encode(message as unknown as Record<string, unknown>), [...transfer]);
-          if (context.signal.aborted) onAbort();
+          postRequest(options.port, codec.encode(message as unknown as Record<string, unknown>), transfer);
+          if (merged.signal.aborted) onAbort();
         } catch (error) {
           pending.delete(callId);
           pendingCall.removeAbort();
+          pendingCall.disposeDeadline();
           pendingCall.reject(error);
         }
       });
@@ -262,4 +306,12 @@ export function createMessagePortServiceTransport(
     dispose,
   };
   return transport;
+}
+
+/** Provider 侧调用消息的结构化输入。 */
+export interface MessagePortServiceCallInput {
+  message: RemoteServicePortCallMessage;
+  /** Provider 的权威目录命中的服务引用。 */
+  reference: RemoteServiceReference;
+  signal: AbortSignal;
 }

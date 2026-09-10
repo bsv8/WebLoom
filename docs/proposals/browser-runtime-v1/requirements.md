@@ -1,10 +1,15 @@
 # WebLoom 浏览器双运行时迭代需求
 
+> SharedWorker 连接协议现已采用 call-first 方向。本文涉及 `hello`、握手、baseline、
+> resync、`ready()` 和自动重连的条款，由
+> [SharedWorker call-first 消融施工单](../shared-worker-call-first/implementation-plan.md)
+> 覆盖；其他产品目标和安全要求不变。
+
 ## 1. 文档信息
 
 - 项目：WebLoom
 - 迭代：浏览器双运行时 v1
-- 状态：需求已确认，待实施
+- 状态：基础 Runtime 已实施；SharedWorker 连接部分由 call-first 施工单收口
 - 文档性质：破坏性简化迭代；不代表当前代码已经具备本文能力
 - 关联施工单：[浏览器双运行时施工单](./implementation-plan.md)
 

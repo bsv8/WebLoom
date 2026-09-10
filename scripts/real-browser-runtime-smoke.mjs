@@ -106,6 +106,9 @@ if (playwright) {
           const context = await browser.newContext();
           const readResult = async (page, url) => {
             await page.goto(url);
+            return readCurrentResult(page);
+          };
+          const readCurrentResult = async (page) => {
             await page.waitForFunction(
               () => Boolean(window.__WEBLOOM_RESULT__),
               undefined,
@@ -113,6 +116,7 @@ if (playwright) {
             );
             return page.evaluate(() => window.__WEBLOOM_RESULT__);
           };
+          const goto = async (page, url) => page.goto(url, { waitUntil: "domcontentloaded" });
           const pages = [await context.newPage(), await context.newPage()];
           const results = await Promise.all(pages.map((page) => readResult(page, baseUrl)));
           if (results.some((result) => !result || result.ok !== true)) {
@@ -128,7 +132,7 @@ if (playwright) {
             || first.setupCount !== 1
             || second.setupCount !== 1
             || first.workerRuntimeInstanceId !== second.workerRuntimeInstanceId
-            || first.connectionId === second.connectionId
+            || first.serviceInstanceId !== second.serviceInstanceId
             || typeof first.workerUrl !== "string"
             || first.workerUrl.startsWith("data:")
             || first.workerUrl.endsWith(".ts")) {
@@ -145,10 +149,54 @@ if (playwright) {
           if (!reconnectResult || reconnectResult.ok !== true
             || reconnectResult.scenario !== "reconnect"
             || reconnectResult.reconnected !== true
-            || reconnectResult.firstConnectionId === reconnectResult.secondConnectionId) {
+            || reconnectResult.firstRuntimeInstanceId !== reconnectResult.secondRuntimeInstanceId
+            || !["service_revoked", "transport_unavailable"].includes(String(reconnectResult.oldProxyError))) {
             throw new Error(`real reconnect assertions failed: ${JSON.stringify(reconnectResult)}`);
           }
           await reconnectPage.close();
+
+          const terminalPages = [await context.newPage(), await context.newPage()];
+          await Promise.all(terminalPages.map((page, index) => goto(
+            page,
+            `${baseUrl}?scenario=${index === 0 ? "terminal-trigger" : "terminal-observer"}`,
+          )));
+          await Promise.all(terminalPages.map((page) => page.waitForFunction(
+            () => window.__WEBLOOM_TERMINAL_READY__?.connected === true
+              && window.__WEBLOOM_TERMINAL_READY__?.runtimeReady === true
+              && window.__WEBLOOM_TERMINAL_READY__?.subscriptionInstalled === true,
+            undefined,
+            { timeout: 10_000 },
+          )));
+          const terminalReady = await Promise.all(terminalPages.map((page) => page.evaluate(
+            () => window.__WEBLOOM_TERMINAL_READY__,
+          )));
+          if (terminalReady.some((state) => !state?.connected || !state.runtimeReady || !state.subscriptionInstalled)) {
+            throw new Error(`terminal connection barrier failed: ${JSON.stringify(terminalReady)}`);
+          }
+          await terminalPages[0].evaluate(() => window.__WEBLOOM_SHUTDOWN__?.());
+          const terminalResults = await Promise.all(terminalPages.map((page) => readCurrentResult(page)));
+          if (terminalResults.some((result) => !result || result.ok !== true)
+            || terminalResults.some((result) => !Array.isArray(result.states)
+              || !result.states.includes("stopping")
+              || !result.states.includes("disposed"))
+            || terminalResults.some((result) => !result.terminalReady?.connected
+              || !result.terminalReady?.runtimeReady
+              || !result.terminalReady?.subscriptionInstalled)
+            || !["service_revoked", "transport_unavailable"].includes(String(terminalResults[0]?.oldProxyError))
+            || Number(terminalResults[0]?.elapsedMs) >= 500) {
+            throw new Error(`real terminal dispose assertions failed: ${JSON.stringify(terminalResults)}`);
+          }
+          const latePage = await context.newPage();
+          const lateResult = await readResult(latePage, `${baseUrl}?scenario=terminal-late`);
+          if (!lateResult || lateResult.ok !== true
+            || lateResult.scenario !== "terminal-late"
+            || !Array.isArray(lateResult.states)
+            || !lateResult.states.includes("disposed")
+            || lateResult.states.includes("stopping")) {
+            throw new Error(`real late terminal connection assertions failed: ${JSON.stringify(lateResult)}`);
+          }
+          await latePage.close();
+          await Promise.all(terminalPages.map((page) => page.close()));
 
           const mismatchPage = await context.newPage();
           const mismatchResult = await readResult(mismatchPage, `${baseUrl}?scenario=protocol-mismatch`);
@@ -165,6 +213,8 @@ if (playwright) {
             emittedWorkerChunks: workerFiles,
             results,
             reconnect: reconnectResult,
+            terminalDispose: terminalResults,
+            terminalLate: lateResult,
             protocolMismatch: mismatchResult,
           }, null, 2));
           await context.close();

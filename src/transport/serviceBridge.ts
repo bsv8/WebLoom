@@ -1,14 +1,16 @@
-// 跨 Worker 服务桥的本地实现。
+// 跨 Worker 服务桥的 WebLoom v2 实现。
 //
-// 桥只处理握手、服务目录连续性和代理失效；它不做自动寻址、不传递
-// PluginContext，也不替代本地依赖装配器。真正的 RPC 入口仍必须在提供端
-// 按引用、租约和宿主绑定属性再次校验。
+// capability() / getProxy() 只创建惰性代理。第一次 call() 在同一个总
+// deadline 内等待完整目录和远端执行；绑定成功后代理永久固定到一份
+// runtimeInstanceId + serviceInstanceId，目录替换、断线和 Runtime 重启只会
+// 撤销它，绝不静默换绑。
 
 import type {
   LifecycleScope,
   RemoteServiceBridge,
   RemoteServiceCallContext,
-  RemoteServiceHandshake,
+  RemoteServiceCallOptions,
+  RemoteServiceErrorCode,
   RemoteServiceLookup,
   RemoteServiceProxy,
   RemoteServiceReference,
@@ -16,64 +18,28 @@ import type {
   RemoteServiceSnapshotResult,
   RemoteServiceTransport,
 } from "../contracts/lifecycle.js";
-import { RemoteServiceUnavailableError } from "../contracts/lifecycle.js";
+import {
+  RemoteServiceError,
+} from "../contracts/lifecycle.js";
 
 export interface CreateServiceBridgeOptions {
-  /** 桥协议版本；握手要求精确匹配。 */
+  /** 要接受的精确服务协议版本。 */
   protocolVersion: string;
   /** 实际端口 RPC 传输；桥不负责重放请求。 */
   transport: RemoteServiceTransport;
+  /** 默认总 deadline；必须有限且大于零。 */
+  defaultCallTimeoutMs?: number;
 }
 
-function makeRequestId(): string {
-  try {
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      return `service-request:${crypto.randomUUID()}`;
-    }
-  } catch {
-    // 测试 / 旧 Worker 没有 Web Crypto 时退回非安全唯一值；它不是授权凭据。
-  }
-  return `service-request:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
+interface ProxyRecord {
+  boundReference?: RemoteServiceReference;
+  revoked: boolean;
+  reason: string;
+  controller: AbortController;
 }
 
-function mergeSignals(...signals: Array<AbortSignal | undefined>): {
-  signal: AbortSignal;
-  dispose: () => void;
-} {
-  const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
-  if (activeSignals.length === 0) {
-    return { signal: new AbortController().signal, dispose: () => undefined };
-  }
-  if (activeSignals.length === 1) {
-    const [signal] = activeSignals;
-    // length 已知为 1；显式判断是为了兼容 noUncheckedIndexedAccess。
-    if (signal) return { signal, dispose: () => undefined };
-  }
-  const alreadyAborted = activeSignals.find((signal) => signal.aborted);
-  if (alreadyAborted) {
-    const controller = new AbortController();
-    controller.abort(alreadyAborted.reason);
-    return { signal: controller.signal, dispose: () => undefined };
-  }
-  const controller = new AbortController();
-  const abort = (source: AbortSignal) => {
-    try {
-      controller.abort(source.reason);
-    } catch {
-      controller.abort();
-    }
-  };
-  const listeners = activeSignals.map((signal) => {
-    const listener = () => abort(signal);
-    signal.addEventListener("abort", listener, { once: true });
-    return { signal, listener };
-  });
-  return {
-    signal: controller.signal,
-    dispose: () => {
-      for (const item of listeners) item.signal.removeEventListener("abort", item.listener);
-    },
-  };
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function stableAttributes(value: Readonly<Record<string, unknown>>): string {
@@ -89,232 +55,346 @@ function stableAttributes(value: Readonly<Record<string, unknown>>): string {
   return JSON.stringify(normalize(value));
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isSafeAttributeValue(value: unknown, seen: Set<object>): boolean {
+  if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  const valid = Array.isArray(value)
+    ? value.every((item) => isSafeAttributeValue(item, seen))
+    : isPlainRecord(value)
+      && !Reflect.ownKeys(value).some((key) => typeof key !== "string")
+      && Object.values(value).every((item) => isSafeAttributeValue(item, seen));
+  seen.delete(value);
+  return valid;
+}
+
+function isValidAttributes(value: unknown): value is Readonly<Record<string, unknown>> {
+  return isPlainRecord(value) && isSafeAttributeValue(value, new Set<object>());
+}
+
+function isValidSnapshot(snapshot: RemoteServiceSnapshot): boolean {
+  if (!snapshot || typeof snapshot !== "object"
+    || typeof snapshot.protocolVersion !== "string"
+    || snapshot.protocolVersion.length === 0
+    || typeof snapshot.runtimeInstanceId !== "string"
+    || snapshot.runtimeInstanceId.length === 0
+    || !Number.isSafeInteger(snapshot.revision)
+    || snapshot.revision < 0
+    || !Array.isArray(snapshot.services)) return false;
+  if (snapshot.runtimeId !== undefined && (typeof snapshot.runtimeId !== "string" || snapshot.runtimeId.length === 0)) return false;
+  if (snapshot.runtimeKind !== undefined && snapshot.runtimeKind !== "window-main" && snapshot.runtimeKind !== "shared-worker") return false;
+  if (snapshot.state !== undefined
+    && snapshot.state !== "starting"
+    && snapshot.state !== "ready"
+    && snapshot.state !== "stopping"
+    && snapshot.state !== "failed"
+    && snapshot.state !== "disposed") return false;
+
+  const bindingKeys = new Set<string>();
+  const serviceCapabilityKeys = new Set<string>();
+  const readyLookupKeys = new Set<string>();
+  for (const service of snapshot.services) {
+    if (!service || typeof service !== "object"
+      || typeof service.capabilityId !== "string" || service.capabilityId.length === 0
+      || typeof service.contractVersion !== "string" || service.contractVersion.length === 0
+      || (service.runtime !== "window-main" && service.runtime !== "shared-worker")
+      || service.runtimeInstanceId !== snapshot.runtimeInstanceId
+      || typeof service.serviceInstanceId !== "string" || service.serviceInstanceId.length === 0
+      || (service.status !== "starting" && service.status !== "ready" && service.status !== "unavailable" && service.status !== "failed")
+      || !isValidAttributes(service.attributes)
+      || (service.grantId !== undefined && (typeof service.grantId !== "string" || service.grantId.length === 0))
+      || (service.authorizationRevision !== undefined
+        && (!Number.isSafeInteger(service.authorizationRevision) || service.authorizationRevision < 0))) return false;
+    if (snapshot.runtimeKind !== undefined && service.runtime !== snapshot.runtimeKind) return false;
+
+    const key = bindingKey(service);
+    if (bindingKeys.has(key)) return false;
+    bindingKeys.add(key);
+    const serviceCapabilityKey = `${service.capabilityId}\u0000${service.serviceInstanceId}`;
+    if (serviceCapabilityKeys.has(serviceCapabilityKey)) return false;
+    serviceCapabilityKeys.add(serviceCapabilityKey);
+    if (service.status === "ready") {
+      const lookupKey = `${service.capabilityId}\u0000${service.contractVersion}\u0000${service.runtime}`;
+      if (readyLookupKeys.has(lookupKey)) return false;
+      readyLookupKeys.add(lookupKey);
+    }
+  }
+  return true;
+}
+
 function referenceKey(reference: RemoteServiceReference): string {
   return [
     reference.capabilityId,
-    reference.providerInstanceId,
-    reference.runtime,
     reference.contractVersion,
-    reference.authorityInstanceId,
-    reference.connectionId ?? "local",
-    reference.scopeId,
-    reference.handoverGeneration,
+    reference.runtime,
+    reference.runtimeInstanceId,
+    reference.serviceInstanceId,
+    reference.status,
     stableAttributes(reference.attributes),
     reference.grantId ?? "null",
     reference.authorizationRevision ?? "null",
-    // 代理绑定的是某一份权威目录快照；目录修订后即使 Provider 实例未变，
-    // 旧代理也不能继续使用旧授权视图，必须重新取得当前引用。
-    reference.snapshotRevision,
+  ].join("\u0000");
+}
+
+function bindingKey(reference: RemoteServiceReference): string {
+  return [
+    reference.capabilityId,
+    reference.contractVersion,
+    reference.runtime,
+    reference.runtimeInstanceId,
+    reference.serviceInstanceId,
   ].join("\u0000");
 }
 
 function lookupMatches(reference: RemoteServiceReference, lookup: RemoteServiceLookup): boolean {
-  return reference.status === "ready"
-    && reference.capabilityId === lookup.capabilityId
+  return reference.capabilityId === lookup.capabilityId
     && reference.contractVersion === lookup.contractVersion
-    && (lookup.runtime === undefined || reference.runtime === lookup.runtime)
-    && (lookup.scopeId === undefined || reference.scopeId === lookup.scopeId);
+    && (lookup.runtime === undefined || reference.runtime === lookup.runtime);
 }
 
-interface ProxyRecord {
-  reference: RemoteServiceReference;
-  revoked: boolean;
-  reason: string;
-  controller: AbortController;
+function ensureTimeout(value: number | undefined, label: string): number {
+  const timeout = value ?? 30_000;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new TypeError(`${label} must be a finite number greater than zero`);
+  }
+  return timeout;
 }
 
-/**
- * 创建一个绑定端口的服务桥。
- *
- * 快照规则：必须先接受 baseline；后续 revision 必须连续递增。发现缺口后
- * 立即清空代理，等待新 baseline，不能拿旧服务继续运行。
- */
+function mergeSignals(...signals: Array<AbortSignal | undefined>): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (active.length === 0) return { signal: new AbortController().signal, dispose: () => undefined };
+  const alreadyAborted = active.find((signal) => signal.aborted);
+  if (alreadyAborted) {
+    const controller = new AbortController();
+    controller.abort(alreadyAborted.reason);
+    return { signal: controller.signal, dispose: () => undefined };
+  }
+  const controller = new AbortController();
+  const listeners = active.map((signal) => {
+    const listener = () => {
+      try { controller.abort(signal.reason); } catch { controller.abort(); }
+    };
+    signal.addEventListener("abort", listener, { once: true });
+    return { signal, listener };
+  });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const { signal, listener } of listeners) signal.removeEventListener("abort", listener);
+    },
+  };
+}
+
+function abortedError(signal: AbortSignal, fallback: RemoteServiceErrorCode = "request_cancelled"): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error && typeof (reason as Error & { code?: unknown }).code === "string") return reason;
+  if (reason instanceof Error && fallback === "request_cancelled") {
+    return new RemoteServiceError("request_cancelled", reason.message);
+  }
+  return new RemoteServiceError(fallback, fallback === "call_timeout" ? "Remote service call timed out" : "Remote service request was cancelled");
+}
+
+function callTimeoutError(timeoutMs: number): RemoteServiceError {
+  return new RemoteServiceError("call_timeout", `Remote service call exceeded its ${timeoutMs}ms deadline`, { timeoutMs });
+}
+
+/** 创建一个无连接握手、无增量 revision 状态机的服务桥。 */
 export function createServiceBridge(options: CreateServiceBridgeOptions): RemoteServiceBridge {
-  let currentState: RemoteServiceBridge["state"] = "disconnected";
-  let currentConnectionId: string | undefined;
-  let currentAuthorityInstanceId: string | undefined;
-  let lastRevision: number | undefined;
-  let hasBaseline = false;
-  const references = new Map<string, RemoteServiceReference>();
+  const defaultCallTimeoutMs = ensureTimeout(options.defaultCallTimeoutMs, "defaultCallTimeoutMs");
+  let currentState: RemoteServiceBridge["state"] = "empty";
+  let currentRuntimeInstanceId: string | undefined;
+  let currentRevision: number | undefined;
+  let currentServices: readonly RemoteServiceReference[] = [];
+  let terminalError: RemoteServiceError | undefined;
   const proxies = new Set<ProxyRecord>();
   const listeners = new Set<() => void>();
 
-  const notify = () => {
+  const notify = (): void => {
     for (const listener of [...listeners]) {
-      try {
-        listener();
-      } catch {
-        // 观察者异常不能让服务桥停止接收撤权消息。
-      }
+      try { listener(); } catch { /* 观察者不能阻断撤权 */ }
     }
   };
 
-  const revokeProxy = (proxy: ProxyRecord, reason: string) => {
-    if (proxy.revoked) return;
-    proxy.revoked = true;
-    proxy.reason = reason;
-    try {
-      proxy.controller.abort(new RemoteServiceUnavailableError(reason));
-    } catch {
-      proxy.controller.abort();
-    }
+  const revokeProxy = (record: ProxyRecord, reason: string, code: RemoteServiceErrorCode = "service_revoked"): void => {
+    if (record.revoked) return;
+    record.revoked = true;
+    record.reason = reason;
+    try { record.controller.abort(new RemoteServiceError(code, reason)); } catch { record.controller.abort(); }
   };
 
-  const invalidateProxies = (reason: string, keep?: ReadonlySet<string>) => {
-    for (const proxy of proxies) {
-      if (!keep?.has(referenceKey(proxy.reference))) {
-        revokeProxy(proxy, reason);
-        // Proxy 对象仍可被调用方持有；这里只移除桥内部的追踪记录，
-        // 避免每次 Provider 重建都累积一个永不再用的旧实例记录。
-        proxies.delete(proxy);
-      }
-    }
+  const revokeAll = (reason: string, code: RemoteServiceErrorCode = "service_revoked"): void => {
+    for (const record of proxies) revokeProxy(record, reason, code);
   };
 
-  const clearReferences = (reason: string) => {
-    references.clear();
-    invalidateProxies(reason);
+  const currentMatches = (lookup: RemoteServiceLookup): RemoteServiceReference[] => (
+    currentServices.filter((reference) => reference.status === "ready" && lookupMatches(reference, lookup))
+  );
+
+  const findBinding = (record: ProxyRecord, lookup: RemoteServiceLookup): RemoteServiceReference | undefined => {
+    if (record.boundReference) return record.boundReference;
+    if (terminalError) throw terminalError;
+    const matches = currentMatches(lookup);
+    if (matches.length > 1) {
+      throw new RemoteServiceError(
+        "capability_unavailable",
+        `Service "${lookup.capabilityId}" version "${lookup.contractVersion}" has multiple ready instances`,
+      );
+    }
+    const reference = matches[0];
+    if (reference) {
+      record.boundReference = Object.freeze({
+        ...reference,
+        attributes: Object.freeze({ ...reference.attributes }),
+      });
+      return record.boundReference;
+    }
+    return undefined;
+  };
+
+  const waitForBinding = (
+    record: ProxyRecord,
+    lookup: RemoteServiceLookup,
+    signal: AbortSignal,
+  ): Promise<RemoteServiceReference> => {
+    const immediate = findBinding(record, lookup);
+    if (immediate) return Promise.resolve(immediate);
+    if (record.revoked) return Promise.reject(new RemoteServiceError("service_revoked", record.reason));
+    if (signal.aborted) return Promise.reject(abortedError(signal));
+
+    return new Promise<RemoteServiceReference>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        removeListener();
+        callback();
+      };
+      const check = (): void => {
+        if (record.revoked) {
+          finish(() => reject(new RemoteServiceError("service_revoked", record.reason)));
+          return;
+        }
+        if (signal.aborted) {
+          finish(() => reject(abortedError(signal)));
+          return;
+        }
+        try {
+          const reference = findBinding(record, lookup);
+          if (reference) finish(() => resolve(reference));
+        } catch (error) {
+          finish(() => reject(error));
+        }
+      };
+      const onAbort = () => check();
+      const listener = () => check();
+      const removeListener = (): void => {
+        signal.removeEventListener("abort", onAbort);
+        listeners.delete(listener);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      listeners.add(listener);
+      check();
+    });
   };
 
   const bridge: RemoteServiceBridge = {
-    get state() {
-      return currentState;
-    },
-    get connectionId() {
-      return currentConnectionId;
-    },
-    get authorityInstanceId() {
-      return currentAuthorityInstanceId;
-    },
-    handshake(input: RemoteServiceHandshake) {
-      if (input.protocolVersion !== options.protocolVersion) {
-        clearReferences("service bridge protocol mismatch");
-        currentConnectionId = undefined;
-        currentAuthorityInstanceId = undefined;
-        lastRevision = undefined;
-        hasBaseline = false;
-        currentState = "disconnected";
-        notify();
-        return { accepted: false, reason: "protocol-mismatch" as const };
-      }
-
-      const isNewBinding = currentConnectionId !== input.connectionId
-        || currentAuthorityInstanceId !== input.authorityInstanceId;
-      if (isNewBinding) {
-        clearReferences("remote service authority or connection changed");
-        lastRevision = undefined;
-        hasBaseline = false;
-      }
-      currentConnectionId = input.connectionId;
-      currentAuthorityInstanceId = input.authorityInstanceId;
-      currentState = "handshaking";
-      notify();
-      return { accepted: true };
-    },
+    get state() { return currentState; },
+    get runtimeInstanceId() { return currentRuntimeInstanceId; },
+    get defaultCallTimeoutMs() { return defaultCallTimeoutMs; },
     applySnapshot(snapshot: RemoteServiceSnapshot): RemoteServiceSnapshotResult {
-      if (snapshot.connectionId !== currentConnectionId) {
-        return {
-          accepted: false,
-          reason: "wrong-connection",
-          receivedRevision: snapshot.snapshotRevision,
-        };
+      if (currentState === "disposed") return { accepted: false, reason: "disposed" };
+      if (snapshot.protocolVersion !== options.protocolVersion) {
+        return { accepted: false, reason: "protocol-mismatch", receivedRevision: snapshot.revision };
       }
-      if (snapshot.authorityInstanceId !== currentAuthorityInstanceId) {
-        return {
-          accepted: false,
-          reason: "wrong-authority",
-          receivedRevision: snapshot.snapshotRevision,
-        };
+      // Validate the complete directory before revoking any proxy or changing
+      // the current authority. A single foreign/duplicate/unsafe reference
+      // therefore cannot cause a partial state transition.
+      if (!isValidSnapshot(snapshot)) {
+        return { accepted: false, reason: "invalid-snapshot", receivedRevision: snapshot.revision };
       }
-      if (!Number.isSafeInteger(snapshot.snapshotRevision) || snapshot.snapshotRevision < 0) {
-        return {
-          accepted: false,
-          reason: "stale-revision",
-          receivedRevision: snapshot.snapshotRevision,
-        };
-      }
-      if (!snapshot.baseline && !hasBaseline) {
-        currentState = "stale";
-        clearReferences("service bridge baseline required");
-        notify();
-        return {
-          accepted: false,
-          reason: "baseline-required",
-          receivedRevision: snapshot.snapshotRevision,
-        };
-      }
-      if (lastRevision !== undefined && snapshot.snapshotRevision <= lastRevision) {
-        return {
-          accepted: false,
-          reason: "stale-revision",
-          receivedRevision: snapshot.snapshotRevision,
-        };
-      }
-      if (!snapshot.baseline && lastRevision !== undefined && snapshot.snapshotRevision !== lastRevision + 1) {
-        currentState = "stale";
-        clearReferences("service bridge revision gap");
-        hasBaseline = false;
-        notify();
-        return {
-          accepted: false,
-          reason: "revision-gap",
-          expectedRevision: lastRevision + 1,
-          receivedRevision: snapshot.snapshotRevision,
-        };
+      if (currentRuntimeInstanceId === snapshot.runtimeInstanceId
+        && currentRevision !== undefined
+        && snapshot.revision <= currentRevision) {
+        return { accepted: false, reason: "stale-revision", receivedRevision: snapshot.revision };
       }
 
-      const next = new Map<string, RemoteServiceReference>();
-      for (const reference of snapshot.services) {
-        // 目录包也必须自洽；不能让一条伪造的 entry 借当前握手身份
-        // 把代理指向另一条 authority，或借旧 revision 混入当前快照。
-        // 不自洽的条目按 fail-closed 处理：忽略它，而不是猜测兼容版本。
-        if (
-          reference.authorityInstanceId !== currentAuthorityInstanceId
-          || reference.connectionId !== undefined && reference.connectionId !== snapshot.connectionId
-          || reference.snapshotRevision !== snapshot.snapshotRevision
-        ) continue;
-        next.set(referenceKey(reference), Object.freeze({ ...reference }));
+      const runtimeChanged = currentRuntimeInstanceId !== undefined
+        && currentRuntimeInstanceId !== snapshot.runtimeInstanceId;
+      if (runtimeChanged) revokeAll("Runtime instance changed; proxy cannot be rebound", "service_stale");
+
+      const nextServices = snapshot.services.map((service) => Object.freeze({
+        ...service,
+        attributes: Object.freeze({ ...service.attributes }),
+      }));
+      const nextReady = new Map(nextServices
+        .filter((service) => service.status === "ready")
+        .map((service) => [bindingKey(service), service] as const));
+      if (!runtimeChanged) {
+        for (const record of proxies) {
+          const bound = record.boundReference;
+          if (!bound) continue;
+          const replacement = nextReady.get(bindingKey(bound));
+          if (!replacement || referenceKey(replacement) !== referenceKey(bound)) {
+            revokeProxy(record, "Bound service instance was replaced or revoked", "service_revoked");
+          }
+        }
       }
-      references.clear();
-      for (const [key, reference] of next) references.set(key, reference);
-      const validKeys = new Set(
-        [...next.values()]
-          .filter((reference) => reference.status === "ready")
-          .map(referenceKey)
-      );
-      invalidateProxies("remote service reference is no longer ready", validKeys);
-      lastRevision = snapshot.snapshotRevision;
-      hasBaseline = true;
-      currentState = "ready";
+
+      currentRuntimeInstanceId = snapshot.runtimeInstanceId;
+      currentRevision = snapshot.revision;
+      currentServices = Object.freeze(nextServices);
+      terminalError = undefined;
+      if (snapshot.state === "failed") {
+        currentState = "stale";
+        terminalError = new RemoteServiceError("runtime_initialization_failed", "Remote Runtime initialization failed");
+      } else if (snapshot.state === "disposed" || snapshot.state === "stopping") {
+        currentState = "stale";
+        terminalError = new RemoteServiceError("transport_unavailable", "Remote Runtime is no longer accepting calls");
+        revokeAll("Remote Runtime is no longer accepting calls", "transport_unavailable");
+      } else if (snapshot.state === "ready") {
+        currentState = "ready";
+      } else {
+        currentState = "empty";
+      }
       notify();
-      return {
-        accepted: true,
-        state: currentState,
-        snapshotRevision: snapshot.snapshotRevision,
-      };
+      return { accepted: true, state: currentState, revision: snapshot.revision };
     },
-    getProxy(lookup: RemoteServiceLookup, scope?: LifecycleScope): RemoteServiceProxy | undefined {
-      if (currentState !== "ready") return undefined;
-      const matches = [...references.values()].filter((candidate) => lookupMatches(candidate, lookup));
-      if (matches.length > 1) {
-        throw new RemoteServiceUnavailableError(
-          `Service reference is ambiguous for "${lookup.capabilityId}" version "${lookup.contractVersion}"`
-        );
-      }
-      const reference = matches[0];
-      if (!reference) return undefined;
+    markProtocolMismatch(reason = "Remote Runtime protocol version mismatch"): void {
+      if (currentState === "disposed") return;
+      terminalError = new RemoteServiceError("protocol_mismatch", reason);
+      revokeAll(reason, "protocol_mismatch");
+      currentState = "stale";
+      notify();
+    },
+    markInitializationFailed(reason = "Remote Runtime initialization failed"): void {
+      if (currentState === "disposed") return;
+      terminalError = new RemoteServiceError("runtime_initialization_failed", reason);
+      revokeAll(reason, "runtime_initialization_failed");
+      currentState = "stale";
+      notify();
+    },
+    getProxy(lookup: RemoteServiceLookup, scope?: LifecycleScope): RemoteServiceProxy {
       const record: ProxyRecord = {
-        reference,
         revoked: false,
-        reason: "remote service proxy revoked",
+        reason: "Remote service proxy revoked",
         controller: new AbortController(),
       };
       proxies.add(record);
       let removeScopeRevoke: (() => void) | undefined;
       let removeScopeDispose: (() => void) | undefined;
-      let proxy: RemoteServiceProxy;
-      const revokeFromScope = (reason: string) => {
-        revokeProxy(record, reason);
+      const revokeFromScope = (reason: string): void => {
+        revokeProxy(record, reason, "service_revoked");
         proxies.delete(record);
         removeScopeRevoke?.();
         removeScopeDispose?.();
@@ -322,76 +402,61 @@ export function createServiceBridge(options: CreateServiceBridgeOptions): Remote
       if (scope) {
         try {
           removeScopeRevoke = scope.onRevoke(revokeFromScope);
-          removeScopeDispose = scope.onDispose(revokeFromScope, `service-proxy:${reference.capabilityId}`);
+          removeScopeDispose = scope.onDispose(revokeFromScope, `service-proxy:${lookup.capabilityId}`);
         } catch {
-          record.revoked = true;
+          revokeFromScope("Remote service proxy scope is already revoked");
         }
       }
-      if (record.revoked) {
-        proxies.delete(record);
-        removeScopeRevoke?.();
-        removeScopeDispose?.();
-        return undefined;
-      }
-      proxy = {
-        reference,
-        get revoked() {
-          return record.revoked;
-        },
-        async call<TRequest, TResult>(
-          request: TRequest,
-          callOptions: { signal?: AbortSignal; operationId?: string; requestId?: string } = {}
-        ) {
-          if (record.revoked) throw new RemoteServiceUnavailableError(record.reason);
-          const current = references.get(referenceKey(reference));
-          if (currentState !== "ready" || !current || current.status !== "ready") {
-            record.revoked = true;
-            record.reason = "Remote service reference is no longer ready";
-            throw new RemoteServiceUnavailableError(record.reason);
-          }
-          const merged = mergeSignals(scope?.signal, record.controller.signal, callOptions.signal);
-          const connectionId = currentConnectionId;
-          if (!connectionId) {
-            merged.dispose();
-            throw new RemoteServiceUnavailableError("Remote service connection is no longer active");
-          }
-          const context: RemoteServiceCallContext = {
-            // requestId 只作为旧调用方的业务 operationId 别名；真正的
-            // MessagePort callId 由传输层每次调用单独生成。
-            operationId: callOptions.operationId ?? callOptions.requestId ?? makeRequestId(),
-            connectionId,
-            reference,
-            grantId: reference.grantId,
-            signal: merged.signal,
-          };
-          let result: Promise<TResult>;
+      const proxy: RemoteServiceProxy = {
+        get reference() { return record.boundReference; },
+        get revoked() { return record.revoked; },
+        async call<TRequest, TResult>(request: TRequest, callOptions: RemoteServiceCallOptions = {}): Promise<TResult> {
+          if (record.revoked) throw new RemoteServiceError("service_revoked", record.reason);
+          const timeoutMs = ensureTimeout(callOptions.timeoutMs ?? defaultCallTimeoutMs, "timeoutMs");
+          const deadlineAt = Date.now() + timeoutMs;
+          const timeoutController = new AbortController();
+          const timeout = setTimeout(() => {
+            try { timeoutController.abort(callTimeoutError(timeoutMs)); } catch { timeoutController.abort(); }
+          }, timeoutMs);
+          const merged = mergeSignals(scope?.signal, record.controller.signal, callOptions.signal, timeoutController.signal);
           try {
-            result = Promise.resolve(options.transport.call<TRequest, TResult>(request, context));
-          } catch (error) {
-            merged.dispose();
-            throw error;
-          }
-          try {
+            const reference = await waitForBinding(record, lookup, merged.signal);
+            if (merged.signal.aborted) throw abortedError(merged.signal);
+            const context: RemoteServiceCallContext = {
+              operationId: callOptions.operationId ?? callOptions.requestId,
+              reference,
+              grantId: reference.grantId,
+              signal: merged.signal,
+              deadlineAt,
+              timeoutMs,
+            };
+            let result: Promise<TResult>;
+            try {
+              result = Promise.resolve(options.transport.call<TRequest, TResult>(request, context));
+            } catch (error) {
+              throw error;
+            }
             const value = await Promise.race([
               result,
               new Promise<TResult>((_, reject) => {
                 if (merged.signal.aborted) {
-                  reject(merged.signal.reason ?? new RemoteServiceUnavailableError("Remote service request aborted"));
+                  reject(abortedError(merged.signal));
                   return;
                 }
-                const onAbort = () => reject(merged.signal.reason ?? new RemoteServiceUnavailableError("Remote service request aborted"));
+                const onAbort = () => reject(abortedError(merged.signal));
                 merged.signal.addEventListener("abort", onAbort, { once: true });
                 result.finally(() => merged.signal.removeEventListener("abort", onAbort)).catch(() => undefined);
               }),
             ]);
-            if (record.revoked || currentState !== "ready" || references.get(referenceKey(reference))?.status !== "ready") {
-              throw new RemoteServiceUnavailableError("Remote service request belongs to an invalidated proxy");
-            }
+            if (record.revoked) throw new RemoteServiceError("service_revoked", record.reason);
             return value;
+          } catch (error) {
+            if (merged.signal.aborted) throw abortedError(merged.signal);
+            if (error instanceof RemoteServiceError) throw error;
+            throw error;
           } finally {
+            clearTimeout(timeout);
             merged.dispose();
-            // 代理被撤销后保留在集合中没有安全意义，避免长期增长；撤销
-            // 本身已经不可逆，因此不会被未来同名服务复用。
             if (record.revoked) {
               proxies.delete(record);
               removeScopeRevoke?.();
@@ -399,51 +464,52 @@ export function createServiceBridge(options: CreateServiceBridgeOptions): Remote
             }
           }
         },
-        revoke(reason = "remote service proxy revoked") {
-          revokeProxy(record, reason);
-          proxies.delete(record);
-          removeScopeRevoke?.();
-          removeScopeDispose?.();
+        revoke(reason = "Remote service proxy revoked"): void {
+          revokeFromScope(reason);
         },
       };
       return proxy;
     },
     requireProxy(lookup: RemoteServiceLookup, scope?: LifecycleScope): RemoteServiceProxy {
-      const proxy = bridge.getProxy(lookup, scope);
-      if (!proxy) {
-        throw new RemoteServiceUnavailableError(
-          `Service "${lookup.capabilityId}" version "${lookup.contractVersion}" is not ready`
-        );
-      }
-      return proxy;
+      return bridge.getProxy(lookup, scope) as RemoteServiceProxy;
     },
-    invalidate(reason = "remote service bridge invalidated") {
-      clearReferences(reason);
+    invalidate(reason = "Remote service directory invalidated"): void {
+      if (currentState === "disposed") return;
+      currentServices = [];
+      currentRevision = undefined;
+      terminalError = undefined;
+      revokeAll(reason, "service_revoked");
       currentState = "stale";
-      lastRevision = undefined;
-      hasBaseline = false;
       notify();
     },
-    disconnect(reason = "remote service connection disconnected") {
-      clearReferences(reason);
-      currentConnectionId = undefined;
-      currentAuthorityInstanceId = undefined;
-      lastRevision = undefined;
-      hasBaseline = false;
-      currentState = "disconnected";
+    disconnect(reason = "Remote service transport disconnected"): void {
+      if (currentState === "disposed") return;
+      currentServices = [];
+      currentRevision = undefined;
+      currentRuntimeInstanceId = undefined;
+      terminalError = new RemoteServiceError("transport_unavailable", reason);
+      revokeAll(reason, "transport_unavailable");
+      currentState = "stale";
       notify();
     },
-    subscribe(listener) {
+    dispose(reason = "Remote service bridge disposed"): void {
+      if (currentState === "disposed") return;
+      currentServices = [];
+      currentRevision = undefined;
+      currentRuntimeInstanceId = undefined;
+      terminalError = new RemoteServiceError("transport_unavailable", reason);
+      revokeAll(reason, "transport_unavailable");
+      currentState = "disposed";
+      notify();
+      proxies.clear();
+    },
+    subscribe(listener: () => void): () => void {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    services() {
-      return [...references.values()];
+    services(): readonly RemoteServiceReference[] {
+      return currentServices;
     },
   };
-
   return bridge;
 }
-
-/** 兼容“服务桥 / 远程服务桥”两种调用语义；实现仍只有一套。 */
-export const createRemoteServiceBridge = createServiceBridge;

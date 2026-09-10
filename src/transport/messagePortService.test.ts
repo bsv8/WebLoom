@@ -1,176 +1,169 @@
 import { describe, expect, it } from "vitest";
-
 import {
   createRemoteServiceMessageCodec,
   type RemoteServiceReference,
 } from "../contracts/lifecycle.js";
-import {
-  createMessagePortServiceProvider,
-} from "./messagePortServiceProvider.js";
-import {
-  createMessagePortServiceTransport,
-} from "./messagePortServiceTransport.js";
+import { createMessagePortServiceProvider } from "./messagePortServiceProvider.js";
+import { createMessagePortServiceTransport } from "./messagePortServiceTransport.js";
 
-function reference(providerInstanceId = "provider-1"): RemoteServiceReference {
+function reference(serviceInstanceId = "service-1"): RemoteServiceReference {
   return {
     capabilityId: "demo.service",
-    providerInstanceId,
+    contractVersion: "demo.service.v1",
     runtime: "shared-worker",
-    contractVersion: "1.0.0",
-    authorityInstanceId: "authority-1",
-    scopeId: "scope-1",
-    handoverGeneration: 1,
-    attributes: { tenant: "demo" },
+    runtimeInstanceId: "runtime-1",
+    serviceInstanceId,
     status: "ready",
-    snapshotRevision: 1,
+    attributes: { tenant: "demo" },
   };
 }
 
-describe("MessagePort service transport/provider", () => {
-  it("使用默认 WebLoom codec 完成调用，并区分 operationId 与 callId", async () => {
+function context(ref = reference(), signal = new AbortController().signal) {
+  return { reference: ref, signal };
+}
+
+describe("MessagePort service transport/provider v2", () => {
+  it("完成 call/result 且 wire 不包含 connectionId 或完整 reference", async () => {
     const channel = new MessageChannel();
-    const receivedCallIds: string[] = [];
+    const received: Record<string, unknown>[] = [];
+    const ref = reference();
     const provider = createMessagePortServiceProvider({
       port: channel.port1,
-      handshake: {
-        connectionId: "connection-1",
-        authorityInstanceId: "authority-1",
-        protocolVersion: "1",
-      },
-      snapshot: {
-        connectionId: "connection-1",
-        authorityInstanceId: "authority-1",
-        snapshotRevision: 1,
-        baseline: true,
-        services: [reference()],
-      },
+      services: () => [ref],
       handleCall: async ({ message }) => {
-        receivedCallIds.push(message.callId);
+        received.push(message as unknown as Record<string, unknown>);
         return { echoed: message.request };
       },
     });
-    const transport = createMessagePortServiceTransport({
-      port: channel.port2,
+    const transport = createMessagePortServiceTransport({ port: channel.port2 });
+    await expect(transport.call({ value: 1 }, context(ref))).resolves.toEqual({ echoed: { value: 1 } });
+    expect(received[0]).toMatchObject({
+      capabilityId: "demo.service",
+      contractVersion: "demo.service.v1",
+      serviceInstanceId: "service-1",
+      request: { value: 1 },
     });
-    const serviceReference = reference();
-    const context = () => ({
-      operationId: "same-business-operation",
-      connectionId: "connection-1",
-      reference: serviceReference,
-      signal: new AbortController().signal,
-    });
-
-    await expect(transport.call({ value: 1 }, context())).resolves.toEqual({
-      echoed: { value: 1 },
-    });
-    await expect(transport.call({ value: 2 }, context())).resolves.toEqual({
-      echoed: { value: 2 },
-    });
-
-    expect(receivedCallIds).toHaveLength(2);
-    expect(new Set(receivedCallIds).size).toBe(2);
+    expect(received[0]).not.toHaveProperty("connectionId");
+    expect(received[0]).not.toHaveProperty("reference");
     provider.dispose();
     transport.dispose();
   });
 
-  it("通过显式 codec 保持产品旧 wire 前缀，同时保留同一套传输实现", async () => {
+  it("支持自定义 wire prefix，但消息类别仍只有四种", async () => {
     const channel = new MessageChannel();
-    const codec = createRemoteServiceMessageCodec({
-      prefix: "legacy.remote-service",
-      protocolVersion: "1",
-    });
+    const codec = createRemoteServiceMessageCodec({ prefix: "product.remote-service" });
+    const ref = reference("service-custom");
     const provider = createMessagePortServiceProvider({
       port: channel.port1,
       codec,
-      handshake: {
-        connectionId: "connection-legacy",
-        authorityInstanceId: "authority-legacy",
-        protocolVersion: codec.protocolVersion,
-      },
-      snapshot: {
-        connectionId: "connection-legacy",
-        authorityInstanceId: "authority-legacy",
-        snapshotRevision: 1,
-        baseline: true,
-        services: [
-          {
-            ...reference("provider-legacy"),
-            authorityInstanceId: "authority-legacy",
-            providerInstanceId: "provider-legacy",
-          },
-        ],
-      },
+      services: () => [ref],
       handleCall: async ({ message }) => message.request,
     });
-    const transport = createMessagePortServiceTransport({
-      port: channel.port2,
-      codec,
-    });
-
-    await expect(transport.call(
-      { legacy: true },
-      {
-        connectionId: "connection-legacy",
-        reference: {
-          ...reference("provider-legacy"),
-          authorityInstanceId: "authority-legacy",
-          providerInstanceId: "provider-legacy",
-        },
-        signal: new AbortController().signal,
-      },
-    )).resolves.toEqual({ legacy: true });
-
-    expect(codec.type("call")).toBe("legacy.remote-service.call");
+    const transport = createMessagePortServiceTransport({ port: channel.port2, codec });
+    await expect(transport.call({ custom: true }, context(ref))).resolves.toEqual({ custom: true });
+    expect(codec.type("call")).toBe("product.remote-service.call");
+    expect(() => codec.type("call")).not.toThrow();
     provider.dispose();
     transport.dispose();
   });
 
-  it("取消调用时向 Provider 发送 cancel，且不把迟到结果交给调用方", async () => {
+  it("同步 postMessage/DataCloneError 立即返回结构化 clone error", async () => {
+    const channel = new MessageChannel();
+    const port = channel.port2 as MessagePort & { postMessage: MessagePort["postMessage"] };
+    port.postMessage = (() => {
+      throw new DOMException("The object could not be cloned", "DataCloneError");
+    }) as MessagePort["postMessage"];
+    const transport = createMessagePortServiceTransport({ port, defaultCallTimeoutMs: 100 });
+    await expect(transport.call({ uncloneable: true }, context())).rejects.toMatchObject({
+      code: "request_clone_failed",
+      details: { name: "DataCloneError" },
+    });
+    transport.dispose();
+    channel.port1.close();
+  });
+
+  it("取消调用时删除 pending 并向 Provider 发送 cancel", async () => {
     const channel = new MessageChannel();
     let providerAborted = false;
+    let handlerStarted = false;
+    const ref = reference("service-cancel");
     const provider = createMessagePortServiceProvider({
       port: channel.port1,
-      handshake: {
-        connectionId: "connection-cancel",
-        authorityInstanceId: "authority-cancel",
-        protocolVersion: "1",
-      },
-      snapshot: {
-        connectionId: "connection-cancel",
-        authorityInstanceId: "authority-cancel",
-        snapshotRevision: 1,
-        baseline: true,
-        services: [reference("provider-cancel")],
-      },
+      services: () => [ref],
       handleCall: async ({ signal }) => {
-        await new Promise<void>((resolve) => {
-          signal.addEventListener("abort", () => {
-            providerAborted = true;
-            resolve();
-          }, { once: true });
-        });
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+          providerAborted = true;
+          resolve();
+        }, { once: true }));
         throw new Error("cancelled");
       },
     });
     const transport = createMessagePortServiceTransport({ port: channel.port2 });
     const controller = new AbortController();
-    const pending = transport.call(
-      { value: "cancel-me" },
-      {
-        connectionId: "connection-cancel",
-        reference: reference("provider-cancel"),
-        signal: controller.signal,
-      },
-    );
+    const pending = transport.call({}, context(ref, controller.signal));
     controller.abort(new Error("caller cancelled"));
+    await expect(pending).rejects.toMatchObject({ code: "request_cancelled" });
+    await viWaitFor(() => providerAborted);
+    provider.dispose();
+    transport.dispose();
+  });
 
-    await expect(pending).rejects.toThrow("caller cancelled");
-    await new Promise<void>((resolve) => {
-      const check = () => providerAborted ? resolve() : setTimeout(check, 0);
-      check();
+  it("Provider revoke 先阻止新调用并 abort 当前 handler", async () => {
+    const channel = new MessageChannel();
+    let providerAborted = false;
+    let handlerStarted = false;
+    const ref = reference("service-revoke");
+    const provider = createMessagePortServiceProvider({
+      port: channel.port1,
+      services: () => [ref],
+      handleCall: async ({ signal }) => new Promise((_resolve, reject) => {
+        handlerStarted = true;
+        signal.addEventListener("abort", () => {
+          providerAborted = true;
+          reject(new Error("revoked"));
+        }, { once: true });
+      }),
     });
-    expect(providerAborted).toBe(true);
+    const transport = createMessagePortServiceTransport({ port: channel.port2 });
+    const pending = transport.call({}, context(ref));
+    await viWaitFor(() => handlerStarted);
+    provider.revoke("provider restarting");
+    await expect(pending).rejects.toBeDefined();
+    await expect(transport.call({}, context(ref))).rejects.toMatchObject({ code: "service_revoked" });
+    provider.dispose();
+    transport.dispose();
+  });
+
+  it("目录替换会撤销旧 binding；忽略 AbortSignal 的 handler 也不能发送迟到结果", async () => {
+    const channel = new MessageChannel();
+    let handlerStarted = false;
+    let releaseHandler!: () => void;
+    const ref = reference("service-directory-epoch");
+    const provider = createMessagePortServiceProvider({
+      port: channel.port1,
+      services: () => [ref],
+      handleCall: async () => {
+        handlerStarted = true;
+        await new Promise<void>((resolve) => { releaseHandler = resolve; });
+        return "late-success";
+      },
+    });
+    const transport = createMessagePortServiceTransport({ port: channel.port2, defaultCallTimeoutMs: 40 });
+    const pending = transport.call({}, context(ref));
+    await viWaitFor(() => handlerStarted);
+    provider.setServices([]);
+    releaseHandler();
+
+    await expect(pending).rejects.toMatchObject({ code: "service_revoked" });
     provider.dispose();
     transport.dispose();
   });
 });
+
+async function viWaitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition did not become true");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+}

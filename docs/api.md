@@ -2,15 +2,15 @@
 
 ## 浏览器 Runtime
 
-WebLoom v1 只支持两个真实 JavaScript realm：`window-main` 和
+WebLoom 0.3.0 只支持两个真实 JavaScript realm：`window-main` 和
 `shared-worker`。`runtime` 是受限的 `RuntimeKind`，不是可自由填写的环境标签；
-不支持的 runtime 在装配边界 fail closed。v1 不实现 Server、Service Worker 或
+不支持的 runtime 在装配边界 fail closed。不实现 Server、Service Worker 或
 其它服务端 PluginHost。
 
 一次 Runtime 启动会生成不可复用的 `runtimeInstanceId`。每个插件运行单元启动
-会生成不可复用的 `unitInstanceId`（在 Host 的兼容状态接口中表现为
-`instanceId`）。同一 SharedWorker 接收多个 Window 连接时，Worker 单元仍只有
-一个实例；每条端口连接拥有独立的 `connectionId`、请求和取消空间。
+会生成不可复用的运行单元 `instanceId`。同一 SharedWorker 接收多个 Window 连接
+时，Worker 单元仍只有一个实例；端口本身隔离请求和取消空间，物理端口身份不进入
+公共 Runtime 或 RemoteService wire。
 
 ## 普通插件 API
 
@@ -70,7 +70,7 @@ Window 入口：
 import coordinatorWorkerUrl from "./coordinator.worker.ts?sharedworker&url";
 import { connectSharedWorker } from "webloom-framework";
 
-const runtime = await connectSharedWorker({
+const runtime = connectSharedWorker({
   id: "coordinator",
   url: coordinatorWorkerUrl,
 });
@@ -79,10 +79,11 @@ const storage = runtime.capability("storage.service");
 await storage.call({ key: "hello" });
 ```
 
-连接入口必须创建真实的 `new SharedWorker(url, { type: "module" })`。握手成功
-后必须先收到完整 baseline；后续快照 revision 必须连续。断线、revision gap、
-Worker 重启或 Provider 实例变化都会同步撤销旧代理。重连只建立新连接和新代理，
-不会重放可能产生外部副作用的调用，也不会静默替换旧代理的绑定。
+连接入口必须创建真实的 `new SharedWorker(url, { type: "module" })`，并同步返回
+本地 `RuntimeHandle`。Worker 只发布完整 `RuntimeSnapshot`；`capability()` 总是
+返回惰性代理，第一次 `call()` 在同一个有限 deadline 内等待目录和远程执行。断线、
+协议不兼容、Worker 重启或 Provider 实例变化都会同步撤销旧代理。显式重建只建立
+新句柄和新代理，不会重放可能产生外部副作用的调用，也不会静默替换旧代理的绑定。
 
 这里的 `url` 必须是 Bundler 产出的 JavaScript Worker URL。Vite 使用
 `?sharedworker&url` 或等价的独立 Rollup entry；不要把
@@ -95,10 +96,8 @@ Worker 重启或 Provider 实例变化都会同步撤销旧代理。重连只建
 | --- | --- |
 | `runtimeId` | Worker 的逻辑标识 |
 | `runtimeInstanceId` | 当前 Worker 物理启动身份 |
-| `connectionId` | 当前 Window 物理连接身份 |
-| `state()` | `connecting / ready / disconnected / failed / disposed` 快照 |
-| `ready()` | 等待握手和完整 baseline；不可自动重连的断线、failed 或 disposed 后持续拒绝 `RuntimeUnavailableError`，自动重连时只等待新的 readiness generation |
-| `capability()` | 获取绑定 Runtime、Provider、契约版本和 revision 的代理 |
+| `state()` | `starting / ready / disconnected / failed / stopping / disposed` 快照 |
+| `capability()` | 立即获取惰性代理；第一次 `call()` 精确绑定 Runtime/service instance |
 | `subscribe()` | 观察 Runtime/Unit/服务快照 |
 | `dispose()` | 同步撤销本句柄，异步关闭连接资源 |
 
@@ -117,21 +116,23 @@ const app = await createWindowApp({
       contractVersion: "coordinator.service.v1",
       sourceRuntime: "shared-worker",
     }],
-    async setup(ctx) {
+    setup(ctx) {
       const coordinator = ctx.serviceBridge?.requireProxy({
         capabilityId: "coordinator.service",
         contractVersion: "coordinator.service.v1",
         runtime: "shared-worker",
       }, ctx.scope);
-      ctx.provide("window.coordinator", await coordinator.call({ type: "health" }));
+      if (!coordinator) throw new Error("Remote service bridge is unavailable");
+      ctx.provide("window.coordinator", coordinator);
     },
   })],
 });
 ```
 
-`remoteRuntime` 只向 Host 投影当前 baseline/revision 中的服务和单元状态；setup
-函数不会进入 Worker。断线时 Host 同步撤销页面插件的 Scope 和远程代理，重连后的
-新代理必须重新取得，不会静默重绑旧引用。
+`remoteRuntime` 只向 Host 投影当前完整快照中的服务和单元状态；setup 函数不会进入
+Worker。这里的 `coordinator` 是惰性代理，业务在调用边界执行
+`await coordinator.call({ type: "health" })`。断线时 Host 同步撤销页面插件的 Scope
+和远程代理，显式重建后的新代理必须重新取得，不会静默重绑旧引用。
 
 ## 生命周期和 Scope
 

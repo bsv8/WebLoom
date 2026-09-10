@@ -32,6 +32,7 @@ const allowedPackFiles = [
   /^README\.md$/,
   /^docs\/(?:api|migration-baseline)\.md$/,
   /^docs\/proposals\/browser-runtime-v1\/(?:requirements|implementation-plan|verification)\.md$/,
+  /^docs\/proposals\/shared-worker-call-first\/(?:implementation-plan|SWCF-009-typed-transfer-follow-up)\.md$/,
   /^dist\/(?:index|react|testing)\.(?:js|d\.ts|js\.map)$/,
   /^dist\/chunk-[A-Za-z0-9_-]+\.js(?:\.map)?$/,
   /^dist\/(?:createPluginHost|resourceRegistry)-[A-Za-z0-9_-]+\.d\.ts$/,

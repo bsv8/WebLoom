@@ -1,6 +1,6 @@
 # WebLoom
 
-WebLoom 是一个只面向浏览器的插件 Runtime 框架。v1 管理真实的
+WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.3.0 管理真实的
 `window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、
 依赖图、ResourceScope、权限租约、服务桥和资源缓存；路由、存储、日志、
 国际化等产品能力由插件或下游应用注入。
@@ -75,7 +75,7 @@ Window 侧只连接 Worker，不创建第二套 Worker 插件生命周期：
 import coordinatorWorkerUrl from "./coordinator.worker.ts?sharedworker&url";
 import { connectSharedWorker } from "webloom-framework";
 
-const runtime = await connectSharedWorker({
+const runtime = connectSharedWorker({
   id: "coordinator",
   url: coordinatorWorkerUrl,
 });
@@ -83,9 +83,11 @@ const service = runtime.capability("coordinator.service");
 await service.call({ type: "health" });
 ```
 
-句柄统一处理 module `SharedWorker`、握手、完整 baseline、连续 revision、
-断线和重连。旧代理不会静默换绑到新 Worker；Worker 重启后
-`runtimeInstanceId` 与 `unitInstanceId` 都会变化。
+`connectSharedWorker()` 同步返回本地句柄；Worker 通过完整 `RuntimeSnapshot` 发布
+状态和服务目录，代理的第一次 `call()` 在有限 deadline 内等待精确匹配。协议不兼容、
+断线、超时和服务撤销都从调用 Promise 返回；框架不自动重连或重放调用。旧代理不会
+静默换绑到新 Worker；Worker 重启后 `runtimeInstanceId`、服务的
+`serviceInstanceId` 和运行单元实例都会变化。
 
 Vite 项目必须把 Worker 入口交给 Vite 的 Worker importer（例如
 `?sharedworker&url`），再把构建后导出的 URL 传给框架。框架内部的
@@ -97,7 +99,7 @@ Rollup entry。仓库的 `pnpm run test:browser` 会先执行生产构建，再�
 Window 插件依赖 Worker capability 时，把已连接的 `RuntimeHandle` 传给
 `createWindowApp({ remoteRuntime: runtime, plugins })`，并在 setup 中通过
 `ctx.serviceBridge.requireProxy()` 获取精确版本的远程代理。Worker 断线时，Window
-Host 会把相关单元置为 `blocked`；新 baseline 到达后按原启用意图重新协调。
+Host 会把相关单元置为 `blocked`；新的完整快照到达后按原启用意图重新协调。
 
 ## 公共字段中文语义
 
@@ -106,9 +108,10 @@ Host 会把相关单元置为 `blocked`；新 baseline 到达后按原启用意�
 | `pluginId` | 插件产品的稳定标识；用于用户启停和依赖图身份。 |
 | `unitId` | 产品在一个 Runtime 中的稳定运行单元标识。 |
 | `instanceId` | 某运行单元一次启动生成的唯一实例标识；重启不得复用。 |
-| `runtime` | 真实 JavaScript 运行空间；v1 仅为 `window-main/shared-worker`。 |
+| `runtime` | 真实 JavaScript 运行空间；当前版本仅为 `window-main/shared-worker`。 |
 | `runtimeInstanceId` | 某个 Window 或 SharedWorker 启动生成的不可复用身份。 |
-| `connectionId` | Window 与 SharedWorker 之间一条物理连接的不可复用身份。 |
+| `serviceInstanceId` | 某个服务实例的不可复用身份；服务撤销或重建后必须变化。 |
+| `revision` | 完整 RuntimeSnapshot 的单调修订号；只用于观察和目录收敛。 |
 | `scopeId` | 本次生命周期 Scope 的唯一标识。 |
 | `capability` | 插件提供或依赖的服务契约标识。 |
 | `contractVersion` | capability 的精确契约版本。 |

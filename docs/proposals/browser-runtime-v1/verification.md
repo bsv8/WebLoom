@@ -1,11 +1,11 @@
-# 浏览器双运行时 v1 验证记录
+# 浏览器双运行时验证记录
 
 更新时间：2026-09-09
 
 ## 当前已通过
 
-- WebLoom TypeScript typecheck：通过。
-- Vitest：17 个测试文件、112 个测试通过；SharedWorker 的 Node 部分明确使用
+- WebLoom 0.3.0 TypeScript typecheck：通过。
+- Vitest：16 个测试文件、107 个测试通过；SharedWorker 的 Node 部分明确使用
   `MessageChannel` transport simulation。
 - `pnpm lint:boundaries`：通过。
 - `pnpm build`：通过。
@@ -14,19 +14,22 @@
 - `git diff --check`：通过。
 
 本轮还覆盖了 Window Host 的 `remoteRuntime` 投影、跨 Runtime 精确契约依赖、
-断线后 blocked/reconnect reconcile、required 元数据防降级、显式 `unitId` 投影、
-握手超时、SharedWorker 错误连接收敛，以及不可重连断线/dispose 后 `ready()`
-持续拒绝。
+断线后 blocked/reconcile、required 元数据防降级、显式 `unitId` 投影、
+惰性 call deadline、SharedWorker 错误连接收敛、stopping/disposed 后拒绝新连接，
+以及 dispose 后旧代理永久失效。
 
 ## 真实浏览器证据
 
 仓库新增 `scripts/browser-runtime-fixture/` 和 `pnpm run test:browser`。fixture
 先由 Vite 生产构建，再从临时 dist preview 启动真实 HTML Window、module
 SharedWorker 和两个页面，断言 Window/Worker realm marker、Worker setup 只执行
-一次、共享 Worker 实例身份和独立 connectionId；同时覆盖真实重连、协议版本不兼容
-和构建后 Worker URL。
+一次、共享 Worker/runtime/service 实例身份；同时覆盖显式 dispose 后重建新句柄和新
+代理、旧代理失效、协议版本不兼容和构建后 Worker URL。
 
-当前执行结果：通过。仓库声明 Playwright 1.63.0，已安装 Chromium；runner 会在
+当前执行结果：通过；最终 fixture 连续 10/10 次通过。terminal 场景先等待触发页和观察页
+都报告 connected、ready、subscription installed，再触发 shutdown；两端均收到
+`ready → stopping → disposed`。另有末态后连接页面收到 `starting → disposed`，不补发
+历史 `stopping`。仓库声明 Playwright 1.63.0，已安装 Chromium；runner 会在
 每次验收前执行 `playwright install chromium`，缺少浏览器时仍 fail closed 为
 `unsupported`/退出码 2，不回退为 Node 或同页面 MessageChannel。
 
@@ -43,7 +46,11 @@ SharedWorker 和两个页面，断言 Window/Worker realm marker、Worker setup 
   client 通过 `connectSharedWorker()` 复用同一物理端口，保留原有 Coordinator RPC、
   私钥隔离、session epoch、owner fence、final-I/O lease 和 localStorage bridge。
   Keymaster typecheck、production build 以及 215-file Vitest batch 已通过。
-- `webloom-framework@0.2.0` 仍是待发布工作区版本；npm registry 当前没有该版本，
-  Keymaster 仍保留本地 `file:` 依赖，release-boundary 仍锁定已发布的 `0.1.0`。
-  因此“npm 0.2.0 发布后重新安装并验收”的发布门禁尚未宣称通过，也没有在本轮
-  伪造 registry 版本或自动发布。
+- `webloom-framework@0.3.0` 仍是待发布工作区版本；npm registry 当前没有该版本，
+  下游使用本地 tarball 完成消费者验证，release-boundary 已切换为精确 `0.3.0`。
+  Keymaster 的 release-boundary 现在还会动态查询 registry 的精确版本、tarball
+  integrity，并与 frozen lockfile 比对；当前门禁因 registry 404 失败。因此“npm
+  0.3.0 发布后重新安装并验收”尚未完成。Keymaster 另有
+  `pnpm verify:webloom-registry`，会在全新临时目录生成 lockfile、执行 registry-only
+  `npm ci` 并导入三个公共入口；当前同样因 404 fail closed。没有在本轮伪造 registry
+  版本或自动发布。

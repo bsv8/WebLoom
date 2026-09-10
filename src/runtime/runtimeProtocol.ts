@@ -1,43 +1,28 @@
-// Window <-> SharedWorker 的轻量运行时协议。
+// Window <-> SharedWorker 的 WebLoom v2 运行时协议。
 //
-// 服务调用仍复用 RemoteServiceMessageCodec / MessagePort transport；本文件
-// 只定义运行时握手、快照和重同步消息。setup 函数、Context 和业务私密值
-// 永远不进入这些结构化克隆消息。
+// Runtime 只发布完整快照。没有 hello、握手、baseline 或 resync 控制消息；
+// 端口本身就是连接边界，服务调用则只走 call/result/error/cancel。
 
 import type { PluginStateKind, PluginUnitState } from "../contracts/plugin.js";
 import type {
   RemoteServiceMessageCodec,
   RemoteServiceReference,
+  RuntimeKind,
 } from "../contracts/lifecycle.js";
 import { createRemoteServiceMessageCodec } from "../contracts/lifecycle.js";
-import type { RuntimeKind } from "../contracts/lifecycle.js";
 
-export const RUNTIME_PROTOCOL_VERSION = "webloom.runtime.v1";
-export const RUNTIME_HELLO_TYPE = "webloom.runtime.hello";
+export const RUNTIME_PROTOCOL_VERSION = "webloom.runtime.v2";
 export const RUNTIME_SNAPSHOT_TYPE = "webloom.runtime.snapshot";
-export const RUNTIME_RESYNC_TYPE = "webloom.runtime.resync";
 export const RUNTIME_ERROR_TYPE = "webloom.runtime.error";
-
-export interface RuntimeHelloMessage {
-  type: typeof RUNTIME_HELLO_TYPE;
-  protocolVersion: string;
-  connectionId: string;
-  runtimeId: string;
-}
-
-export interface RuntimeResyncMessage {
-  type: typeof RUNTIME_RESYNC_TYPE;
-  connectionId: string;
-}
 
 export interface RuntimeErrorMessage {
   type: typeof RUNTIME_ERROR_TYPE;
   protocolVersion: string;
-  code: "runtime.protocol_mismatch" | "runtime.initialization_failed" | "runtime.invalid_connection";
+  code: "runtime_initialization_failed" | "protocol_mismatch" | "transport_unavailable";
   message: string;
   pluginId?: string;
   unitId?: string;
-  phase?: string;
+  phase?: "startup" | "snapshot";
 }
 
 export interface RuntimeSnapshot {
@@ -46,9 +31,7 @@ export interface RuntimeSnapshot {
   runtimeId: string;
   runtimeKind: RuntimeKind;
   runtimeInstanceId: string;
-  connectionId: string;
-  snapshotRevision: number;
-  baseline: boolean;
+  revision: number;
   state: "starting" | "ready" | "stopping" | "failed" | "disposed";
   units: readonly RuntimeSnapshotUnit[];
   services: readonly RemoteServiceReference[];
@@ -90,22 +73,16 @@ function isRemoteServiceReference(input: unknown): input is RemoteServiceReferen
   if (!isRecord(input)) return false;
   const reference = input as Partial<RemoteServiceReference>;
   return isNonEmptyString(reference.capabilityId)
-    && isNonEmptyString(reference.providerInstanceId)
-    && isRuntimeKind(reference.runtime)
     && isNonEmptyString(reference.contractVersion)
-    && isNonEmptyString(reference.authorityInstanceId)
-    && isNonEmptyString(reference.scopeId)
-    && Number.isSafeInteger(reference.handoverGeneration)
-    && (reference.handoverGeneration as number) >= 0
-    && isRecord(reference.attributes)
-    && !Array.isArray(reference.attributes)
+    && isRuntimeKind(reference.runtime)
+    && isNonEmptyString(reference.runtimeInstanceId)
+    && isNonEmptyString(reference.serviceInstanceId)
     && (reference.status === "starting"
       || reference.status === "ready"
       || reference.status === "unavailable"
       || reference.status === "failed")
-    && Number.isSafeInteger(reference.snapshotRevision)
-    && (reference.snapshotRevision as number) >= 0
-    && (reference.connectionId === undefined || isNonEmptyString(reference.connectionId))
+    && isRecord(reference.attributes)
+    && !Array.isArray(reference.attributes)
     && (reference.grantId === undefined || isNonEmptyString(reference.grantId))
     && (reference.authorizationRevision === undefined
       || (Number.isSafeInteger(reference.authorizationRevision) && reference.authorizationRevision >= 0));
@@ -128,34 +105,17 @@ export function createRuntimeMessageCodec(): RemoteServiceMessageCodec {
   });
 }
 
-export function isRuntimeHello(input: unknown): input is RuntimeHelloMessage {
-  if (!isRecord(input)) return false;
-  const message = input as Partial<RuntimeHelloMessage>;
-  return message.type === RUNTIME_HELLO_TYPE
-    && isNonEmptyString(message.protocolVersion)
-    && isNonEmptyString(message.connectionId)
-    && isNonEmptyString(message.runtimeId);
-}
-
-export function isRuntimeResync(input: unknown): input is RuntimeResyncMessage {
-  if (!isRecord(input)) return false;
-  const message = input as Partial<RuntimeResyncMessage>;
-  return message.type === RUNTIME_RESYNC_TYPE
-    && isNonEmptyString(message.connectionId);
-}
-
+/** 只验证外层结构；协议版本接受由 RuntimeHandle 单独处理。 */
 export function isRuntimeSnapshot(input: unknown): input is RuntimeSnapshot {
   if (!isRecord(input)) return false;
   const message = input as Partial<RuntimeSnapshot>;
   return message.type === RUNTIME_SNAPSHOT_TYPE
-    && message.protocolVersion === RUNTIME_PROTOCOL_VERSION
+    && isNonEmptyString(message.protocolVersion)
     && isNonEmptyString(message.runtimeId)
     && isRuntimeKind(message.runtimeKind)
     && isNonEmptyString(message.runtimeInstanceId)
-    && isNonEmptyString(message.connectionId)
-    && Number.isSafeInteger(message.snapshotRevision)
-    && (message.snapshotRevision as number) >= 0
-    && typeof message.baseline === "boolean"
+    && Number.isSafeInteger(message.revision)
+    && (message.revision as number) >= 0
     && Array.isArray(message.units)
     && message.units.every(isRuntimeSnapshotUnit)
     && Array.isArray(message.services)
@@ -167,18 +127,22 @@ export function isRuntimeSnapshot(input: unknown): input is RuntimeSnapshot {
       || message.state === "disposed");
 }
 
+export function isRuntimeSnapshotProtocol(input: RuntimeSnapshot): boolean {
+  return input.protocolVersion === RUNTIME_PROTOCOL_VERSION;
+}
+
 export function isRuntimeError(input: unknown): input is RuntimeErrorMessage {
   if (!isRecord(input)) return false;
   const message = input as Partial<RuntimeErrorMessage>;
   return message.type === RUNTIME_ERROR_TYPE
     && isNonEmptyString(message.protocolVersion)
-    && (message.code === "runtime.protocol_mismatch"
-      || message.code === "runtime.initialization_failed"
-      || message.code === "runtime.invalid_connection")
+    && (message.code === "runtime_initialization_failed"
+      || message.code === "protocol_mismatch"
+      || message.code === "transport_unavailable")
     && isNonEmptyString(message.message)
     && (message.pluginId === undefined || isNonEmptyString(message.pluginId))
     && (message.unitId === undefined || isNonEmptyString(message.unitId))
-    && (message.phase === undefined || isNonEmptyString(message.phase));
+    && (message.phase === undefined || message.phase === "startup" || message.phase === "snapshot");
 }
 
 /** 将 Host 的 PluginUnitState 映射成不会泄露领域配置的运行时快照。 */

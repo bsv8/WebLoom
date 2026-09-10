@@ -1,53 +1,44 @@
-// 基于 MessagePort 的服务提供端点。
+// MessagePort Provider。
 //
-// 该模块是 Coordinator/Provider 侧的物理端点：它发送握手和服务目录，
-// 接收代理调用，并把取消信号传给实际 handler。它不决定谁有权限使用
-// 服务；handler 必须在这里之后继续做引用、授权、owner 和世代校验。
+// Provider 不发送握手、目录或失效控制包。Runtime Host 是完整快照的唯一
+// 发布者；Provider 只维护自己端点的权威目录，按 call 中的精确标识重新
+// 查找服务，并把取消传给当前 handler。
 
 import type {
-  RemoteServiceHandshake,
   RemoteServiceMessageCodec,
-  RemoteServicePortControlMessage,
-  RemoteServiceSnapshot,
+  RemoteServiceReference,
 } from "../contracts/lifecycle.js";
-import { createRemoteServiceMessageCodec } from "../contracts/lifecycle.js";
+import {
+  createRemoteServiceMessageCodec,
+  RemoteServiceError,
+} from "../contracts/lifecycle.js";
 import type {
+  MessagePortServiceCallInput,
   RemoteServicePortCallMessage,
   RemoteServicePortCancelMessage,
   RemoteServicePortErrorMessage,
   RemoteServicePortResultMessage,
 } from "./messagePortServiceTransport.js";
 
-export interface MessagePortServiceCallInput {
-  /** 传输层生成的调用包；业务 handler 不得把 callId 当业务幂等键。 */
-  message: RemoteServicePortCallMessage;
-  /** 调用方撤销或端点失效时自动终止的信号。 */
-  signal: AbortSignal;
-}
-
 export interface CreateMessagePortServiceProviderOptions {
   /** 与页面服务桥配对的专用双工端口。 */
   port: MessagePort;
-  /** 本端产生的握手身份。 */
-  handshake: RemoteServiceHandshake;
-  /** 初始必须是完整基线快照。 */
-  snapshot: RemoteServiceSnapshot;
+  /** Provider 的本地权威目录；不会采信客户端回传的完整 reference。 */
+  services?: () => readonly RemoteServiceReference[];
   /** 具体服务分派；这里不自动重放调用。 */
   handleCall(input: MessagePortServiceCallInput): Promise<unknown>;
   /** dispose 时是否关闭本端端口；默认关闭。 */
   closeOnDispose?: boolean;
-  /** wire 消息 codec；默认使用 webloom.remote-service.*。 */
+  /** wire 消息 codec；默认 webloom.remote-service.v2。 */
   codec?: RemoteServiceMessageCodec;
 }
 
 export interface MessagePortServiceProvider {
-  /** 发布同一连接上的下一份连续目录快照。 */
-  publishSnapshot(snapshot: RemoteServiceSnapshot): void;
-  /** 同步通知消费者撤销当前代理；调用仍由 handler 自己做最终校验。 */
-  invalidate(reason?: string): void;
-  /** 发送断线控制消息并关闭端点。 */
-  disconnect(reason?: string): void;
-  /** 撤销未决调用、移除监听器并释放端口。 */
+  /** 替换 Provider 本地权威目录；不产生 wire 控制消息。 */
+  setServices(services: readonly RemoteServiceReference[]): void;
+  /** 同步停止新调用并 abort 当前 handler。 */
+  revoke(reason?: string): void;
+  /** 移除监听器并释放端口；不发送断开控制包。 */
   dispose(): void;
 }
 
@@ -55,163 +46,251 @@ function isCallMessage(input: unknown, codec: RemoteServiceMessageCodec): input 
   if (!input || typeof input !== "object") return false;
   const message = input as Partial<RemoteServicePortCallMessage>;
   return message.type === codec.type("call")
+    && typeof message.protocolVersion === "string"
     && typeof message.callId === "string"
     && message.callId.length > 0
-    && typeof message.connectionId === "string"
-    && typeof message.providerInstanceId === "string"
-    && Boolean(message.reference);
+    && typeof message.capabilityId === "string"
+    && typeof message.contractVersion === "string"
+    && typeof message.serviceInstanceId === "string";
 }
 
 function isCancelMessage(input: unknown, codec: RemoteServiceMessageCodec): input is RemoteServicePortCancelMessage {
   if (!input || typeof input !== "object") return false;
   const message = input as Partial<RemoteServicePortCancelMessage>;
   return message.type === codec.type("cancel")
+    && typeof message.protocolVersion === "string"
     && typeof message.callId === "string"
-    && typeof message.connectionId === "string"
-    && typeof message.providerInstanceId === "string";
+    && typeof message.serviceInstanceId === "string";
 }
 
 function errorMessage(error: unknown): RemoteServicePortErrorMessage["error"] {
-  const candidate = error && typeof error === "object" ? error as { name?: unknown; message?: unknown; code?: unknown } : undefined;
+  const candidate = error && typeof error === "object"
+    ? error as { name?: unknown; message?: unknown; code?: unknown; details?: unknown }
+    : undefined;
+  const code = typeof candidate?.code === "string" && candidate.code.length > 0
+    ? candidate.code
+    : "handler_failed";
   return {
     ...(typeof candidate?.name === "string" ? { name: candidate.name } : {}),
     message: typeof candidate?.message === "string" ? candidate.message : String(error),
-    ...(typeof candidate?.code === "string" ? { code: candidate.code } : {}),
+    code,
+    ...(candidate?.details && typeof candidate.details === "object" && !Array.isArray(candidate.details)
+      ? { details: candidate.details as Readonly<Record<string, unknown>> }
+      : {}),
   };
 }
 
-function post(port: MessagePort, message: unknown): void {
-  try {
-    port.postMessage(message);
-  } catch {
-    // 端口断开后调用方会通过连接状态和超时收敛；不能用异常打断 Worker。
-  }
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, stableValue(item)]),
+  );
 }
 
-/** 创建一个只服务于一条实际 MessagePort 连接的 Provider 端点。 */
+function bindingKey(reference: Pick<RemoteServiceReference, "capabilityId" | "contractVersion" | "runtime" | "runtimeInstanceId" | "serviceInstanceId">): string {
+  return [
+    reference.capabilityId,
+    reference.contractVersion,
+    reference.runtime,
+    reference.runtimeInstanceId,
+    reference.serviceInstanceId,
+  ].join("\u0000");
+}
+
+function referenceFingerprint(reference: RemoteServiceReference): string {
+  return JSON.stringify({
+    ...reference,
+    attributes: stableValue(reference.attributes),
+  });
+}
+
+interface ServiceBinding {
+  readonly reference: RemoteServiceReference;
+  readonly epoch: number;
+}
+
+interface PendingCall {
+  readonly message: RemoteServicePortCallMessage;
+  readonly controller: AbortController;
+  readonly serviceInstanceId: string;
+  readonly bindingKey: string;
+  readonly bindingEpoch: number;
+}
+
+function postBestEffort(port: MessagePort, message: unknown): void {
+  try { port.postMessage(message); } catch { /* 端口关闭时由调用方 deadline 收敛 */ }
+}
+
+/** 创建一条只服务于当前 MessagePort 的 Provider 端点。 */
 export function createMessagePortServiceProvider(
-  options: CreateMessagePortServiceProviderOptions
+  options: CreateMessagePortServiceProviderOptions,
 ): MessagePortServiceProvider {
-  const pending = new Map<string, { controller: AbortController; providerInstanceId: string }>();
+  const pending = new Map<string, PendingCall>();
   const codec = options.codec ?? createRemoteServiceMessageCodec();
-  let activeProviderInstanceIds = new Set(
-    options.snapshot.services.map((service) => service.providerInstanceId)
-  );
+  let services = [...(options.services?.() ?? [])];
+  let bindings = new Map<string, ServiceBinding>();
+  let nextBindingEpoch = 0;
+  let revoked = false;
   let disposed = false;
+
+  const buildBindings = (nextServices: readonly RemoteServiceReference[]): Map<string, ServiceBinding> => {
+    const nextBindings = new Map<string, ServiceBinding>();
+    for (const reference of nextServices) {
+      const key = bindingKey(reference);
+      const previous = bindings.get(key);
+      const epoch = previous && referenceFingerprint(previous.reference) === referenceFingerprint(reference)
+        ? previous.epoch
+        : ++nextBindingEpoch;
+      nextBindings.set(key, { reference, epoch });
+    }
+    return nextBindings;
+  };
+
+  const isCurrent = (callId: string, call: PendingCall): boolean => {
+    const current = bindings.get(call.bindingKey);
+    return !disposed
+      && !revoked
+      && pending.get(callId) === call
+      && current?.epoch === call.bindingEpoch
+      && current.reference.serviceInstanceId === call.serviceInstanceId;
+  };
+
+  const revokeReplacedCalls = (nextBindings: ReadonlyMap<string, ServiceBinding>): void => {
+    for (const call of pending.values()) {
+      const next = nextBindings.get(call.bindingKey);
+      if (!next || next.epoch !== call.bindingEpoch) {
+        sendError(call.message, new RemoteServiceError("service_revoked", "Remote service binding was replaced"));
+        call.controller.abort(new RemoteServiceError("service_revoked", "Remote service binding was replaced"));
+      }
+    }
+  };
+
+  bindings = buildBindings(services);
 
   const sendError = (message: RemoteServicePortCallMessage, error: unknown): void => {
     const response: RemoteServicePortErrorMessage = {
       type: codec.type("error"),
+      protocolVersion: codec.protocolVersion,
       callId: message.callId,
-      connectionId: message.connectionId,
-      providerInstanceId: message.providerInstanceId,
+      serviceInstanceId: message.serviceInstanceId,
       error: errorMessage(error),
     };
-    post(options.port, codec.encode(response as unknown as Record<string, unknown>));
+    postBestEffort(options.port, codec.encode(response as unknown as Record<string, unknown>));
   };
 
   const onMessage = (event: MessageEvent): void => {
     if (disposed) return;
     const decoded = codec.decode(event.data);
     if (isCancelMessage(decoded, codec)) {
-      if (decoded.connectionId !== options.handshake.connectionId) return;
+      if (decoded.protocolVersion !== codec.protocolVersion) return;
       const call = pending.get(decoded.callId);
-      if (call?.providerInstanceId === decoded.providerInstanceId) {
-        call.controller.abort(new Error("Remote service request cancelled"));
+      if (call?.serviceInstanceId === decoded.serviceInstanceId) {
+        call.controller.abort(new RemoteServiceError("request_cancelled", "Remote service request cancelled"));
       }
       return;
     }
     if (!isCallMessage(decoded, codec)) return;
     const message = decoded;
-    if (message.connectionId !== options.handshake.connectionId) {
-      sendError(message, Object.assign(new Error("Remote service connection mismatch"), { code: "service.connection_mismatch" }));
+    if (message.protocolVersion !== codec.protocolVersion) {
+      sendError(message, new RemoteServiceError("protocol_mismatch", "Remote service protocol version mismatch"));
       return;
     }
-    // providerInstanceId 由服务引用绑定。不同 Provider 的调用不能共用一条端点。
-    if (!activeProviderInstanceIds.has(message.providerInstanceId)) {
-      sendError(message, Object.assign(new Error("Remote service provider mismatch"), { code: "service.provider_mismatch" }));
+    if (revoked) {
+      sendError(message, new RemoteServiceError("service_revoked", "Remote service Provider has been revoked"));
+      return;
+    }
+    const reference = services.find((candidate) => candidate.status === "ready"
+      && candidate.capabilityId === message.capabilityId
+      && candidate.contractVersion === message.contractVersion
+      && candidate.serviceInstanceId === message.serviceInstanceId);
+    if (!reference) {
+      sendError(message, new RemoteServiceError("service_stale", "Remote service instance is stale or unavailable"));
       return;
     }
     if (pending.has(message.callId)) {
-      sendError(message, Object.assign(new Error("Remote service callId is duplicated"), { code: "service.duplicate_call" }));
+      sendError(message, new RemoteServiceError("handler_failed", "Remote service callId is duplicated"));
       return;
     }
-
     const controller = new AbortController();
-    pending.set(message.callId, { controller, providerInstanceId: message.providerInstanceId });
+    const currentBindingKey = bindingKey(reference);
+    const currentBinding = bindings.get(currentBindingKey);
+    if (!currentBinding || currentBinding.reference !== reference) {
+      sendError(message, new RemoteServiceError("service_stale", "Remote service binding changed"));
+      return;
+    }
+    const call: PendingCall = {
+      message,
+      controller,
+      serviceInstanceId: message.serviceInstanceId,
+      bindingKey: currentBindingKey,
+      bindingEpoch: currentBinding.epoch,
+    };
+    pending.set(message.callId, call);
     void (async () => {
       try {
-        const result = await options.handleCall({ message, signal: controller.signal });
-        if (controller.signal.aborted || disposed) return;
+        const result = await options.handleCall({ message, reference, signal: controller.signal });
+        if (controller.signal.aborted || !isCurrent(message.callId, call)) return;
         const response: RemoteServicePortResultMessage = {
           type: codec.type("result"),
+          protocolVersion: codec.protocolVersion,
           callId: message.callId,
-          connectionId: message.connectionId,
-          providerInstanceId: message.providerInstanceId,
+          serviceInstanceId: message.serviceInstanceId,
           result,
         };
-        post(options.port, codec.encode(response as unknown as Record<string, unknown>));
+        postBestEffort(options.port, codec.encode(response as unknown as Record<string, unknown>));
       } catch (error) {
-        if (disposed) return;
+        if (controller.signal.aborted || !isCurrent(message.callId, call)) return;
         sendError(message, error);
       } finally {
-        pending.delete(message.callId);
+        if (pending.get(message.callId) === call) pending.delete(message.callId);
       }
     })();
   };
 
   options.port.addEventListener("message", onMessage);
   options.port.start();
-  post(options.port, codec.encode({
-    type: codec.type("handshake"),
-    handshake: options.handshake,
-  } satisfies RemoteServicePortControlMessage));
-  post(options.port, codec.encode({
-    type: codec.type("snapshot"),
-    snapshot: options.snapshot,
-  } satisfies RemoteServicePortControlMessage));
-
-  const dispose = (): void => {
-    if (disposed) return;
-    disposed = true;
-    options.port.removeEventListener("message", onMessage);
-    for (const { controller } of pending.values()) controller.abort(new Error("Remote service provider disposed"));
-    pending.clear();
-    if (options.closeOnDispose !== false) options.port.close();
-  };
 
   const provider: MessagePortServiceProvider = {
-    publishSnapshot(snapshot) {
+    setServices(nextServices): void {
       if (disposed) return;
-      activeProviderInstanceIds = new Set(
-        snapshot.services.map((service) => service.providerInstanceId)
-      );
-      post(options.port, codec.encode({
-        type: codec.type("snapshot"),
-        snapshot,
-      } satisfies RemoteServicePortControlMessage));
+      const next = [...nextServices];
+      const nextBindings = buildBindings(next);
+      // Withdraw the old directory first. Abort is synchronous; a handler that
+      // ignores AbortSignal is fenced again by isCurrent() before any response.
+      revoked = true;
+      revokeReplacedCalls(nextBindings);
+      services = next;
+      bindings = nextBindings;
+      revoked = false;
     },
-    invalidate(reason = "Remote service invalidated") {
+    revoke(reason = "Remote service Provider revoked"): void {
       if (disposed) return;
-      // 撤销是同步调用边界：在下一份快照到达前，旧 Provider 实例不能再
-      // 接受新请求。否则消费者虽已撤下代理，恶意/迟到的旧报文仍可能
-      // 进入 handler；publishSnapshot() 重新建立当前实例后才恢复接收。
-      activeProviderInstanceIds = new Set();
-      for (const { controller } of pending.values()) controller.abort(new Error(reason));
-      post(options.port, codec.encode({
-        type: codec.type("invalidate"),
-        reason,
-      } satisfies RemoteServicePortControlMessage));
+      revoked = true;
+      for (const call of pending.values()) {
+        sendError(call.message, new RemoteServiceError("service_revoked", reason));
+        call.controller.abort(new RemoteServiceError("service_revoked", reason));
+      }
+      services = [];
+      bindings = new Map();
     },
-    disconnect(reason = "Remote service disconnected") {
+    dispose(): void {
       if (disposed) return;
-      post(options.port, codec.encode({
-        type: codec.type("disconnect"),
-        reason,
-      } satisfies RemoteServicePortControlMessage));
-      dispose();
+      disposed = true;
+      revoked = true;
+      options.port.removeEventListener("message", onMessage);
+      for (const { controller } of pending.values()) {
+        controller.abort(new RemoteServiceError("transport_unavailable", "Remote service Provider disposed"));
+      }
+      pending.clear();
+      services = [];
+      bindings = new Map();
+      if (options.closeOnDispose !== false) {
+        try { options.port.close(); } catch { /* noop */ }
+      }
     },
-    dispose,
   };
   return provider;
 }

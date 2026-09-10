@@ -1,10 +1,16 @@
 # WebLoom 浏览器双运行时施工单
 
+> SharedWorker 的 `hello`、RemoteService `handshake`、`baseline/resync`、握手超时和
+> 自动重连要求，已被[SharedWorker call-first 消融施工单](../shared-worker-call-first/implementation-plan.md)
+> 覆盖。其余 Runtime、PluginHost、生命周期和安全边界继续有效。
+
 ## 1. 施工目标
 
 把 WebLoom 从字符串运行标签和手工初始化装配，升级为真实的 `window-main + shared-worker` 浏览器双运行时；删除无执行语义的 `lifetime` 与插件分类 `kind`；用高层 API 封装 SharedWorker、MessagePort 和远程 capability。
 
-需求基线见[浏览器双运行时迭代需求](./requirements.md)。本施工单是未来实施顺序，不表示任何工单已经完成。
+需求基线见[浏览器双运行时迭代需求](./requirements.md)。本施工单保留基础双运行时的
+历史实施顺序；SharedWorker 连接相关条款已由上方 call-first 施工单取代，不再作为
+当前 hello/handshake/baseline/reconnect 行为的真值。
 
 ## 2. 施工边界
 

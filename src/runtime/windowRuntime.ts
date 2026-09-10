@@ -1,5 +1,6 @@
 import type {
   LifecycleDisposeResult,
+  RemoteServiceBridge,
   RemoteServiceReference,
 } from "../contracts/lifecycle.js";
 import type { PluginManifest } from "../contracts/plugin.js";
@@ -61,7 +62,6 @@ function buildLocalServices(
   host: PluginHost,
   manifests: readonly PluginManifest[],
   runtimeInstanceId: string,
-  revision: number,
 ): readonly RemoteServiceReference[] {
   const services: RemoteServiceReference[] = [];
   for (const manifest of manifests) {
@@ -69,19 +69,15 @@ function buildLocalServices(
     const unit = manifest.units?.find((candidate) => candidate.id === state.unitId)
       ?? manifest.units?.[0];
     if (!unit || unit.runtime === undefined || !state.instanceId || state.kind !== "enabled") continue;
-    const scopeId = host.scope(manifest.id)?.identity.scopeId ?? `scope:${state.instanceId}`;
     for (const capability of unit.provides ?? []) {
       services.push({
         capabilityId: capability,
-        providerInstanceId: state.instanceId,
-        runtime: unit.runtime,
         contractVersion: unit.providedContracts?.[capability] ?? `${capability}.v1`,
-        authorityInstanceId: runtimeInstanceId,
-        scopeId,
-        handoverGeneration: 0,
-        attributes: Object.freeze({}),
+        runtime: unit.runtime,
+        runtimeInstanceId,
+        serviceInstanceId: state.instanceId,
         status: "ready",
-        snapshotRevision: revision,
+        attributes: Object.freeze({}),
       });
     }
   }
@@ -98,7 +94,7 @@ export async function createWindowApp(options: CreateWindowAppOptions): Promise<
     runtimeKind: "window-main",
     runtimeInstanceId,
     state: "starting",
-    snapshotRevision: 0,
+    revision: 0,
     units: [],
     services: [],
   };
@@ -143,6 +139,9 @@ export async function createWindowApp(options: CreateWindowAppOptions): Promise<
 
   let host: PluginHost;
   const suppliedHost = options.host;
+  const remoteServiceBridge = remoteRuntime
+    ? (remoteRuntime as RuntimeHandle & { readonly serviceBridge: RemoteServiceBridge }).serviceBridge
+    : undefined;
   try {
     const {
       id: _id,
@@ -167,7 +166,7 @@ export async function createWindowApp(options: CreateWindowAppOptions): Promise<
             }))
           : hostOptions.runtimeSnapshots?.() ?? [],
         serviceBridgeForPlugin: (pluginId, instanceId) => (
-          suppliedBridgeFactory?.(pluginId, instanceId) ?? remoteRuntime?.serviceBridge
+          suppliedBridgeFactory?.(pluginId, instanceId) ?? remoteServiceBridge
         ),
         rootAttributes: {
           ...(hostOptions.rootAttributes ?? {}),
@@ -198,13 +197,13 @@ export async function createWindowApp(options: CreateWindowAppOptions): Promise<
         unit.runtime,
       ));
     });
-    const revision = Math.max(currentState.snapshotRevision + 1, host.version());
+    const revision = Math.max(currentState.revision + 1, host.version());
     emit({
       ...currentState,
-      snapshotRevision: revision,
+      revision,
       units,
       services: [
-        ...buildLocalServices(host, snapshotManifests, runtimeInstanceId, revision),
+        ...buildLocalServices(host, snapshotManifests, runtimeInstanceId),
         ...(remoteRuntime?.state().services ?? []),
       ],
     });

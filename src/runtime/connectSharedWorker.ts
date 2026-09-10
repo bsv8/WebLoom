@@ -8,8 +8,7 @@ import {
   createRuntimeMessageCodec,
   isRuntimeError,
   isRuntimeSnapshot,
-  RUNTIME_ERROR_TYPE,
-  RUNTIME_HELLO_TYPE,
+  isRuntimeSnapshotProtocol,
   RUNTIME_PROTOCOL_VERSION,
   type RuntimeErrorMessage,
   type RuntimeSnapshot,
@@ -25,244 +24,128 @@ import {
 export interface SharedWorkerLike {
   readonly port: MessagePort;
   onerror?: (event: Event) => void;
-  /** 浏览器 SharedWorker 的错误事件；测试 fake 可省略。 */
   addEventListener?(type: "error", listener: (event: Event) => void): void;
   removeEventListener?(type: "error", listener: (event: Event) => void): void;
 }
 
 export type SharedWorkerFactory = (
   url: string | URL,
-  options: { type: "module"; name?: string },
+  options: { type: "module"; name?: string; credentials?: RequestCredentials },
 ) => SharedWorkerLike;
 
 /**
- * 供仍需在同一物理连接上承载产品 RPC 的装配层使用。
- *
- * 普通调用方不需要这个接缝；它们只使用 RuntimeHandle 的状态和
- * serviceBridge。已有大量领域 RPC 的应用迁移时可以先把
- * Runtime 握手与旧 RPC 复用同一 MessagePort，再逐步把领域调用收敛到
- * capability service，而不会偷偷创建第二个 SharedWorker 连接。
+ * 临时迁移接缝：下游 typed transfer API 完成前允许领域代码在同一
+ * 物理端口安装 listener。它不参与 Runtime 授权，也不传 connectionId。
  */
 export interface SharedWorkerConnectionContext {
   readonly worker: SharedWorkerLike;
   readonly port: MessagePort;
-  readonly connectionId: string;
 }
 
 export interface ConnectSharedWorkerOptions {
-  /** Worker 入口的逻辑 Runtime 标识。 */
   id: string;
-  /** module SharedWorker URL；默认直接传给 new SharedWorker。 */
   url: string | URL;
-  /** 可选的浏览器 SharedWorker name；不传时由 URL 参与实例隔离。 */
   name?: string;
-  /** 断线后是否建立新连接；旧代理仍永久失效。默认为 true。 */
-  autoReconnect?: boolean;
-  /** 自动重连等待毫秒数。 */
-  reconnectDelayMs?: number;
-  /** 首个 runtime snapshot 到达前的握手超时；默认 10000ms。 */
-  handshakeTimeoutMs?: number;
-  /** 测试 fixture 使用；生产默认使用 globalThis.SharedWorker。 */
-  workerFactory?: SharedWorkerFactory;
-  /**
-   * 每次建立实际物理连接时调用一次；自动重连会再次调用。
-   * 回调可以在同一端口上安装产品协议，但不得替换 Runtime 的消息
-   * 监听器，也不得把旧端口保存为可重用连接。
-   */
-  onConnection?: (context: SharedWorkerConnectionContext) => void | Promise<void>;
+  credentials?: RequestCredentials;
+  defaultCallTimeoutMs?: number;
+  /** SWCF-009 完成前的临时同端口迁移接缝。 */
+  onConnection?: (context: SharedWorkerConnectionContext) => void;
 }
 
-function makeConnectionId(runtimeId: string): string {
-  try {
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      return `${runtimeId}:connection:${crypto.randomUUID()}`;
-    }
-  } catch {
-    // connection id is not an authorization secret.
-  }
-  return `${runtimeId}:connection:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
+interface InternalConnectSharedWorkerOptions extends ConnectSharedWorkerOptions {
+  workerFactory?: SharedWorkerFactory;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-interface Deferred<T> {
-  promise: Promise<T>;
-  settled: boolean;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-
-interface ConnectionResources {
-  readonly generation: number;
-  readonly worker: SharedWorkerLike;
-  readonly port: MessagePort;
-  readonly connectionId: string;
-  removeMessage?: () => void;
-  removeWorkerError?: () => void;
-  transport?: RemoteServiceTransport & { dispose(): void };
-  handshakeTimer?: ReturnType<typeof setTimeout>;
-  cleaned: boolean;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (error: unknown) => void;
-  const deferred: Deferred<T> = {
-    promise: new Promise<T>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    }),
-    settled: false,
-    resolve(value) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      resolvePromise(value);
-    },
-    reject(error) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      rejectPromise(error);
-    },
-  };
-  return deferred;
-}
-
-function post(port: MessagePort, message: unknown): void {
-  try { port.postMessage(message); } catch { /* disconnect path converges through state */ }
+function ensureTimeout(value: number | undefined): number {
+  const timeout = value ?? 30_000;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new TypeError("defaultCallTimeoutMs must be a finite number greater than zero");
+  }
+  return timeout;
 }
 
 function addMessageListener(port: MessagePort, listener: (event: MessageEvent) => void): () => void {
-  // 真实 MessagePort 的 onmessage 与 addEventListener 可以并存；测试宿主
-  // 和少数嵌入环境可能把 addEventListener 简化成覆盖 onmessage。检测这
-  // 一类实现并保留已有领域 listener，避免 Runtime 握手吞掉产品协议。
-  const before = port.onmessage;
   port.addEventListener("message", listener);
-  if (port.onmessage === listener && before && before !== listener) {
-    port.removeEventListener("message", listener);
-    const composed = (event: MessageEvent): void => {
-      before.call(port, event);
-      listener(event);
-    };
-    port.addEventListener("message", composed);
-    return () => port.removeEventListener("message", composed);
-  }
   return () => port.removeEventListener("message", listener);
 }
 
-/**
- * 保留标准 MessagePort API；极简测试宿主有时只实现 onmessage。这个适配
- * 只补 listener 注册面，不改变真实浏览器端口或其消息语义。
- */
+/** 给极简测试端口补齐事件目标；真实 MessagePort 不改变其行为。 */
 function ensureMessageEventTarget(port: MessagePort): void {
   const target = port as unknown as {
     onmessage: ((this: MessagePort, event: MessageEvent) => unknown) | null;
     addEventListener?: (this: MessagePort, type: string, listener: (event: MessageEvent) => void) => void;
     removeEventListener?: (this: MessagePort, type: string, listener: (event: MessageEvent) => void) => void;
   };
-  const add = target.addEventListener;
-  const remove = target.removeEventListener;
-  if (add && remove) {
-    // Detect a minimal fake whose addEventListener implementation overwrites
-    // onmessage. Standard MessagePort leaves the property untouched.
-    const before = target.onmessage;
-    const probe = (): void => undefined;
-    add.call(port, "message", probe);
-    const overwritesProperty = target.onmessage === probe;
-    remove.call(port, "message", probe);
-    if (!overwritesProperty) return;
-    const listeners = new Set<(event: MessageEvent) => void>();
-    const dispatch = (event: MessageEvent): void => {
-      before?.call(port, event);
-      for (const listener of [...listeners]) listener(event);
-    };
-    target.addEventListener = function addMessageListener(type, listener) {
-      if (type === "message") listeners.add(listener);
-      else add.call(port, type, listener);
-    };
-    target.removeEventListener = function removeMessageListener(type, listener) {
-      if (type === "message") listeners.delete(listener);
-      else remove.call(port, type, listener);
-    };
-    target.onmessage = dispatch;
-    return;
-  }
-
+  if (target.addEventListener && target.removeEventListener) return;
   const listeners = new Set<(event: MessageEvent) => void>();
   const original = target.onmessage;
-  const dispatch = (event: MessageEvent): void => {
+  target.addEventListener = function add(type, listener) {
+    if (type === "message") listeners.add(listener);
+  };
+  target.removeEventListener = function remove(type, listener) {
+    if (type === "message") listeners.delete(listener);
+  };
+  target.onmessage = (event) => {
     original?.call(port, event);
     for (const listener of [...listeners]) listener(event);
   };
-  target.addEventListener = function addMessageListener(type, listener) {
-    if (type === "message") listeners.add(listener);
-  };
-  target.removeEventListener = function removeMessageListener(type, listener) {
-    if (type === "message") listeners.delete(listener);
-  };
-  target.onmessage = dispatch;
 }
 
-function makeWorker(options: ConnectSharedWorkerOptions): SharedWorkerLike {
+function makeWorker(options: InternalConnectSharedWorkerOptions): SharedWorkerLike {
   const workerOptions = {
     type: "module" as const,
     ...(options.name ? { name: options.name } : {}),
+    ...(options.credentials ? { credentials: options.credentials } : {}),
   };
   if (options.workerFactory) return options.workerFactory(options.url, workerOptions);
   const WorkerConstructor = (globalThis as unknown as {
-    SharedWorker?: new (url: string | URL, options: { type: "module"; name?: string }) => SharedWorkerLike;
+    SharedWorker?: new (
+      url: string | URL,
+      options: { type: "module"; name?: string; credentials?: RequestCredentials },
+    ) => SharedWorkerLike;
   }).SharedWorker;
   if (!WorkerConstructor) throw new RuntimeUnavailableError("SharedWorker is not supported by this browser");
   return new WorkerConstructor(options.url, workerOptions);
 }
 
 /**
- * 从 Window 连接真实 module SharedWorker。
+ * 同步创建本地 RuntimeHandle。
  *
- * Promise 只在首个完整 baseline 快照到达后成功；调用方得到的代理均绑定
- * 当前 connection/runtime/provider/revision，断线或重启不会静默换绑旧代理。
+ * 该函数只执行参数校验、SharedWorker 构造、监听器/Transport 安装和
+ * port.start()；它不等待任何 Worker 回包。远端就绪、协议不兼容和服务
+ * 不存在都在 capability().call() 的 Promise 边界收敛。
  */
-export async function connectSharedWorker(options: ConnectSharedWorkerOptions): Promise<RuntimeHandle> {
+function connectSharedWorkerInternal(options: InternalConnectSharedWorkerOptions): RuntimeHandle {
   if (!options || typeof options.id !== "string" || options.id.trim() === "") {
     throw new Error("SharedWorker runtime id must be a non-empty string");
   }
-  const codec = createRuntimeMessageCodec();
+  const defaultCallTimeoutMs = ensureTimeout(options.defaultCallTimeoutMs);
+  const worker = makeWorker(options);
+  const port = worker.port;
+  if (!port) throw new RuntimeUnavailableError("SharedWorker did not expose a MessagePort");
+  ensureMessageEventTarget(port);
+
   const listeners = new Set<RuntimeStatusListener>();
-  const autoReconnect = options.autoReconnect ?? true;
-  const reconnectDelayMs = Math.max(0, options.reconnectDelayMs ?? 25);
-  const handshakeTimeoutMs = Math.max(1, options.handshakeTimeoutMs ?? 10_000);
+  const codec = createRuntimeMessageCodec();
   let disposed = false;
-  let currentWorker: SharedWorkerLike | undefined;
-  let currentPort: MessagePort | undefined;
-  let currentTransport: (RemoteServiceTransport & { dispose(): void }) | undefined;
-  let removeMessage: (() => void) | undefined;
-  let removeWorkerError: (() => void) | undefined;
-  let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
-  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  let connectionGeneration = 0;
-  let currentConnection: ConnectionResources | undefined;
-  let readyDeferred = createDeferred<void>();
-  let initialConnection = true;
   let runtimeInstanceId: string | undefined;
-  let connectionId: string | undefined;
+  let removeRuntimeMessage: (() => void) | undefined;
+  let transport: (RemoteServiceTransport & { dispose(): void }) | undefined;
+  let restoreWorkerError = (): void => undefined;
+
   let currentSnapshot: RuntimeStatusSnapshot = {
     runtimeId: options.id,
     runtimeKind: "shared-worker",
     runtimeInstanceId: "",
-    state: "connecting",
-    snapshotRevision: 0,
+    state: "starting",
+    revision: 0,
     units: [],
     services: [],
   };
-
-  const bridgeTransport: RemoteServiceTransport = {
-    call<TRequest, TResult>(request: TRequest, context: RemoteServiceCallContext): Promise<TResult> {
-      if (!currentTransport) return Promise.reject(new RuntimeUnavailableError("SharedWorker connection is unavailable"));
-      return currentTransport.call<TRequest, TResult>(request, context);
-    },
-  };
-  const bridge = createServiceBridge({ protocolVersion: RUNTIME_PROTOCOL_VERSION, transport: bridgeTransport });
 
   const emit = (next: RuntimeStatusSnapshot): void => {
     currentSnapshot = Object.freeze({
@@ -275,363 +158,192 @@ export async function connectSharedWorker(options: ConnectSharedWorkerOptions): 
     }
   };
 
-  const rejectReady = (error: unknown): void => {
-    readyDeferred.reject(error);
-    // A rejected readiness is also exposed through RuntimeHandle.ready() after
-    // the transition. Mark the promise as observed here so a caller that only
-    // subscribes to state does not create an unhandled-rejection noise source.
-    void readyDeferred.promise.catch(() => undefined);
+  const bridgeTransport: RemoteServiceTransport = {
+    call<TRequest, TResult>(request: TRequest, context: RemoteServiceCallContext): Promise<TResult> {
+      if (!transport) {
+        return Promise.reject(new RuntimeUnavailableError("SharedWorker connection is unavailable"));
+      }
+      return transport.call<TRequest, TResult>(request, context);
+    },
   };
+  const bridge = createServiceBridge({
+    protocolVersion: RUNTIME_PROTOCOL_VERSION,
+    transport: bridgeTransport,
+    defaultCallTimeoutMs,
+  });
 
-  const beginReadinessGeneration = (reason: string): void => {
-    rejectReady(new RuntimeUnavailableError(reason));
-    readyDeferred = createDeferred<void>();
-  };
-
-  const replaceWithRejectedReadiness = (error: unknown): void => {
-    rejectReady(error);
-    readyDeferred = createDeferred<void>();
-    rejectReady(error);
-  };
-
-  const scheduleReconnect = (): void => {
-    if (disposed || !autoReconnect || reconnectTimer !== undefined) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = undefined;
-      void openConnection().catch((error) => {
-        if (disposed) return;
-        // makeWorker() can fail before a port exists (bad URL/unsupported
-        // constructor). Settle this connection generation as well; it must not
-        // leave callers waiting on a forever-pending ready() promise.
-        if (currentSnapshot.state !== "disconnected") {
-          emit({ ...currentSnapshot, state: "disconnected", error: errorMessage(error), units: [], services: [] });
-        }
-        rejectReady(error);
-        beginReadinessGeneration("SharedWorker reconnecting");
-        scheduleReconnect();
-      });
-    }, reconnectDelayMs);
-  };
-
-  const cleanupConnection = (connection: ConnectionResources | undefined): void => {
-    if (!connection || connection.cleaned) return;
-    connection.cleaned = true;
-    const timer = connection.handshakeTimer;
-    const removeMessageForConnection = connection.removeMessage;
-    const removeWorkerErrorForConnection = connection.removeWorkerError;
-    const transport = connection.transport;
-    if (timer !== undefined) clearTimeout(timer);
-    connection.handshakeTimer = undefined;
-    removeMessageForConnection?.();
-    connection.removeMessage = undefined;
-    removeWorkerErrorForConnection?.();
-    connection.removeWorkerError = undefined;
+  const cleanup = (): void => {
+    removeRuntimeMessage?.();
+    removeRuntimeMessage = undefined;
+    port.removeEventListener("messageerror", onWorkerError);
     transport?.dispose();
-    connection.transport = undefined;
-    if (currentConnection === connection) currentConnection = undefined;
-    if (currentWorker === connection.worker) currentWorker = undefined;
-    if (currentPort === connection.port) currentPort = undefined;
-    if (currentTransport === transport) currentTransport = undefined;
-    if (removeMessage === removeMessageForConnection) removeMessage = undefined;
-    if (removeWorkerError === removeWorkerErrorForConnection) removeWorkerError = undefined;
-    if (handshakeTimer === timer) handshakeTimer = undefined;
-    try { connection.port.close(); } catch { /* noop */ }
+    transport = undefined;
+    try { port.close(); } catch { /* noop */ }
+    if (worker.removeEventListener) worker.removeEventListener("error", onWorkerError);
+    restoreWorkerError();
+    restoreWorkerError = () => undefined;
   };
 
-  const disconnect = (reason: string, failure?: unknown, fatal = false): void => {
+  const disconnect = (reason: string, failure?: unknown): void => {
     if (disposed) return;
-    const connection = currentConnection;
-    const port = connection?.port ?? currentPort;
-    cleanupConnection(connection);
-    currentTransport = undefined;
-    currentWorker = undefined;
-    currentPort = undefined;
-    connectionId = undefined;
+    cleanup();
     bridge.disconnect(reason);
     emit({
       ...currentSnapshot,
-      state: fatal ? "failed" : "disconnected",
-      error: failure ? errorMessage(failure) : reason,
+      state: "disconnected",
       runtimeInstanceId: "",
-      connectionId: undefined,
+      revision: 0,
       units: [],
       services: [],
+      error: failure ? errorMessage(failure) : reason,
     });
     runtimeInstanceId = undefined;
-    const unavailable = failure ?? new RuntimeUnavailableError(reason);
-    if (!initialConnection && !fatal && autoReconnect) {
-      beginReadinessGeneration("SharedWorker reconnecting");
-      scheduleReconnect();
-    } else {
-      // No new baseline can make this generation ready. Replace the current
-      // promise as well as rejecting the old one so ready() called after a
-      // terminal/non-reconnecting transition remains rejected.
-      replaceWithRejectedReadiness(unavailable);
-    }
   };
 
   const onRuntimeError = (message: RuntimeErrorMessage): void => {
     const error = new RuntimeInitializationError({
       pluginId: message.pluginId,
       unitId: message.unitId,
-      phase: message.phase === "handshake" ? "handshake" : "startup",
+      phase: message.phase === "snapshot" ? "snapshot" : "startup",
       error: message.message,
     });
-    const fatal = message.code === "runtime.protocol_mismatch"
-      || message.code === "runtime.initialization_failed";
-    disconnect(message.message, error, fatal);
+    if (message.code === "protocol_mismatch") bridge.markProtocolMismatch(message.message);
+    else if (message.code === "runtime_initialization_failed") bridge.markInitializationFailed(message.message);
+    else bridge.disconnect(message.message);
+    emit({ ...currentSnapshot, state: "failed", error: error.message, units: [], services: [] });
   };
 
   const onSnapshot = (snapshot: RuntimeSnapshot): void => {
-    if (snapshot.runtimeId !== options.id || snapshot.connectionId !== connectionId) return;
-    if (snapshot.runtimeKind !== "shared-worker") {
-      onRuntimeError({
-        type: RUNTIME_ERROR_TYPE,
-        protocolVersion: RUNTIME_PROTOCOL_VERSION,
-        code: "runtime.protocol_mismatch",
-        message: "Connected Runtime is not a SharedWorker Runtime",
-        phase: "handshake",
+    if (snapshot.runtimeId !== options.id || snapshot.runtimeKind !== "shared-worker") return;
+    if (!isRuntimeSnapshotProtocol(snapshot)) {
+      bridge.markProtocolMismatch(`Runtime protocol ${snapshot.protocolVersion} is not supported`);
+      emit({
+        ...currentSnapshot,
+        state: "failed",
+        error: `Runtime protocol ${snapshot.protocolVersion} is not supported`,
+        units: [],
+        services: [],
       });
       return;
     }
-    const isNewAuthority = runtimeInstanceId !== snapshot.runtimeInstanceId;
-    if (isNewAuthority || bridge.state === "disconnected") {
-      const result = bridge.handshake({
-        connectionId: snapshot.connectionId,
-        authorityInstanceId: snapshot.runtimeInstanceId,
-        protocolVersion: snapshot.protocolVersion,
-      });
-      if (!result.accepted) {
-        onRuntimeError({
-          type: RUNTIME_ERROR_TYPE,
-          protocolVersion: RUNTIME_PROTOCOL_VERSION,
-          code: "runtime.protocol_mismatch",
-          message: "Runtime protocol version mismatch",
-          phase: "handshake",
-        });
-        return;
-      }
-    }
+    const applied = bridge.applySnapshot(snapshot);
+    if (!applied.accepted) return;
     runtimeInstanceId = snapshot.runtimeInstanceId;
-    const applied = bridge.applySnapshot({
-      connectionId: snapshot.connectionId,
-      authorityInstanceId: snapshot.runtimeInstanceId,
-      snapshotRevision: snapshot.snapshotRevision,
-      baseline: snapshot.baseline,
-      services: snapshot.services,
-    });
-    if (!applied.accepted) {
-      if (applied.reason === "revision-gap" || applied.reason === "baseline-required") {
-        beginReadinessGeneration(`Runtime snapshot ${applied.reason}`);
-        emit({
-          ...currentSnapshot,
-          state: "disconnected",
-          error: `Runtime snapshot ${applied.reason}`,
-          units: [],
-          services: [],
-        });
-        const port = currentPort;
-        if (port && connectionId) post(port, { type: "webloom.runtime.resync", connectionId });
-      }
-      return;
-    }
     emit({
       runtimeId: snapshot.runtimeId,
       runtimeKind: snapshot.runtimeKind,
       runtimeInstanceId: snapshot.runtimeInstanceId,
       state: snapshot.state === "ready" ? "ready" : snapshot.state,
-      snapshotRevision: snapshot.snapshotRevision,
-      connectionId: snapshot.connectionId,
+      revision: snapshot.revision,
       units: snapshot.units,
       services: snapshot.services,
     });
-    if (snapshot.baseline && snapshot.state === "ready" && bridge.state === "ready") {
-      if (handshakeTimer !== undefined) clearTimeout(handshakeTimer);
-      handshakeTimer = undefined;
-      readyDeferred.resolve(undefined);
-      initialConnection = false;
+  };
+
+  const onWorkerError = (event: Event): void => {
+    const detail = event.type ? `SharedWorker error: ${event.type}` : "SharedWorker error";
+    disconnect(detail);
+  };
+
+  const onMessage = (event: MessageEvent): void => {
+    if (disposed) return;
+    if (isRuntimeError(event.data)) {
+      onRuntimeError(event.data);
+      return;
+    }
+    if (isRuntimeSnapshot(event.data)) {
+      onSnapshot(event.data);
+      return;
+    }
+    // 完全无法解析的对端消息不改变状态；正在等待的 call 由自己的
+    // deadline 收敛为 call_timeout，而不是伪造一个握手错误。
+    const decoded = codec.decode(event.data);
+    if (decoded?.type === codec.type("error")) {
+      // Remote service transport owns response matching. Runtime 只处理它的
+      // own snapshot/error namespace。
     }
   };
 
-  async function openConnection(): Promise<void> {
-    if (disposed) return;
-    const generation = ++connectionGeneration;
-    if (readyDeferred.settled) readyDeferred = createDeferred<void>();
-    let connection: ConnectionResources | undefined;
-    try {
-      const worker = makeWorker(options);
-      const port = worker.port;
-      const nextConnectionId = makeConnectionId(options.id);
-      connection = {
-        generation,
-        worker,
-        port,
-        connectionId: nextConnectionId,
-        cleaned: false,
+  try {
+    // 临时迁移钩子必须先于 Runtime listener 安装，以便复用同一端口。
+    options.onConnection?.({ worker, port });
+    transport = createMessagePortServiceTransport({
+      port,
+      codec,
+      defaultCallTimeoutMs,
+      closeOnDispose: false,
+    });
+    removeRuntimeMessage = addMessageListener(port, onMessage);
+    port.addEventListener("messageerror", onWorkerError);
+    if (worker.addEventListener) worker.addEventListener("error", onWorkerError);
+    else {
+      const previous = worker.onerror;
+      const fallbackHandler = (event: Event): void => {
+        previous?.(event);
+        onWorkerError(event);
       };
-      currentConnection = connection;
-      currentWorker = worker;
-      currentPort = port;
-      connectionId = nextConnectionId;
-      emit({
-        ...currentSnapshot,
-        state: "connecting",
-        connectionId: nextConnectionId,
-        error: undefined,
-      });
-
-      // This callback runs before WebLoom installs its own listeners so an
-      // existing product protocol can share the same physical port. A thrown
-      // callback is still a failed physical connection: the generation owns
-      // the port from this point and must close it before rejecting ready().
-      await options.onConnection?.({
-        worker,
-        port,
-        connectionId: nextConnectionId,
-      });
-      if (disposed || currentConnection !== connection) {
-        cleanupConnection(connection);
-        return;
-      }
-
-      ensureMessageEventTarget(port);
-      connection.transport = createMessagePortServiceTransport({ port, codec });
-      currentTransport = connection.transport;
-      const onWorkerError = (event: Event): void => {
-        if (disposed || generation !== connectionGeneration || worker !== currentWorker) return;
-        disconnect(`SharedWorker error${event.type ? `: ${event.type}` : ""}`);
+      worker.onerror = fallbackHandler;
+      restoreWorkerError = () => {
+        if (worker.onerror === fallbackHandler) worker.onerror = previous;
       };
-      if (worker.addEventListener) {
-        worker.addEventListener("error", onWorkerError);
-        connection.removeWorkerError = () => worker.removeEventListener?.("error", onWorkerError);
-        removeWorkerError = connection.removeWorkerError;
-      } else {
-        const workerWithOnError = worker as SharedWorkerLike & {
-          onerror?: (event: Event) => void;
-        };
-        const previousOnError = workerWithOnError.onerror;
-        const composedOnError = (event: Event): void => {
-          previousOnError?.(event);
-          onWorkerError(event);
-        };
-        workerWithOnError.onerror = composedOnError;
-        connection.removeWorkerError = () => {
-          if (workerWithOnError.onerror === composedOnError) workerWithOnError.onerror = previousOnError;
-        };
-        removeWorkerError = connection.removeWorkerError;
-      }
-      const onMessage = (event: MessageEvent): void => {
-        if (disposed || generation !== connectionGeneration || port !== currentPort) return;
-        if (isRuntimeError(event.data)) {
-          onRuntimeError(event.data);
-          return;
-        }
-        if (isSnapshot(event.data)) {
-          onSnapshot(event.data);
-          return;
-        }
-        const decoded = codec.decode(event.data);
-        if (decoded?.type === codec.type("disconnect")) {
-          disconnect(typeof decoded.reason === "string" ? decoded.reason : "SharedWorker disconnected");
-        }
-      };
-      connection.removeMessage = addMessageListener(port, onMessage);
-      removeMessage = connection.removeMessage;
-      port.start();
-      const timer = setTimeout(() => {
-        if (disposed || generation !== connectionGeneration || port !== currentPort) return;
-        const error = new RuntimeInitializationError({
-          phase: "handshake",
-          error: `SharedWorker handshake timed out after ${handshakeTimeoutMs}ms`,
-        });
-        disconnect(error.message, error, false);
-      }, handshakeTimeoutMs);
-      connection.handshakeTimer = timer;
-      handshakeTimer = timer;
-      post(port, {
-        type: RUNTIME_HELLO_TYPE,
-        protocolVersion: RUNTIME_PROTOCOL_VERSION,
-        connectionId: nextConnectionId,
-        runtimeId: options.id,
-      });
-      await readyDeferred.promise;
-    } catch (error) {
-      // disconnect() already owns cleanup and reconnection when the failure
-      // came from a live connection (handshake/error/runtime message). For a
-      // callback/setup failure, no RuntimeHandle exists yet, so this catch is
-      // the last safe owner of the generation's physical port.
-      if (connection && !connection.cleaned && currentConnection === connection) {
-        disconnect("SharedWorker connection setup failed", error, false);
-      } else if (connection && !connection.cleaned) {
-        cleanupConnection(connection);
-      } else if (!connection && !disposed && initialConnection) {
-        replaceWithRejectedReadiness(error);
-      }
-      throw error;
     }
+    port.start();
+  } catch (error) {
+    cleanup();
+    throw error;
   }
 
-  function isSnapshot(input: unknown): input is RuntimeSnapshot {
-    return isRuntimeSnapshot(input);
-  }
-
-  const app: RuntimeHandle = {
-    runtimeKind: "shared-worker",
+  // 供 Window Runtime 的内部装配使用；不写入 RuntimeHandle 公共接口，
+  // 也不暴露原始 MessagePort。
+  const handle = {
+    runtimeKind: "shared-worker" as const,
     runtimeId: options.id,
-    serviceBridge: bridge,
     get runtimeInstanceId() { return runtimeInstanceId; },
-    get connectionId() { return connectionId; },
+    serviceBridge: bridge,
     state: () => currentSnapshot,
-    ready: () => readyDeferred.promise,
     capability<T = unknown>(capabilityId: string, capabilityOptions: { contractVersion?: string } = {}) {
-      if (disposed || currentSnapshot.state !== "ready") {
-        throw new RuntimeUnavailableError(`Capability "${capabilityId}" is not ready`);
-      }
-      return bridge.requireProxy({
+      const proxy = bridge.requireProxy({
         capabilityId,
         contractVersion: capabilityOptions.contractVersion ?? `${capabilityId}.v1`,
-      }) as ReturnType<typeof bridge.requireProxy> & { readonly serviceType?: T };
+      });
+      return proxy as typeof proxy & { readonly serviceType?: T };
     },
-    subscribe(listener) {
+    subscribe(listener: RuntimeStatusListener) {
       listeners.add(listener);
       listener(currentSnapshot);
       return () => listeners.delete(listener);
     },
-    dispose(reason = "SharedWorker connection disposed") {
+    dispose(reason = "SharedWorker connection disposed"): Promise<void> {
       if (disposed) return Promise.resolve();
+      // 先同步撤销代理并拒绝 transport pending，再做端口清理。
       disposed = true;
-      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
-      replaceWithRejectedReadiness(new RuntimeUnavailableError(reason));
-      const connection = currentConnection;
-      const port = connection?.port ?? currentPort;
-      if (port) post(port, codec.encode({ type: codec.type("disconnect"), reason }));
-      cleanupConnection(connection);
-      currentWorker = undefined;
-      currentPort = undefined;
-      connectionId = undefined;
+      emit({ ...currentSnapshot, state: "stopping" });
+      bridge.dispose(reason);
+      cleanup();
       runtimeInstanceId = undefined;
-      currentTransport?.dispose();
-      currentTransport = undefined;
-      bridge.disconnect(reason);
       emit({
         ...currentSnapshot,
         state: "disposed",
         runtimeInstanceId: "",
-        connectionId: undefined,
+        revision: 0,
         units: [],
         services: [],
       });
       return Promise.resolve();
     },
   };
+  return handle as RuntimeHandle;
+}
 
-  try {
-    await openConnection();
-  } catch (error) {
-    if (!disposed) {
-      emit({ ...currentSnapshot, state: "failed", error: errorMessage(error) });
-    }
-    throw error;
-  }
-  return app;
+/** 创建生产 RuntimeHandle；测试工厂不属于生产公共选项。 */
+export function connectSharedWorker(options: ConnectSharedWorkerOptions): RuntimeHandle {
+  return connectSharedWorkerInternal(options);
+}
+
+/** 仅由 `webloom-framework/testing` 暴露的 SharedWorker 工厂注入入口。 */
+export function connectSharedWorkerForTesting(
+  options: ConnectSharedWorkerOptions,
+  workerFactory: SharedWorkerFactory,
+): RuntimeHandle {
+  return connectSharedWorkerInternal({ ...options, workerFactory });
 }
