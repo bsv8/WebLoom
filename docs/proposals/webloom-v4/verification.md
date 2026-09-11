@@ -3,9 +3,9 @@
 更新时间：2026-09-11（工作树验证）。本记录只写已经执行的命令和观察到的结果；
 未执行的跨浏览器、产品部署和 registry-only 验收不会由本地测试推断为通过。
 
-用户已确认 `webloom-framework@0.4.0` 已发布。本轮针对同一 v4 wire 的 patch 版本
-`webloom-framework@0.4.1` 执行发布；发布后的 registry integrity 与消费验证将在上传后
-补记。
+`webloom-framework@0.4.1` 已发布到 npm。本轮发布的是同一 v4 wire 的 patch 版本；registry
+返回的 `dist.integrity` 为
+`sha512-/sXro/by2FDq6ZehsOUnuYT8JwaaK3o6bn0uN/ZhtQBWd/7dlTbVcxZF+BlGJ/4dAhqhNOlUWXyGJ5Vk77IOLw==`。
 
 ## 1. WebLoom 本仓库
 
@@ -68,8 +68,9 @@ AT-16 的 `1/10/100 services × 1/2/10 peers` 测量在 `v4Acceptance.test.ts` �
   service identity。
 
 Demo 的验证使用当前本地 WebLoom 工作树链接；这证明源码类型和真实浏览器交互，不替代
-registry-only frozen install。0.4.0 是上一轮已发布基线；本轮 0.4.1 的 registry-only
-消费验证在发布后单独记录。
+registry-only frozen install。Demo 已切换到 `0.4.1` 并在 frozen install 后完成类型、生产
+构建和真实 Chromium smoke；Keymaster 的 registry-only 四入口 consumer 也已从 npm
+`0.4.1` 验证通过。
 
 ## 3. Keymaster
 
@@ -100,16 +101,30 @@ Local/S3 真实浏览器、CORS/CAS、重启、多 tab、恢复、app-view 外�
 
 上一轮已实际完成 `webloom-framework@0.4.0` 的 registry integrity、Keymaster/Demo
 lockfile 一致性、release-boundary 和 registry-only consumer 验证；该版本是本轮的已发布
-基线。本轮发布 `webloom-framework@0.4.1`，发布后必须从 registry 读取真实 `dist.integrity`
-并单独执行三仓 frozen-install 消费验证，不能用本地 tarball 或下游 lockfile 代替。
+基线。本轮已发布 `webloom-framework@0.4.1`，并从 registry 读取上述真实 `dist.integrity`。
+Keymaster 与 Demo 的 package 声明和 lockfile 均已切换到该版本；Keymaster
+`pnpm lint:webloom-release`、`pnpm verify:webloom-registry` 以及两仓 frozen-install 验证
+均通过，不能用本地 tarball 代替这些证据。
 
-## 5. 尚未关闭的跨环境验收
+## 5. Contract inventory CI
+
+WebLoom 和 Keymaster 均新增 `.github/workflows/contract-inventory.yml`。workflow 使用
+`actions/checkout` 的 `fetch-depth: 0`；PR 显式映射
+`github.event.pull_request.base.sha`，main push 映射 `github.event.before`，然后执行
+`pnpm test:types` 和 `pnpm run test:contract-inventory:ci`。job 名称固定为
+`contract-inventory`，可作为仓库 required status check。
+
+workflow 文件已落地并已在本地用显式历史 baseline 验证脚本通过；GitHub branch protection
+中将 `contract-inventory` 设为 required 的远端仓库设置，本轮无法从当前失效的 GitHub
+认证态读取或修改，因此该设置仍需在仓库管理面确认。
+
+## 6. 尚未关闭的跨环境验收
 
 - Firefox、真实 Safari、Playwright WebKit 的 module SharedWorker、双向 transfer 和 stream
   组合尚未执行。
 - Keymaster 的 app-view、Local/S3/CORS/CAS、重启/多 tab、恢复 ledger、不可逆 I/O 和部署
   生产门禁没有本轮完整外部证据。
 
-因此当前结论是：本轮四类 review 代码阻塞已完成修复，WebLoom/Demo 的本地与 Chromium
-证据已补齐，0.4.1 的 registry 发布与三仓消费验证待本轮上传后补记；跨浏览器与 Keymaster
-产品/部署验收仍保持明确的未验收状态。
+因此当前结论是：核心代码修复、`0.4.1` 下游版本一致性、registry consumer 和 inventory
+workflow 已完成；GitHub required-check 远端设置仍待确认。跨浏览器与 Keymaster 产品/部署
+验收仍保持明确的未验收状态。

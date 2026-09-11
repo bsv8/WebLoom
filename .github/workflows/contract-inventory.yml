@@ -1,0 +1,44 @@
+name: Contract inventory
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  contract-inventory:
+    name: contract-inventory
+    runs-on: ubuntu-latest
+    env:
+      CONTRACT_INVENTORY_BASELINE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.1
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run regular type and inventory checks
+        run: pnpm test:types
+      - name: Run historical-baseline inventory gate
+        run: |
+          set -euo pipefail
+          if [[ -z "${CONTRACT_INVENTORY_BASELINE_REF}" || "${CONTRACT_INVENTORY_BASELINE_REF}" == 0000000000000000000000000000000000000000 ]]; then
+            echo "CONTRACT_INVENTORY_BASELINE_REF is unavailable; refusing to use the current HEAD as its own baseline"
+            exit 1
+          fi
+          git cat-file -e "${CONTRACT_INVENTORY_BASELINE_REF}^{commit}"
+          pnpm run test:contract-inventory:ci
