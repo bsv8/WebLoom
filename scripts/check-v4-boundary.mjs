@@ -23,6 +23,9 @@ const forbidden = [
 const stringCapability = /\b(?:ctx|context|app|runtime|peer|host)\.(?:capability|optionalCapability|provide|handle)\s*<[^>]*>??\s*\(\s*["'`]/;
 const untypedStringCapability = /\b(?:ctx|context|app|runtime|peer|host)\.(?:capability|optionalCapability|provide|handle)\s*\(\s*["'`]/;
 const oldGenericCall = /\.call\s*<[^>]+>\s*\(/;
+const intentionalTypecheckFixtures = new Set([
+  "src/contracts/capability.typecheck.ts",
+]);
 
 async function filesUnder(directory) {
   const entries = await (await import("node:fs/promises")).readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -41,7 +44,8 @@ for (const directory of sourceFiles) {
     const content = await readFile(path, "utf8");
     const relativePath = relative(root, path);
     for (const pattern of forbidden) if (pattern.test(content)) violations.push(`${relativePath} matches ${pattern}`);
-    if (stringCapability.test(content) || untypedStringCapability.test(content)) violations.push(`${relativePath} contains a string capability call`);
+    if (!intentionalTypecheckFixtures.has(relativePath)
+      && (stringCapability.test(content) || untypedStringCapability.test(content))) violations.push(`${relativePath} contains a string capability call`);
     if (oldGenericCall.test(content)) violations.push(`${relativePath} contains a manually supplied call generic`);
   }
 }

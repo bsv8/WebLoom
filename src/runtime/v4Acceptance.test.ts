@@ -9,6 +9,7 @@ import {
   type RuntimeSnapshot,
   type ServiceReference,
 } from "../index.js";
+import type { RuntimeStatusSnapshot } from "./runtimeTypes.js";
 import { definePlugin } from "../authoring/definePlugin.js";
 import { createCapabilityPeerView } from "./peerView.js";
 import { connectSharedWorkerForTesting, type SharedWorkerLike } from "./connectSharedWorker.js";
@@ -24,6 +25,7 @@ import {
   RUNTIME_NEXT_TYPE,
   RUNTIME_PROTOCOL_VERSION,
   RUNTIME_RESULT_TYPE,
+  RUNTIME_SNAPSHOT_TYPE,
   type RuntimeCallMessage,
 } from "./runtimeProtocol.js";
 
@@ -150,11 +152,14 @@ async function waitUntil(check: () => boolean, attempts = 50): Promise<void> {
 function createTestWorker(plugins: readonly ReturnType<typeof definePlugin>[], expose: readonly RemoteCapability[] = [], options: {
   readonly configurePeer?: (peer: import("./sharedWorkerHost.js").PeerController) => void;
   readonly peerExposureAllowlist?: readonly RemoteCapability[];
+  readonly snapshotObserver?: (snapshot: RuntimeStatusSnapshot) => void;
 } = {}): {
   readonly app: ReturnType<typeof startSharedWorkerAppForTesting>;
   readonly factory: (url: string | URL, options: { type: "module"; name?: string; credentials?: RequestCredentials }) => SharedWorkerLike;
+  readonly wireMessages: readonly unknown[][];
 } {
   const scope: SharedWorkerScopeLike = { onconnect: null };
+  const wireMessages: unknown[][] = [];
   const app = startSharedWorkerAppForTesting({
     id: "worker",
     plugins,
@@ -166,9 +171,14 @@ function createTestWorker(plugins: readonly ReturnType<typeof definePlugin>[], e
     app,
     factory() {
       const channel = new MessageChannel();
+      const messages: unknown[] = [];
+      channel.port1.addEventListener("message", (event) => messages.push(event.data));
+      channel.port1.start();
+      wireMessages.push(messages);
       queueMicrotask(() => scope.onconnect?.({ ports: [channel.port2] }));
       return { port: channel.port1 };
     },
+    wireMessages,
   };
 }
 
@@ -227,6 +237,29 @@ function streamCall(
     request: { topic: "acceptance" },
     initialCredit,
   };
+}
+
+function makeAt16Capabilities(count: number): readonly typeof Echo[] {
+  return Array.from({ length: count }, (_, index) => defineCapability<{ value: string }, { result: string }>({
+    kind: "rpc",
+    id: `acceptance.at16.${index}`,
+    version: "1",
+    request: Echo.request,
+    response: Echo.response,
+  }));
+}
+
+function makeAt16Plugin(capabilities: readonly typeof Echo[]) {
+  return definePlugin({
+    id: "at16-provider",
+    provides: capabilities,
+    startup: "required" as const,
+    setup(ctx) {
+      for (const capability of capabilities) {
+        ctx.handle(capability, (request) => ({ result: request.value }));
+      }
+    },
+  });
 }
 
 describe("WebLoom v4 acceptance boundaries", () => {
@@ -569,6 +602,57 @@ describe("WebLoom v4 acceptance boundaries", () => {
     await waitUntil(() => errorPort.sent.some((message) => (message as { type?: unknown }).type === RUNTIME_PROTOCOL_VERSION + ".error"));
     expect(JSON.stringify(errorPort.sent)).not.toContain("TOP_SECRET_HANDLER_MESSAGE");
     errorProvider.dispose();
+  });
+
+  it("AT-16 measures one public base snapshot across the service/peer matrix and isolates grants", async () => {
+    for (const serviceCount of [1, 10, 100]) {
+      for (const peerCount of [1, 2, 10]) {
+        const capabilities = makeAt16Capabilities(serviceCount);
+        const baseSnapshots: RuntimeStatusSnapshot[] = [];
+        let nextGrantId = 0;
+        const worker = createTestWorker([makeAt16Plugin(capabilities)], [], {
+          peerExposureAllowlist: capabilities,
+          configurePeer(peer) {
+            const grantId = `at16-grant-${nextGrantId++}`;
+            peer.exposeGroup(capabilities.map((capability) => ({ capability, options: { grantId } })));
+          },
+          snapshotObserver(snapshot) { baseSnapshots.push(snapshot); },
+        });
+        const runtimes: ReturnType<typeof connectSharedWorkerForTesting>[] = [];
+        try {
+          for (let index = 0; index < peerCount; index += 1) {
+            runtimes.push(connectSharedWorkerForTesting({ id: "worker", url: "/worker.js" }, worker.factory));
+          }
+          await worker.app.ready();
+          await Promise.all(runtimes.map((runtime) => waitUntil(() => runtime.state().state === "ready")));
+
+          expect(baseSnapshots).toHaveLength(1);
+          expect(baseSnapshots[0]?.state).toBe("ready");
+          expect(baseSnapshots[0]?.services).toHaveLength(serviceCount);
+          expect(new Set(baseSnapshots[0]?.services.map((service) => `${service.kind}\u0000${service.capabilityId}\u0000${service.contractVersion}`)).size).toBe(serviceCount);
+
+          const grants = worker.wireMessages.map((messages) => {
+            const snapshots = messages.filter((message): message is RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } => (
+              Boolean(message) && typeof message === "object" && (message as { type?: unknown }).type === RUNTIME_SNAPSHOT_TYPE
+            ));
+            const snapshot = snapshots.at(-1);
+            expect(snapshot?.state).toBe("ready");
+            expect(snapshot?.services).toHaveLength(serviceCount);
+            expect(new Set(snapshot?.services.map((service) => `${service.kind}\u0000${service.capabilityId}\u0000${service.contractVersion}`)).size).toBe(serviceCount);
+            expect(snapshot?.services.every((service) => !Object.hasOwn(service, "runtime") && !Object.hasOwn(service, "runtimeInstanceId"))).toBe(true);
+            expect((JSON.stringify(snapshot).match(/"runtimeInstanceId"/g) ?? []).length).toBe(1);
+            return [...new Set(snapshot?.services.map((service) => service.grantId))];
+          });
+          expect(grants).toHaveLength(peerCount);
+          expect(grants.every((peerGrants) => peerGrants.length === 1)).toBe(true);
+          expect(new Set(grants.map((peerGrants) => peerGrants[0])).size).toBe(peerCount);
+          expect(nextGrantId).toBe(peerCount);
+        } finally {
+          await Promise.all(runtimes.map((runtime) => runtime.dispose()));
+          await worker.app.dispose();
+        }
+      }
+    }
   });
 
   it("AT-28 runs the static contract inventory gate and preserves parser/dependency review metadata", () => {

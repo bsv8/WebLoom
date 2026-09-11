@@ -15,14 +15,29 @@ import ts from "typescript";
  * therefore stops the build and requires an explicit inventory review.
  */
 
-const root = fileURLToPath(new URL("..", import.meta.url));
-const inventoryPath = resolve(root, "contract-inventory.json");
 const execFileAsync = promisify(execFile);
-const args = new Set(process.argv.slice(2));
+const defaultRoot = fileURLToPath(new URL("..", import.meta.url));
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+
+function optionValues(name) {
+  const values = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === name && argv[index + 1]) values.push(argv[index + 1]);
+  }
+  return values;
+}
+
+const root = resolve(optionValues("--root")[0] ?? defaultRoot);
+const inventoryPath = resolve(root, optionValues("--inventory")[0] ?? "contract-inventory.json");
+const sourceRootOptions = optionValues("--source-root");
+const sourceRoots = sourceRootOptions.length > 0
+  ? sourceRootOptions.map((sourceRoot) => resolve(root, sourceRoot))
+  : [resolve(root, "src")];
 
 const sourceExtensions = [".ts", ".tsx"];
 const sourceFilePattern = /\.(?:ts|tsx)$/u;
-const testFilePattern = /(?:\.test|\.spec)\.(?:ts|tsx)$/u;
+const testFilePattern = /(?:\.test|\.spec|\.typecheck)\.(?:ts|tsx)$/u;
 
 function identityKey(entry) {
   return `${entry.kind}\u0000${entry.id}\u0000${entry.version}`;
@@ -49,6 +64,16 @@ async function filesUnder(directory) {
     else if (sourceFilePattern.test(entry.name)) result.push(path);
   }
   return result;
+}
+
+async function filesAt(sourceRoot) {
+  try {
+    const sourceRootStat = await stat(sourceRoot);
+    if (sourceRootStat.isDirectory()) return filesUnder(sourceRoot);
+    return sourceFilePattern.test(sourceRoot) ? [sourceRoot] : [];
+  } catch {
+    return [];
+  }
 }
 
 function moduleSpecifierText(node) {
@@ -312,7 +337,7 @@ async function readInventory() {
 
 async function readHeadInventory() {
   try {
-    const { stdout } = await execFileAsync("git", ["show", "HEAD:contract-inventory.json"], { cwd: root, maxBuffer: 2 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("git", ["show", `HEAD:${rel(inventoryPath)}`], { cwd: root, maxBuffer: 2 * 1024 * 1024 });
     const value = JSON.parse(stdout);
     return value?.schemaVersion === 1 && Array.isArray(value.entries) ? value : undefined;
   } catch {
@@ -378,7 +403,8 @@ function compareInventory(observed, inventory, headInventory) {
   return errors;
 }
 
-const allSourceFiles = (await filesUnder(resolve(root, "src"))).filter((path) => !testFilePattern.test(path));
+const allSourceFiles = [...new Set((await Promise.all(sourceRoots.map(filesAt))).flat())]
+  .filter((path) => !testFilePattern.test(path));
 const fileContents = new Map();
 for (const path of allSourceFiles) fileContents.set(path, await readFile(path, "utf8"));
 const knownFiles = new Set(allSourceFiles);

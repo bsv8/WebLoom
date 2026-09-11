@@ -154,6 +154,34 @@ if (playwright) {
           }
           await Promise.all(pages.map((page) => page.close()));
 
+          const transferPage = await context.newPage();
+          const transferMatrix = await readResult(transferPage, `${baseUrl}?scenario=transfer-matrix`);
+          const transferCases = Array.isArray(transferMatrix?.transferMatrix?.cases)
+            ? transferMatrix.transferMatrix.cases
+            : [];
+          if (!transferMatrix || transferMatrix.ok !== true
+            || transferMatrix.transferMatrix?.ok !== true
+            || transferCases.length < 10
+            || transferCases.some((result) => result?.ok !== true)
+            || transferCases.find((result) => result?.marker === "rpc-normal")?.requestBufferDetached !== true
+            || transferCases.find((result) => result?.marker === "rpc-normal")?.responseViewsShareBuffer !== true
+            || transferCases.find((result) => result?.marker === "rpc-normal")?.requestPortDelivered !== true
+            || transferCases.find((result) => result?.marker === "rpc-normal")?.responsePortRoundTrip !== true
+            || transferCases.find((result) => result?.marker === "rpc-duplicate")?.ok !== true
+            || transferCases.find((result) => result?.marker === "rpc-unreachable-request")?.errorCode !== "transfer_invalid"
+            || transferCases.find((result) => result?.marker === "rpc-unreachable-request")?.requestBufferByteLength !== 32
+            || transferCases.find((result) => result?.marker === "rpc-unreachable-response")?.errorCode !== "transfer_invalid"
+            || transferCases.find((result) => result?.marker === "stream-normal")?.itemViewsShareBuffer?.every((value) => value === true) !== true
+            || transferCases.find((result) => result?.marker === "stream-normal")?.itemPortRoundTrips?.every((value) => value === true) !== true
+            || transferCases.find((result) => result?.marker === "stream-unreachable-item")?.closedErrorCode !== "transfer_invalid"
+            || transferCases.find((result) => result?.marker === "stream-cancel-before-ready")?.closedErrorCode !== "request_cancelled"
+            || transferCases.find((result) => result?.marker === "stream-cancel-after-send")?.closedErrorCode !== "request_cancelled"
+            || transferCases.find((result) => result?.marker === "stream-cancel-after-send")?.requestBufferDetached !== true
+            || transferCases.find((result) => result?.ok === true && result?.marker === "cancel-before-send")?.bufferByteLength !== 32) {
+            throw new Error(`real transfer matrix assertions failed: ${JSON.stringify(transferMatrix)}`);
+          }
+          await transferPage.close();
+
           const reconnectPage = await context.newPage();
           const reconnectResult = await readResult(reconnectPage, `${baseUrl}?scenario=reconnect`);
           if (!reconnectResult || reconnectResult.ok !== true
@@ -223,6 +251,7 @@ if (playwright) {
             build: "production",
             emittedWorkerChunks: workerFiles,
             results,
+            transferMatrix,
             reconnect: reconnectResult,
             terminalDispose: terminalResults,
             terminalLate: lateResult,

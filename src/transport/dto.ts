@@ -452,11 +452,17 @@ export function validateTransferListWithStats(
       maxEdges: limits.maxDtoEdges,
       maxBudgetBytes: limits.maxMessageBudgetBytes,
     },
+    // MessagePort presence is checked below so a missing declaration is
+    // reported as a transfer-contract error, while the walker still validates
+    // the complete DTO graph and preserves the actual port identity set.
+    allowUnlistedMessagePorts: true,
     transferables: new Set(result),
     phase: options.phase ?? "validate",
   });
   const reachable = new Set(stats.reachableTransferables);
   if (result.some((item) => !reachable.has(item))) throw new WebLoomError("transfer_invalid", "Capability transfer resource is not reachable from its payload", options.phase ?? "validate");
+  const declared = new Set(result);
+  if (stats.messagePorts.some((port) => !declared.has(port))) throw new WebLoomError("transfer_invalid", "Capability payload contains a MessagePort missing from its transfer declaration", options.phase ?? "validate");
   return { transfer: Object.freeze(result), stats };
 }
 

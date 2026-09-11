@@ -76,6 +76,8 @@ export interface StartSharedWorkerAppOptions extends Omit<CreatePluginHostOption
 export interface StartSharedWorkerAppForTestingOptions extends StartSharedWorkerAppOptions {
   /** testing 入口注入的 SharedWorkerGlobalScope 替身。 */
   readonly globalScope: SharedWorkerScopeLike;
+  /** 仅测试用：观察每次向所有 peer 广播前构建的公共快照。 */
+  readonly snapshotObserver?: (snapshot: RuntimeStatusSnapshot) => void;
 }
 
 export interface SharedWorkerApp {
@@ -110,7 +112,7 @@ function makeId(prefix: string): string {
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
 /** 启动一个真实 SharedWorker Runtime；setup 异步完成前也会发布空 services 快照。 */
-function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions, injectedScope?: SharedWorkerScopeLike): SharedWorkerApp {
+function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pick<StartSharedWorkerAppForTestingOptions, "snapshotObserver">, injectedScope?: SharedWorkerScopeLike): SharedWorkerApp {
   if (!options || typeof options.id !== "string" || options.id.trim() === "") throw new TypeError("SharedWorker runtime id must be a non-empty string");
   const scope = injectedScope ?? ((globalThis as unknown as { onconnect?: unknown }).onconnect !== undefined ? globalThis as unknown as SharedWorkerScopeLike : undefined);
   if (!scope) throw new RuntimeInitializationError({ phase: "validate", error: "startSharedWorkerApp must run in a SharedWorkerGlobalScope" });
@@ -140,7 +142,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions, inje
     const services = runtimeState === "ready" && host ? host.serviceReferences().map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) })) : [];
     return Object.freeze({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId, revision, state: runtimeState, units: Object.freeze(units), services: Object.freeze(services) });
   };
-  const emit = (): void => { const snapshot = localSnapshot(); for (const listener of [...listeners]) { try { listener(snapshot); } catch { /* observer isolation */ } } };
+  const emit = (snapshot: RuntimeStatusSnapshot = localSnapshot()): void => { for (const listener of [...listeners]) { try { listener(snapshot); } catch { /* observer isolation */ } } };
   const projectedUnits = (exposures: ReadonlyMap<string, ServiceReference>): readonly RuntimeSnapshot["units"][number][] => {
     if (!host || exposures.size === 0) return Object.freeze([]);
     // A peer may only learn about the provider units behind services explicitly
@@ -157,10 +159,10 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions, inje
       .filter((unit) => unit.instanceId !== undefined && owners.has(unit.instanceId))
       .map((unit) => ({ pluginId: unit.pluginId, unitId: unit.unitId, runtime: unit.runtime, ...(unit.instanceId !== undefined ? { instanceId: unit.instanceId } : {}), state: unit.kind }))));
   };
-  const wireSnapshot = (endpoint: Endpoint, nextRevision = endpoint.revision, exposures: ReadonlyMap<string, ServiceReference> = endpoint.exposures): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } => {
-    const base = localSnapshot();
+  const wireSnapshot = (endpoint: Endpoint, nextRevision = endpoint.revision, exposures: ReadonlyMap<string, ServiceReference> = endpoint.exposures, base = localSnapshot()): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } => {
     const services = [...exposures.values()].map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) }));
-    return { type: RUNTIME_SNAPSHOT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId, revision: nextRevision, state: runtimeState, units: projectedUnits(exposures), services: runtimeState === "ready" ? services : [] };
+    const state: RuntimeSnapshot["state"] = base.state === "disconnected" ? "failed" : base.state;
+    return { type: RUNTIME_SNAPSHOT_TYPE, protocolVersion: base.protocolVersion, runtimeId: base.runtimeId, runtimeKind: base.runtimeKind, runtimeInstanceId: base.runtimeInstanceId, revision: nextRevision, state, units: projectedUnits(exposures), services: state === "ready" ? services : [] };
   };
   const validateProjectedSnapshot = (endpoint: Endpoint, exposures: ReadonlyMap<string, ServiceReference>): void => {
     if (exposures.size > limits.maxSnapshotServices) throw new WebLoomError("resource_limit_exceeded", "Runtime service exposure limit exceeded", "dispatch");
@@ -168,20 +170,22 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions, inje
     runtimeCodec.encode(snapshot);
     validateDto(snapshot, { limits: { maxDepth: limits.maxDtoDepth, maxNodes: limits.maxDtoNodes, maxEdges: limits.maxDtoEdges, maxBudgetBytes: limits.maxMessageBudgetBytes }, phase: "dispatch" });
   };
-  const publish = (endpoint: Endpoint, exposures = endpoint.exposures): void => {
+  const publish = (endpoint: Endpoint, exposures = endpoint.exposures, base?: RuntimeStatusSnapshot): void => {
     if (endpoint.closed) return;
     const nextRevision = endpoint.revision + 1;
-    const snapshot = wireSnapshot(endpoint, nextRevision, exposures);
+    const snapshot = wireSnapshot(endpoint, nextRevision, exposures, base);
     endpoint.transport.send(snapshot);
     // postMessage performs structured-clone synchronously. Advance the
     // per-peer revision only after that operation has succeeded.
     endpoint.revision = nextRevision;
   };
   const publishAll = (): void => {
+    const base = localSnapshot();
+    options.snapshotObserver?.(base);
     for (const endpoint of endpoints) {
-      try { publish(endpoint); } catch { closeEndpoint(endpoint, "Runtime snapshot publication failed"); }
+      try { publish(endpoint, endpoint.exposures, base); } catch { closeEndpoint(endpoint, "Runtime snapshot publication failed"); }
     }
-    emit();
+    emit(base);
   };
 
   const createEndpoint = (port: MessagePort): Endpoint => {
@@ -429,7 +433,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions, inje
     const implementations = createRuntimeUnitImplementationRegistry(materialized.map((item) => ({ pluginId: item.manifest.id, unitId: item.unitId, setup: item.setup, capabilities: item.capabilities })));
     const { id: _id, plugins: _plugins, expose: _expose, configurePeer: _configurePeer, ...hostOptions } = options;
     host = createPluginHost({ ...hostOptions, runtime: "shared-worker", runtimeId: options.id, runtimeInstanceId, runtimeUnitImplementationRegistry: implementations });
-    host.subscribe(() => { if (runtimeState === "ready" && !disposed) { revision += 1; publishAll(); } emit(); });
+    host.subscribe(() => { if (runtimeState === "ready" && !disposed) { revision += 1; publishAll(); } else emit(); });
   } catch (error) {
     runtimeState = "failed";
     const failure = new RuntimeInitializationError({ phase: "validate", error: message(error) });

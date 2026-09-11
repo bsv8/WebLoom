@@ -51,6 +51,7 @@
     "test:contract-inventory": "node scripts/check-contract-inventory.mjs",
     "test:browser:install": "playwright install chromium",
     "test:browser": "pnpm run test:browser:install && node scripts/real-browser-runtime-smoke.mjs",
+    "test:ablation": "node scripts/check-v4-ablation.mjs",
     "prepack": "pnpm test:types && pnpm test && pnpm build && pnpm lint:boundaries && pnpm lint:v4",
     "pack": "npm pack",
     "pack:consumer": "pnpm run prepack && node scripts/pack-consumer-smoke.mjs"
