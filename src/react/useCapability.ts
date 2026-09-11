@@ -1,31 +1,28 @@
-// packages/runtime/src/react/useCapability.ts
-// 组件读取 capability 的唯一入口。
-// 设计缘由：业务组件不得直接调用 host.capabilities.get()，
-// 一律通过 hook 走，确保调用路径可观察。
-//
-// 硬切换 001：capability 在 plugin disable 时被 revoke。
-// 组件如果仍然用 has/capability 缓存结果，旧值会"看起来还能用"。
-// 改为基于 host.version 重新求值：disable 后 version 递增 -> 重渲染 ->
-// has/capability 走新值。
+import { useCallback, useSyncExternalStore } from "react";
+import type { Capability, CapabilityClient } from "../contracts/capability.js";
+import { useWebLoomApp } from "./PluginHostProvider.js";
 
-import { useMemo } from "react";
-import { usePluginHost, useHostVersion } from "./PluginHostProvider.js";
-
-export function useCapability<T>(key: string): T {
-  const host = usePluginHost();
-  const version = useHostVersion();
-  return useMemo(() => host.capabilities.get<T>(key), [host, version, key]);
+function subscribeApp(app: { subscribe(listener: () => void): () => void }, listener: () => void): () => void {
+  return app.subscribe(listener);
 }
 
-/** 读取可选兼容 capability；缺失时返回 undefined，不把页面渲染打崩。 */
-export function useOptionalCapability<T>(key: string): T | undefined {
-  const host = usePluginHost();
-  const version = useHostVersion();
-  return useMemo(() => host.capabilities.has(key) ? host.capabilities.get<T>(key) : undefined, [host, version, key]);
+/** 获取 typed capability；远程 proxy 的构造本身不等待 Worker。 */
+export function useCapability<C extends Capability>(capability: C): CapabilityClient<C> {
+  const app = useWebLoomApp();
+  const subscribe = useCallback((listener: () => void) => subscribeApp(app, listener), [app]);
+  const getSnapshot = useCallback(() => (app as unknown as { capability<C extends Capability>(capability: C): CapabilityClient<C> }).capability(capability), [app, capability]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-export function useHasCapability(key: string): boolean {
-  const host = usePluginHost();
-  const version = useHostVersion();
-  return useMemo(() => host.capabilities.has(key), [host, version, key]);
+/** 当前目录没有 capability 时返回 undefined。 */
+export function useOptionalCapability<C extends Capability>(capability: C): CapabilityClient<C> | undefined {
+  const app = useWebLoomApp();
+  const subscribe = useCallback((listener: () => void) => subscribeApp(app, listener), [app]);
+  const getSnapshot = useCallback(() => (app as unknown as { optionalCapability<C extends Capability>(capability: C): CapabilityClient<C> | undefined }).optionalCapability(capability), [app, capability]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/** 对 typed capability 做当前目录查询。 */
+export function useHasCapability<C extends Capability>(capability: C): boolean {
+  return useOptionalCapability(capability) !== undefined;
 }

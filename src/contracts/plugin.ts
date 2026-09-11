@@ -1,239 +1,195 @@
-// WebLoom 插件公共契约。
+// WebLoom v4 插件公共契约。
 //
-// 这里故意只描述插件、运行单元和宿主扩展点。具体产品可以通过泛型扩展
-// contribution、config、attributes 和 Context Extension，但不能把领域字段
-// 反向写进 WebLoom 核心。
+// 静态 manifest 只包含可复制的描述；实现函数、parser、transfer extractor
+// 和 handler 由当前 realm 的装配层保存。普通插件作者不需要接触 Host。
 
-import type { MessageBus } from "./messageBus.js";
+import type {
+  Capability,
+  CapabilityClient,
+  CapabilityDependency,
+  PeerCapabilityDependency,
+  CapabilityDescriptor,
+  LocalCapability,
+  LocalServiceOf,
+  RemoteCapability,
+  RpcCapability,
+  RpcHandler,
+  StreamCapability,
+  StreamHandler,
+} from "./capability.js";
 import type {
   LifecycleScope,
-  PluginPermission,
   PermissionLease,
-  RemoteServiceBridge,
+  PluginPermission,
   RuntimeKind,
   ScopedTaskScheduler,
 } from "./lifecycle.js";
+import type { MessageBus } from "./messageBus.js";
 
 /** 宿主注入的只读结构化属性；不得放入私钥、口令或 Seed。 */
 export type PluginAttributes = Readonly<Record<string, unknown>>;
 
-/** 插件配置的默认形状；具体配置由产品通过泛型约束。 */
+/** 插件配置的默认形状。 */
 export type PluginConfig = Readonly<Record<string, unknown>>;
 
-/** 插件对宿主贡献的默认形状；具体贡献由产品通过泛型约束。 */
+/** 插件对宿主的领域贡献；具体产品通过泛型定义。 */
 export type PluginContribution = unknown;
 
-/** 插件 Context Extension 的默认形状；领域服务只能从这里注入。 */
+/** 插件 Context Extension 的默认形状。 */
 export type PluginContextExtension = Readonly<Record<string, unknown>>;
 
-/** 插件运行时上下文，由 Host 创建并传入运行单元实现。 */
-export interface PluginContext<
-  TConfig extends PluginConfig = PluginConfig,
-  TExtension extends PluginContextExtension = PluginContextExtension,
-> {
-  /** Host 绑定的稳定产品标识；插件不能从调用参数伪造其它标识。 */
-  readonly pluginId: string;
-  /** 本次装配生成的实例标识；重启不得复用。 */
-  readonly instanceId: string;
-  /** 稳定运行单元标识；不等于本次启动的 instanceId。 */
-  readonly unitId: string;
-  /** 当前插件实例的作用域；业务资源应登记到此作用域。 */
-  readonly scope: LifecycleScope;
-  /** 作用域撤权信号；停止、禁用和宿主关闭时触发。 */
-  readonly signal: AbortSignal;
-  /** 可信装配层批准后的权限视图；插件自声明不能扩大集合。 */
-  readonly permissions: readonly PluginPermission[];
-  /** 绑定当前实例和权限身份的租约；最终 I/O 仍需再次校验。 */
-  readonly permissionLease: PermissionLease;
-  /** 已完成握手和快照校验的远程服务桥。 */
-  readonly serviceBridge?: RemoteServiceBridge;
-  /** 绑定当前插件实例的后台任务注册面。 */
-  readonly taskScheduler?: ScopedTaskScheduler;
-  /** 宿主注入的领域扩展；只读且不能替换实例身份。 */
-  readonly extension: TExtension;
-  /** 注册在停止前运行的清理函数；重复停止必须幂等。 */
-  onDispose(cleanup: PluginTeardown): void;
-  /** 注册 capability；重复注册会抛错。 */
-  provide<T>(key: string, value: T): void;
-  /** 读取 capability；缺失会抛错。 */
-  get<T>(key: string): T;
-  /** 探测 capability 是否存在。 */
-  has(key: string): boolean;
-  /** 要求 capability 存在，否则抛错。 */
-  require(key: string): void;
-  /** 事件、命令和请求响应的统一入口。 */
-  readonly messageBus: MessageBus;
-  /** 宿主注入的只读配置；不与启停意图存储混用。 */
-  readonly config?: TConfig;
-}
-
-/** v1 运行时依赖；跨 Runtime 绑定必须使用精确契约版本和来源 Runtime。 */
-export interface RuntimeDependency {
-  /** 依赖的 capability 标识。 */
-  capability: string;
-  /** 精确契约版本；跨 Runtime 依赖必须显式填写，本地可由 helper 推导。 */
-  contractVersion?: string;
-  /** 提供者实际运行空间；省略时由当前 Runtime 补齐。 */
-  sourceRuntime?: RuntimeKind;
-  /** 可选的人类可读诊断说明。 */
-  reason?: string;
-  /** 缺失时只关闭局部能力，不阻止主体运行。 */
-  optional?: boolean;
-}
-
-/** 简单插件的产品级依赖别名。 */
-export type PluginDependency = RuntimeDependency;
-
-/** 运行单元的严格依赖描述。 */
-export interface RuntimeUnitDependency {
-  /** 依赖的 capability 标识。 */
-  capability: string;
-  /** 精确契约版本；第一阶段只接受完全匹配。 */
-  contractVersion: string;
-  /** 提供者实际运行空间；跨 Runtime 依赖在 materialize/validate 边界必须补齐。 */
-  sourceRuntime: RuntimeKind;
-  /** 可选的人类可读诊断说明。 */
-  reason?: string;
-  /** 缺失时只关闭局部能力；未填写表示硬依赖。 */
-  optional?: boolean;
-}
-
-/** 作者入口的未归一化 unit 依赖；进入 Host 前必须补齐版本和来源 Runtime。 */
-export type RuntimeUnitDependencyInput = Omit<RuntimeUnitDependency, "contractVersion" | "sourceRuntime"> & {
-  contractVersion?: string;
-  sourceRuntime?: RuntimeKind;
-};
-
-/** 返回稳定的 capability 契约版本。 */
-export function runtimeCapabilityContractVersion(capability: string): string {
-  return `${capability}.v1`;
-}
-
-/** 将依赖清单补齐为严格运行单元依赖。 */
-export function defineRuntimeUnitDependencies(
-  dependencies: readonly Pick<PluginDependency, "capability" | "reason" | "optional">[],
-  defaults: { sourceRuntime: RuntimeKind },
-): RuntimeUnitDependency[] {
-  return dependencies.map((dependency) => ({
-    capability: dependency.capability,
-    contractVersion: runtimeCapabilityContractVersion(dependency.capability),
-    sourceRuntime: defaults.sourceRuntime,
-    ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
-    ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
-  }));
-}
-
-/** 为运行单元生成精确的 capability 契约版本表。 */
-export function defineRuntimeUnitProvidedContracts(
-  capabilities: readonly string[],
-): Record<string, string> {
-  return Object.fromEntries(
-    capabilities.map((capability) => [capability, runtimeCapabilityContractVersion(capability)]),
-  );
-}
-
-/** 插件在产品清单中的启动要求。 */
-export type PluginStartupMode = "required" | "optional";
-
-/** 插件装配元数据；v1 不解释产品分类字段。 */
-export interface PluginMeta {
-  /** 首次装配时默认是否启用。 */
-  defaultEnabled: boolean;
-  /** 是否允许产品控制面禁用。 */
-  canDisable: boolean;
-  /** 是否属于启动必需插件。 */
-  startup?: PluginStartupMode;
-}
-
-/** 插件 setup 返回的清理函数。 */
+/** 插件运行单元的清理函数。 */
 export type PluginTeardown = () => void | Promise<void>;
 
-/** 插件运行单元的无 UI 装配入口。 */
-export type PluginSetup<
-  TConfig extends PluginConfig = PluginConfig,
-  TExtension extends PluginContextExtension = PluginContextExtension,
-> = (ctx: PluginContext<TConfig, TExtension>) =>
-  void | Promise<void> | PluginTeardown | Promise<PluginTeardown>;
+type DeclaredCapability<TProvides extends readonly Capability[]> = TProvides[number];
+type DeclaredDependencyCapability<TDependencies extends readonly CapabilityDependency[]> =
+  TDependencies[number] extends CapabilityDependency<infer C> ? C : never;
+type DeclaredPeerDependencyCapability<TDependencies extends readonly CapabilityDependency[]> =
+  TDependencies[number] extends infer D
+    ? D extends PeerCapabilityDependency<infer C> ? C : never
+    : never;
+type DeclaredRuntimeDependencyCapability<TDependencies extends readonly CapabilityDependency[]> =
+  Exclude<DeclaredDependencyCapability<TDependencies>, DeclaredPeerDependencyCapability<TDependencies>>;
+type AvailableCapability<
+  TProvides extends readonly Capability[],
+  TDependencies extends readonly CapabilityDependency[],
+> = DeclaredCapability<TProvides> | DeclaredRuntimeDependencyCapability<TDependencies>;
+type DeclaredLocal<TProvides extends readonly Capability[]> = Extract<DeclaredCapability<TProvides>, { kind: "local" }>;
+type DeclaredRemote<TProvides extends readonly Capability[]> = Extract<DeclaredCapability<TProvides>, { kind: "rpc" | "stream" }>;
 
-/** 当前执行环境中按 productId + unitId 解析实现。 */
-export interface RuntimeUnitImplementationRegistry<
+/** 插件 Context；能力参数和返回值从 capability 对象端到端推导。 */
+export interface PluginContext<
+  TProvides extends readonly Capability[] = readonly Capability[],
+  TDependencies extends readonly CapabilityDependency[] = readonly CapabilityDependency[],
   TConfig extends PluginConfig = PluginConfig,
   TExtension extends PluginContextExtension = PluginContextExtension,
 > {
-  /** 未装配实现时返回 undefined。 */
-  get(pluginId: string, unitId: string): PluginSetup<TConfig, TExtension> | undefined;
+  /** Host 绑定的稳定插件标识。 */
+  readonly pluginId: string;
+  /** 本次插件启动生成的实例标识。 */
+  readonly instanceId: string;
+  /** 稳定运行单元标识。 */
+  readonly unitId: string;
+  /** 当前插件实例作用域。 */
+  readonly scope: LifecycleScope;
+  /** 撤权和停止信号。 */
+  readonly signal: AbortSignal;
+  /** 可信装配批准后的权限视图。 */
+  readonly permissions: readonly PluginPermission[];
+  /** 绑定实例与权限身份的租约。 */
+  readonly permissionLease: PermissionLease;
+  /** 当前插件实例的后台任务调度器。 */
+  readonly taskScheduler?: ScopedTaskScheduler;
+  /** 宿主注入的只读领域扩展。 */
+  readonly extension: TExtension;
+  /** 插件配置。 */
+  readonly config?: TConfig;
+  /** 注册在同步撤权之后异步执行的清理。 */
+  onDispose(cleanup: PluginTeardown): void;
+  /** 只允许注册本插件声明的 local provides。 */
+  provide<C extends DeclaredLocal<TProvides>>(capability: C, value: LocalServiceOf<C>): void;
+  /** 只允许注册本插件声明的 RPC/stream provides。 */
+  handle<C extends DeclaredRemote<TProvides>>(
+    capability: C,
+    handler: C extends RpcCapability<infer TRequest, infer TResponse>
+      ? RpcHandler<RpcCapability<TRequest, TResponse>>
+      : C extends StreamCapability<infer TRequest, infer TItem>
+        ? StreamHandler<StreamCapability<TRequest, TItem>>
+        : never,
+  ): void;
+  /** 获取当前声明范围内的 typed 能力；远程能力获取是惰性的。 */
+  capability<C extends AvailableCapability<TProvides, TDependencies>>(capability: C): CapabilityClient<Extract<C, Capability>>;
+  /** 当前目录没有该能力时返回 undefined。 */
+  optionalCapability<C extends AvailableCapability<TProvides, TDependencies>>(capability: C): CapabilityClient<Extract<C, Capability>> | undefined;
+  /** scoped MessageBus；业务事件不承担 Runtime 控制 wire。 */
+  readonly messageBus: MessageBus;
 }
 
-/** 一个产品可以装配的运行单元。 */
+/** 静态依赖描述；wire 不携带 capability 对象引用。 */
+export type RuntimeUnitDependency = {
+  /** 依赖 capability 的静态身份。 */
+  readonly capability: CapabilityDescriptor;
+  /** 可选依赖只影响局部功能。 */
+  readonly optional?: boolean;
+  /** 面向诊断的依赖说明。 */
+  readonly reason?: string;
+} & (
+  /** 按调用 peer 解析的依赖；不参加全局 Host 启动图。 */
+  | { readonly source: "peer"; readonly sourceRuntime?: never }
+  /** 精确来源 Runtime。 */
+  | { readonly source?: never; readonly sourceRuntime: RuntimeKind }
+);
+
+/** 作者输入的依赖；装配层补齐 sourceRuntime。 */
+export type RuntimeUnitDependencyInput = CapabilityDependency & {
+  /** 当前 realm 的 capability 对象。 */
+  readonly capability: Capability;
+};
+
+/** 一个静态运行单元描述；不含 setup/parser/transfer 函数。 */
 export interface RuntimeUnitDescriptor<
   TContribution = PluginContribution,
   TConfig extends PluginConfig = PluginConfig,
 > {
   /** 稳定运行单元标识。 */
-  id: string;
-  /** 运行代码所在真实 Runtime。 */
-  runtime: RuntimeKind;
-  /** 本单元所需的精确 capability 契约。 */
-  dependencies?: RuntimeUnitDependency[];
-  /** 本单元提供的 capability。 */
-  provides?: string[];
-  /** 本单元每个 capability 的精确版本。 */
-  providedContracts?: Record<string, string>;
-  /** 宿主贡献；内容由产品泛型定义。 */
-  contribution?: TContribution;
-  /** 本单元申请的权限。 */
-  permissions?: PluginPermission[];
-  /** 单元专属只读配置声明或装配默认值。 */
-  config?: TConfig;
+  readonly id: string;
+  /** 真实执行 Runtime。 */
+  readonly runtime?: RuntimeKind;
+  /** 该单元的精确依赖。 */
+  readonly dependencies?: readonly RuntimeUnitDependency[];
+  /** 该单元提供的 capability 静态身份。 */
+  readonly provides?: readonly CapabilityDescriptor[];
+  /** 领域贡献。 */
+  readonly contribution?: TContribution;
+  /** 该单元申请的权限。 */
+  readonly permissions?: readonly PluginPermission[];
+  /** 单元只读配置。 */
+  readonly config?: TConfig;
 }
 
-/** 作者入口的未归一化运行单元；runtime 可由 createWindowApp/startSharedWorkerApp 注入。 */
+/** 作者输入的运行单元描述；capability 对象仅留在当前 realm 装配层。 */
 export type RuntimeUnitDescriptorInput<
   TContribution = PluginContribution,
   TConfig extends PluginConfig = PluginConfig,
-> = Omit<RuntimeUnitDescriptor<TContribution, TConfig>, "runtime" | "dependencies"> & {
-  runtime?: RuntimeKind;
-  dependencies?: readonly RuntimeUnitDependencyInput[];
+> = Omit<RuntimeUnitDescriptor<TContribution, TConfig>, "dependencies" | "provides" | "runtime"> & {
+  /** 运行时注入的目标 Runtime。 */
+  readonly runtime?: RuntimeKind;
+  /** 当前 realm 的 typed 依赖对象。 */
+  readonly dependencies?: readonly RuntimeUnitDependencyInput[];
+  /** 当前 realm 的 typed 提供对象。 */
+  readonly provides?: readonly Capability[];
 };
 
-/** 插件清单；插件作者导出的唯一静态描述。 */
+export type PluginStartupMode = "required" | "optional";
+
+/** 插件静态 manifest；startup/defaultEnabled/canDisable 是唯一启停策略。 */
 export interface PluginManifest<
   TContribution = PluginContribution,
   TConfig extends PluginConfig = PluginConfig,
-  TExtension extends PluginContextExtension = PluginContextExtension,
 > {
-  /** 全局稳定产品标识。 */
-  id: string;
+  /** 全局稳定插件标识。 */
+  readonly id: string;
   /** 展示名称。 */
-  name: string;
-  /** 展示描述。 */
-  description?: string;
-  /** 简单插件的宿主贡献；复杂产品通过运行单元声明。 */
-  contribution?: TContribution;
-  /** 简单插件的兼容依赖。 */
-  dependencies?: PluginDependency[];
-  /** 简单插件声明提供的 capability；多单元插件必须放入 unit.provides。 */
-  provides?: string[];
-  /** 产品元数据。 */
-  meta: PluginMeta;
-  /** 简单插件的申请权限。 */
-  permissions?: PluginPermission[];
-  /** 多环境插件的静态运行单元描述。 */
-  units?: readonly RuntimeUnitDescriptor<TContribution, TConfig>[];
-  /** 简单插件的只读配置。 */
-  config?: TConfig;
+  readonly name: string;
+  /** 可选诊断描述。 */
+  readonly description?: string;
+  /** 初始启停策略。 */
+  readonly startup: PluginStartupMode;
+  /** 默认启用意图。 */
+  readonly defaultEnabled: boolean;
+  /** 是否允许控制面停用。 */
+  readonly canDisable: boolean;
+  /** 多 Runtime 静态单元。 */
+  readonly units?: readonly RuntimeUnitDescriptor<TContribution, TConfig>[];
 }
 
-/** 作者入口的未归一化静态清单；进入 Host 前必须 materialize 成 PluginManifest。 */
+/** 作者输入的静态 manifest。 */
 export type PluginManifestInput<
   TContribution = PluginContribution,
   TConfig extends PluginConfig = PluginConfig,
-  TExtension extends PluginContextExtension = PluginContextExtension,
-> = Omit<PluginManifest<TContribution, TConfig, TExtension>, "units"> & {
-  units?: readonly RuntimeUnitDescriptorInput<TContribution, TConfig>[];
-};
+> = PluginManifest<TContribution, TConfig>;
 
-/** 插件运行状态类别；registered 不代表已经运行。 */
+/** 插件运行状态。 */
 export type PluginStateKind =
   | "registered"
   | "starting"
@@ -245,132 +201,161 @@ export type PluginStateKind =
   | "cleanup-pending"
   | "unknown";
 
-/** 对外稳定的产品运行语义。 */
+/** 对外稳定的插件生命周期语义。 */
 export type PluginLifecycleState = "disabled" | "waiting" | "starting" | "running" | "stopping" | "failed";
 
 /** Host 查询到的插件状态。 */
 export interface PluginState {
-  /** 产品标识。 */
-  id: string;
-  /** 兼容状态类别。 */
-  kind: PluginStateKind;
-  /** 稳定生命周期语义。 */
-  lifecycleState?: PluginLifecycleState;
-  /** 最近一次错误。 */
-  error?: string;
-  /** 持久化启用意图。 */
-  desiredEnabled?: boolean;
-  /** 当前产品意图修订。 */
-  desiredRevision?: number;
-  /** 当前运行实例标识。 */
-  instanceId?: string;
-  /** 当前运行单元标识。 */
-  unitId?: string;
-  /** 当前阻塞或清理原因。 */
-  blockedBy?: string[];
-  /** 最近一次结构化清理结果。 */
-  cleanup?: import("./lifecycle.js").LifecycleDisposeResult;
-  /** 当前产品下的运行单元状态。 */
-  units?: readonly PluginUnitState[];
+  /** 插件标识。 */
+  readonly id: string;
+  /** 当前内部状态。 */
+  readonly kind: PluginStateKind;
+  /** 稳定生命周期映射。 */
+  readonly lifecycleState: PluginLifecycleState;
+  /** 脱敏错误文本。 */
+  readonly error?: string;
+  /** 当前启用意图。 */
+  readonly desiredEnabled: boolean;
+  /** 当前意图修订。 */
+  readonly desiredRevision?: number;
+  /** 当前启动实例。 */
+  readonly instanceId?: string;
+  /** 当前运行单元。 */
+  readonly unitId?: string;
+  /** 阻塞原因。 */
+  readonly blockedBy?: readonly string[];
+  /** 最近一次清理结果。 */
+  readonly cleanup?: import("./lifecycle.js").LifecycleDisposeResult;
+  /** 单元状态。 */
+  readonly units: readonly PluginUnitState[];
 }
 
-/** 运行单元状态；唯一身份由 product、unit 和 instance 共同组成。 */
+/** 运行单元状态。 */
 export interface PluginUnitState {
-  /** 所属产品标识。 */
-  pluginId: string;
-  /** 稳定运行单元标识。 */
-  unitId: string;
-  /** 真实运行空间。 */
-  runtime: RuntimeKind;
-  /** 当前运行实例。 */
-  instanceId?: string;
+  /** 所属插件。 */
+  readonly pluginId: string;
+  /** 稳定单元标识。 */
+  readonly unitId: string;
+  /** 真实 Runtime。 */
+  readonly runtime: RuntimeKind;
+  /** 当前启动实例。 */
+  readonly instanceId?: string;
   /** 当前意图修订。 */
-  desiredRevision?: number;
+  readonly desiredRevision?: number;
   /** 单元状态。 */
-  kind: PluginStateKind;
-  /** 单元失败原因。 */
-  error?: string;
-  /** 单元清理结果。 */
-  cleanup?: import("./lifecycle.js").LifecycleDisposeResult;
+  readonly kind: PluginStateKind;
+  /** 脱敏错误文本。 */
+  readonly error?: string;
+  /** 清理结果。 */
+  readonly cleanup?: import("./lifecycle.js").LifecycleDisposeResult;
 }
 
 /** 依赖图中的反向依赖者。 */
 export interface PluginReverseDep {
-  /** 反向依赖产品标识。 */
-  pluginId: string;
-  /** 依赖者当前是否运行。 */
-  enabled: boolean;
-  /** 触发依赖的 capability。 */
-  capabilities: string[];
+  /** 反向依赖插件标识。 */
+  readonly pluginId: string;
+  /** 依赖者是否启用。 */
+  readonly enabled: boolean;
+  /** 触发依赖的 capability 身份。 */
+  readonly capabilities: readonly CapabilityDescriptor[];
 }
 
 /** 插件依赖图快照。 */
 export interface PluginGraph {
-  /** 已知产品标识列表。 */
-  plugins: string[];
-  /** 产品依赖的 capability。 */
-  dependencies: Record<string, string[]>;
-  /** 产品的可选依赖。 */
-  optionalDependencies?: Record<string, string[]>;
-  /** 产品声明提供的 capability。 */
-  provides: Record<string, string[]>;
-  /** capability 到反向依赖者。 */
-  reverse: Record<string, PluginReverseDep[]>;
-  /** capability 到声明提供者。 */
-  providers?: Record<string, string[]>;
-  /** 精确依赖描述。 */
-  dependencyDetails?: Record<string, PluginDependency[]>;
-  /** 发现的硬依赖环。 */
-  cycles?: string[][];
-  /** 当前图中的运行单元。 */
-  units?: Record<string, PluginUnitGraph>;
+  /** 已知插件。 */
+  readonly plugins: readonly string[];
+  /** 插件依赖。 */
+  readonly dependencies: Readonly<Record<string, readonly CapabilityDescriptor[]>>;
+  /** 可选依赖。 */
+  readonly optionalDependencies: Readonly<Record<string, readonly CapabilityDescriptor[]>>;
+  /** 插件提供。 */
+  readonly provides: Readonly<Record<string, readonly CapabilityDescriptor[]>>;
+  /** 反向依赖。 */
+  readonly reverse: Readonly<Record<string, readonly PluginReverseDep[]>>;
+  /** capability 到提供者。 */
+  readonly providers: Readonly<Record<string, readonly string[]>>;
+  /** 依赖环。 */
+  readonly cycles: readonly (readonly string[])[];
+  /** 运行单元图。 */
+  readonly units: Readonly<Record<string, PluginUnitGraph>>;
 }
 
 /** 运行单元依赖图节点。 */
 export interface PluginUnitGraph {
-  /** 所属产品标识。 */
-  pluginId: string;
-  /** 稳定运行单元标识。 */
-  unitId: string;
-  /** 真实运行空间。 */
-  runtime: RuntimeKind;
+  /** 所属插件。 */
+  readonly pluginId: string;
+  /** 单元标识。 */
+  readonly unitId: string;
+  /** 真实 Runtime。 */
+  readonly runtime: RuntimeKind;
   /** capability 依赖。 */
-  dependencies: string[];
-  /** 精确依赖描述。 */
-  dependencyDetails?: RuntimeUnitDependency[];
+  readonly dependencies: readonly CapabilityDescriptor[];
   /** capability 提供。 */
-  provides: string[];
-  /** capability 精确版本。 */
-  providedContracts?: Record<string, string>;
+  readonly provides: readonly CapabilityDescriptor[];
 }
 
-/** Host 版本或状态变化监听器。 */
-export type HostListener = (snapshot: { version: number }) => void;
+/** Host 状态订阅。 */
+export type HostListener = (snapshot: { readonly version: number }) => void;
 
-/** 启动前能力检查的结构化详情。 */
+/** 缺少能力的结构化启动详情。 */
 export interface StartupCapabilityErrorDetails {
-  /** 缺失 capability 标识。 */
-  capability: string;
-  /** 已知提供者产品标识。 */
-  providerPluginId?: string;
+  /** capability 身份。 */
+  readonly capability: CapabilityDescriptor;
+  /** 已知提供者插件。 */
+  readonly providerPluginId?: string;
   /** 提供者状态。 */
-  providerState?: PluginStateKind;
+  readonly providerState?: PluginStateKind;
   /** 提供者错误。 */
-  providerError?: string;
-  /** 当前持久化意图。 */
-  configuredEnabled?: boolean;
+  readonly providerError?: string;
+  /** 当前启用意图。 */
+  readonly configuredEnabled?: boolean;
 }
 
-/** 启动插件失败的结构化详情。 */
+/** 启动插件失败详情。 */
 export interface StartupPluginErrorDetails {
-  /** 产品标识。 */
-  pluginId: string;
-  /** 失败的运行单元。 */
-  unitId?: string;
-  /** 能力列表。 */
-  capabilities: string[];
+  /** 插件标识。 */
+  readonly pluginId: string;
+  /** 失败单元。 */
+  readonly unitId?: string;
+  /** 声明提供的 capability。 */
+  readonly capabilities: readonly CapabilityDescriptor[];
   /** 当前状态。 */
-  state: PluginStateKind;
-  /** 最近错误。 */
-  error?: string;
+  readonly state: PluginStateKind;
+  /** 脱敏错误。 */
+  readonly error?: string;
+}
+
+/** 插件定义：静态 manifest 与当前 realm setup 分离。 */
+export interface PluginDefinition<
+  TProvides extends readonly Capability[] = readonly Capability[],
+  TDependencies extends readonly CapabilityDependency[] = readonly CapabilityDependency[],
+  TContribution = PluginContribution,
+  TConfig extends PluginConfig = PluginConfig,
+  TExtension extends PluginContextExtension = PluginContextExtension,
+> {
+  /** 不含函数的静态描述。 */
+  readonly manifest: PluginManifest<TContribution, TConfig>;
+  /** 当前实现绑定的单元描述。 */
+  readonly descriptor: RuntimeUnitDescriptor<TContribution, TConfig>;
+  /** 当前 realm 的 setup。 */
+  readonly setup: PluginSetup<TProvides, TDependencies, TConfig, TExtension>;
+  /** 当前 realm 使用的完整 capability 对象集合。 */
+  readonly capabilities: readonly Capability[];
+}
+
+/** 插件运行单元实现。 */
+export type PluginSetup<
+  TProvides extends readonly Capability[] = readonly Capability[],
+  TDependencies extends readonly CapabilityDependency[] = readonly CapabilityDependency[],
+  TConfig extends PluginConfig = PluginConfig,
+  TExtension extends PluginContextExtension = PluginContextExtension,
+> = (ctx: PluginContext<TProvides, TDependencies, TConfig, TExtension>) =>
+  void | Promise<void> | PluginTeardown | Promise<PluginTeardown>;
+
+/** 按插件/单元查找当前 realm 的 setup。 */
+export interface RuntimeUnitImplementationRegistry {
+  /** 未注册实现时返回 undefined。 */
+  get(pluginId: string, unitId: string): PluginSetup | undefined;
+  /** 当前 realm 的 capability 定义表；静态 manifest 只含 descriptor。 */
+  getCapabilities?(pluginId: string, unitId: string): readonly Capability[] | undefined;
 }

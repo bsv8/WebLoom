@@ -1,9 +1,9 @@
 # WebLoom v4 需求与设计
 
-- 状态：待实施。本文冻结目标行为，不表示功能、迁移或验收已完成。
-- 日期：2026-09-09。
+- 状态：设计冻结修订；源码实施已开始，完成度待逐项验收。本文不声明现有工作树已经满足要求。
+- 初稿：2026-09-09；本轮冻结修订：2026-09-10。
 - 范围：WebLoom、keymaster.cc、DemoWebLoom 三仓一次性破坏性升级。
-- 目标包：`webloom-framework@0.4.0`；从当前 `0.3.0` 升级到 `0.4.0`；本轮迭代名称为 v4，包版本与协议版本独立编号。
+- 目标包：`webloom-framework@0.4.0`；从已提交基线 `0.3.0` 升级到 `0.4.0`；本轮迭代名称为 v4，包版本与协议版本独立编号。
 - 目标 wire：唯一 `webloom.runtime.v1`；对应本轮 v4 / 包 `0.4.0`，不使用 `webloom.runtime.v4`。capability 自身的业务 `version` 独立于框架版本。
 - 配套：[施工单](./implementation-plan.md)。本文定义“做什么、为什么、最终行为”；施工单定义“改哪里、顺序、如何证明”。
 
@@ -14,16 +14,33 @@
 1. 不兼容、不双轨、不保留旧 API 别名、旧 wire 分支、旧默认版本推导或运行时 fallback。
 2. 三仓最终只消费 v4。开发分步骤可以临时编译失败，但不得把 v2/v4 并存作为交付状态。
 3. 本文整体吸收 `shared-worker-call-first/SWCF-009-typed-transfer-follow-up.md`；typed-transfer 完整纳入本次 0.4.0，不再另留后续尾项。此前 v1/call-first 文档只用于历史与安全不变量参考，冲突时本文优先。
-4. 原有用户工作树必须保留。下游仓库已有大量未提交修改，实施前重新记录并基于现状迁移，禁止 reset、整体覆盖、用旧 HEAD 替换工作树。
+4. 原有用户工作树必须保留。WebLoom 和下游均须在继续施工前记录实际未提交修改；禁止 reset、整体覆盖、用旧 HEAD 替换工作树。
 5. 破坏性升级针对框架 API、内部适配与 wire；不删除用户钱包数据，不改变 Hold 文件格式，不自动清空桶目录或生成新钱包。
+
+### 1.1 本轮反馈裁决
+
+| 反馈 | 裁决与冻结结果 |
+| --- | --- |
+| wire 从 v2 到 v1 | 保持用户指定的 `webloom.runtime.v1`。系统尚未上线；旧 v2 是前期开发迭代编号，不构成已上线 wire 的兼容承诺。迭代 v4、包 0.4.0、wire v1 是三个独立标识，不需要另起 family 或新增 epoch 字段。 |
+| call.peer 权限不清 | 是真实缺口。普通 handler 得到独立 PeerView；管理对象仅属于可信装配/session controller，见 5.3。 |
+| stream request transfer 遗漏 | 是正文遗漏，补齐 request + item，见 7。 |
+| 任意对象图验证与清理 | 是实现约束缺失；采用有限 DTO 图与统一接收资源账本，不承诺遍历任意 JS 对象，见 7.1–7.2。 |
+| deadline/quota | 有限 deadline 和 stream credit 原已要求，但默认值/其他上限未冻结；补齐 6.4。 |
+| stream 终止组合 | 是状态机细节缺失；补齐 8.1 的竞态与 Promise 矩阵。 |
+
+保持一个 hard switch。旧 wire 标记仅用于拒绝旧开发产物，不实现兼容解析。历史文档中的“v1/v2”不能覆盖本文完整 schema；不能仅凭相同的版本字符串跳过结构、身份或授权检查。
 
 ## 2. 当前基线与问题
 
-审查基线为 WebLoom `37817385006429014d1bde2cb5baec45ecff1345`（0.3.0）。下游读取的是工作树，HEAD 仅作定位：Keymaster `e26ce6a085382088e7659aee13fa47c64024998b`；Demo `9be7e63e6504f2b4f41f26e46b266452d5c4a60c`。
+历史 review 基线为 WebLoom `37817385006429014d1bde2cb5baec45ecff1345`（0.3.0）。2026-09-10 本轮核查：proposal 已提交于 `4d3a1f6`，工作树有大量未提交 v4 源码，且工作树 package.json **已为 0.4.0**。因此不能再从干净的 3781738 开始，也不能沿用“当前包还是 0.3.0”的反馈描述。
 
-当前框架已经删除连接 hello/handshake、baseline/resync、连续 revision 与自动重连。v4 继承 call-first，不把这些机制恢复成连接前置门槛。
+下游初次调查的 HEAD（Keymaster `e26ce6a085382088e7659aee13fa47c64024998b`；Demo `9be7e63e6504f2b4f41f26e46b266452d5c4a60c`）仅作历史定位，本轮没有重新验证下游完成度。继续施工以三仓当时的 HEAD + staged/unstaged/untracked 清单与内容为基线。
 
-仍有以下问题：
+下面的问题列表描述历史 review 发现，不代表当前实现仍全部未修复；实施者应逐项对照现有修改补齐证据。本轮只修订文档，不运行程序测试。
+
+历史 0.3.0 框架已经删除连接 hello/handshake、baseline/resync、连续 revision 与自动重连。v4 继承 call-first，不把这些机制恢复成连接前置门槛。
+
+历史 review 的问题与本轮目标：
 
 - capability 是字符串，调用者手填泛型，`RuntimeHandle.capability<T>()` 的 T 没有约束 call 请求/结果。
 - 提供者、依赖者、调用者重复声明字符串和契约版本；普通 `definePlugin()` 有多套启动策略表达。
@@ -95,6 +112,7 @@ const ProfileChanges = defineCapability({
 - parser 不绑定 Zod 等特定库；泛型 parser 接口可以由产品适配现有生产 parser。
 - 同一 `(kind,id,version)` 是共享契约身份，不依赖对象引用相等；运行时不能证明两份不同 parser 的语义等价，三仓必须导入同一业务契约模块。
 - parser/transfer 函数留在各自 realm；manifest/wire 只含 `{kind,id,version}` 静态 DTO，禁止发送函数。
+- 构建期生成 contract inventory：记录 kind/id/version、契约模块、parser 及依赖源码指纹、契约用例版本；同一身份冲突在构建时失败。parser 行为改变必须升业务 version；纯重构可在差异审阅和契约用例等价证据下保留版本。源码 hash 只提示变化，不证明语义等价；不使用 Function.toString 自动判定兼容，也不新增 wire schemaId/协商。
 - 相同契约的两个 ready 提供者不得由“先找到谁”决定，Host 启动/目录接受必须明确报歧义。
 
 ### 4.2 提供、依赖、消费
@@ -135,7 +153,7 @@ Host 必须检查：provide/handle 属于声明的 provides；消费属于声明
 
 `RpcClient.call(request, {signal?, timeoutMs?, operationId?})` 不接受手工 request/result 泛型、不接受 transfer 数组。删除 `requestId` 作为 operationId 的兼容别名；领域 DTO 内自己的 requestId/commandId 可以保留其业务语义。
 
-handler 的 `call` 至少包含：signal（取消）、deadlineAt（总截止时间）、operationId（业务操作 ID）、reference（当前服务绑定）、origin（local/remote 调用来源）、peer（仅由框架绑定的对端视图）。远程调用 origin=remote 且 peer 必有值；同 realm 调用 origin=local 且无 peer，不能伪造一个连接身份。只允许远程 session.open 的领域 handler 必须检查 origin。peer 不是请求可覆盖的字段。未知错误统一收敛，不能把客户端自报 reference/owner/grant 当成权威状态。
+handler 的 `call` 至少包含：signal（取消）、deadlineAt（总截止时间）、operationId（业务操作 ID）、reference（当前服务绑定）、origin（local/remote 调用来源）、peer（仅由框架绑定且按调用者权限收窄的 PeerView）。远程调用 origin=remote 且 peer 必有值；同 realm 调用 origin=local 且无 peer，不能伪造一个连接身份。只允许远程 session.open 的领域 handler 必须检查 origin。peer 不是请求可覆盖的字段。未知错误统一收敛，不能把客户端自报 reference/owner/grant 当成权威状态。
 
 ## 5. Runtime、双向 peer 与暴露策略
 
@@ -164,9 +182,10 @@ startSharedWorkerApp({
   id: "keymaster-coordinator",
   plugins: [coordinatorPlugin],
   expose: [SessionOpen],
-  configurePeer(peer) {
-    // 安装领域连接清理。没有原始 MessagePort。
-    peer.scope.onRevoke(() => revokeDomainSession(peer));
+  configurePeer(controller) {
+    // 仅可信宿主装配可取得 controller；普通 handler 只收到独立 view。
+    sessions.attach(controller); // host-owned，保存在私有闭包中
+    controller.scope.onRevoke(() => sessions.detach(controller.view.peerId));
   },
 });
 
@@ -179,19 +198,45 @@ await local.call({ /* 领域 lease 与 I/O 参数 */ });
 - `client` 可省略，表示页面不暴露反向能力；不能为省略 client 创建第二套假 Window Host。
 - WindowApp 必须先有可用本地 bridge handler，才能完成领域 session.open 中的首个反向 I/O。Keymaster 的其他阶段随后通过 advanced 注册，消除“等 Worker 就绪才安装页面 bridge”的循环。
 - 每条物理端口只运行一套 v4 transport/provider/目录，每侧都可发起调用。callId 在连接、方向及存活期内唯一，两个方向的 pending 不共享关联键。
-- Worker 的 `configurePeer(peer)` 同步安装 peer 级生命周期/策略；异步领域初始化通过 typed SessionOpen call 进行。它不是新的 hello 握手钩子。
-- PeerHandle 的公开面仅含 scope、capability、expose、inspect。scope 为框架创建的连接子作用域；没有 port/worker/raw-send/listener 注入。
-- `peer.expose(C, {scope?, attributes?, grantId?, authorizationRevision?, authorize?})` 暴露已经在 Host 注册的 RPC/stream handler，返回幂等 revoke 句柄。用于 session.open 成功后开放 owner/crypto 等能力。调用的有效性同时受 provider scope、peer scope 与可选领域 scope 约束。
+- Worker 的 `configurePeer(controller)` 同步安装 peer 级生命周期/策略；异步领域初始化通过 typed SessionOpen call 进行。它不是新的 hello 握手钩子。
+- 普通 handler 的 call.peer 是 PeerView；configurePeer 参数是 PeerController。两者必须是不同运行时对象，权限与 SessionOpen 控制流见 5.3。
+- `controller.expose(C, {scope?, attributes?, grantId?, authorizationRevision?, authorize?})` 暴露本 controller 管理授权范围内、已经在 Host 注册的 RPC/stream handler，返回幂等 revoke 句柄。调用的有效性同时受 provider scope、peer scope 与可选领域 scope 约束。
 - `authorize` 在解析后、执行前调用，输入为框架绑定的 call context 与 typed request；允许异步，await 后框架再次检查 scope/binding。领域 handler 的最终 I/O fence 仍由产品负责，框架不会替产品验证 owner/CAS。
 - 更新授权/属性必须 revoke 原 exposure 后新建，产生新的 serviceInstanceId。不能原地修改旧引用让旧代理继续有效。attributes 必须为可校验的无环数据，深复制/冻结后发布；不能通过外部对象别名修改授权指纹。
 - grantId 若存在必须与该 peer 的当前 exposure 一致，再执行领域 authorize；不一致拒绝。缺省 grantId 也不能跳过该 exposure 已要求的领域授权。顶层 expose 只应用于产品确认无需 session 后置授权的 bootstrap/公开能力。
 - 顶层 expose 是对每个 peer 应用相同的显式暴露策略，仍由每条连接形成 exposure；同一契约不得被顶层与 configurePeer 重复暴露。
-- Window client.expose 与 Worker peer.expose 都只能暴露本 Host 的已注册 RPC/stream；对端声明本身不是认证，Local storage 操作仍检查领域 lease。
+- Window client.expose 与 Worker controller.expose 都只能暴露本 Host 的已注册 RPC/stream；对端声明本身不是认证，Local storage 操作仍检查领域 lease。
 - 页面退出/连接 dispose 撤销该 peer 的 RPC、流和 exposure，不撤销其他页面，不销毁 WindowApp 的其他能力。
 
 这条路径必须替代 Keymaster 主 Runtime 裸消息、附加 servicePort、LocalStorageBridgeWire 的框架传输与 pending 管理。不得把它们包装成 `rawSend()` 后宣称 typed 迁移完成。
 
-### 5.3 身份与目录
+### 5.3 PeerView / PeerController 与 SessionOpen 的管理权
+
+| 对象 | 谁可以得到 | 唯一允许的能力 |
+| --- | --- | --- |
+| PeerView | 普通 RPC/stream handler 的 call.peer | 本连接 opaque peerId、已观察到的对端 runtime/runtimeInstanceId、PeerScopeView、按消费声明收窄的 capability(C) |
+| PeerScopeView | PeerView.scope | 只读 state、signal、onRevoke(listener)；返回函数只能取消自己的监听 |
+| PeerController | configurePeer、可信 host-owned session controller 私有闭包 | view、完整 peer scope、expose/exposeGroup、disconnect、管理 inspect；不得经 ctx.extension、handler 结果或 public facade 泄露 |
+
+PeerScopeView 不含 revoke/dispose/child/track/acquire。`Readonly<LifecycleScope>` 仍可调用其变更方法，不满足要求。PeerView 也不能含 controller getter、symbol 后门、prototype 管理方法或可写的身份对象。必须创建真正独立且冻结的 facade，不能把管理对象 `as PeerView` 直接传下去。这是 API 权限收窄，不声称同 realm 任意不可信 JS 已被沙箱隔离。
+
+peerId 是框架本地生成、连接期唯一的索引，不新增 wire connectionId，也不接受 request.peerId 替换 call.peer。runtime/runtimeInstanceId 表示**对端**，首次对端快照前可为 undefined，不能填写当前 Worker 的身份假装已观察到对端。
+
+反向 capability 获取必须检查 handler 所属插件的依赖。采用显式 peer 依赖 `{capability: LocalStorageIo, source: "peer"}`，与原 sourceRuntime 形式互斥：peer 依赖在具体调用中解析，不进入全局 Host 启动依赖图；缺失时按该次调用的 deadline/错误语义收敛，不能用某个页面缺能力阻塞所有 Worker 插件启动。普通 ctx.capability 不可脱离 peer 上下文取这种能力。
+
+SessionOpen 的实际授权路径冻结为：
+
+1. 可信宿主创建私有 sessions controller；configurePeer 将 PeerController 登记到私有 live-peer 表。普通插件拿不到该表或 controller。
+2. SessionOpen 是 host-owned 引导 handler，或在可信装配时注入私有 sessions.openForPeer 函数的受控 handler；此管理函数不进入通用 PluginContext/普通插件 facade。
+3. handler 检查 origin=remote，使用框架注入的 call.peer.peerId 查询私有表，并验证调用绑定仍对应存活 peer；绝不使用 request 中的 clientId/peerId 寻找管理对象。
+4. sessions 完成领域身份、lease、owner/session/grant 校验；await 后检查 call.signal、peer/领域 scope 与 generation。一个 peer 的 open/close/refresh 按会话世代串行化，过期 open 不得重新暴露服务。
+5. 只允许 sessions 使用明确 allowlist（例如 owner/crypto）的管理权。`controller.exposeGroup(entries)` 先验证全部 entries/配额，再在同一同步提交步骤批量激活 exposure 和目录、生成一个 revision；失败不得部分开放。返回的组 revoke 句柄由该领域 session scope 持有。普通 expose 等价于一项 group，不增新 wire 消息。
+6. 领域 session 状态与授权闭包先准备好，提交过程中不得 await；可调用目录最后发布。SessionOpen 的成功响应在提交之后发送。任何提交前失败清理暂存授权；响应丢失后查询既有 session/operation 状态，框架不重放。
+7. lock/close/grant 变化/断开由 sessions 同步 revoke 已持有的 exposure group，再进入领域异步 drain。普通业务 handler 只能执行自己已获准的能力，不能触发任意 Host handler 的 exposure。
+
+实现为独立管理对象后，现有代码中 `peer as CapabilityPeer` 这类仅收窄类型的传递必须消失。`authorize` 回调也只获得 PeerView，不向普通业务授权函数意外注入管理权。
+
+### 5.4 身份与目录
 
 | 身份 | v4 语义 |
 | --- | --- |
@@ -244,15 +289,44 @@ service 项：kind（rpc/stream）、capabilityId、contractVersion、serviceIns
 
 ### 6.3 错误
 
-框架错误至少覆盖：protocol_mismatch、invalid_snapshot、capability_unavailable、contract_mismatch、request_validation_failed、response_validation_failed、request_clone_failed、response_clone_failed、transfer_invalid、handler_failed、call_timeout、request_cancelled、service_revoked、service_stale、transport_unavailable、runtime_initialization_failed、stream_overflow。
+框架错误至少覆盖：protocol_mismatch、invalid_snapshot、capability_unavailable、contract_mismatch、request_validation_failed、response_validation_failed、request_clone_failed、response_clone_failed、transfer_invalid、handler_failed、call_timeout、request_cancelled、service_revoked、service_stale、transport_unavailable、runtime_initialization_failed、stream_overflow、resource_limit_exceeded、invalid_message。
 
 公开 error 结构包括 code、message、phase（validate/wait/dispatch/execute/receive/dispose）、可选 capabilityId/runtimeInstanceId/serviceInstanceId、脱敏 details。phase 表示已观察到的失败阶段，不保证远端副作用未发生；发出请求后的 timeout 必须允许“执行结果未知”的诊断。
 
 parser/异常堆栈及 details 不能携带完整 request、密码、密钥、存储凭据或 grant token。产品错误可以用命名空间 code，不能覆盖框架 code 的语义。
 
+### 6.4 默认 deadline 与资源配额
+
+这是首版确定的工程预算，不是测得的浏览器极限。quota 由可信 Runtime/advanced transport 装配的 `limits` 控制，默认值如下；不得由 wire、普通插件或单次 call 扩大。可信装配只能在本版上限内设置默认值或收紧配额；超过表中上限属于另一次显式设计预算修订，必须更新规范并重做边界/三仓大载荷验收，不能通过配置静默放宽。不允许 Infinity 或无上限。双方各自执行预算，超出对端预算直接失败，不新增协商握手。
+
+| 项目 | 默认/固定上限与计量口径 |
+| --- | --- |
+| unary 总 deadline / stream 建立 deadline | 默认 30,000ms；每次 timeoutMs 范围 1–300,000ms；standalone 同规则；不静默截断 |
+| peer 数 | 每个 Runtime 最多 32 个已接入 peer；超出只拒绝新 peer |
+| pending call | 每 peer、每方向最多 64，含等待目录和 stream 建立；每 Runtime 各方向合计 512 |
+| active stream | 每 peer、每方向最多 16（建立时预留）；每 Runtime 各方向合计 128 |
+| 未完成 handler/iterator 清理执行槽 | 每 peer 最多 64，每 Runtime 合计 512；取消不等于执行已结束，见下文 |
+| stream credit / push 队列 | 默认窗口 16、最多 256；适配队列最多同窗口项数，并同时受字节配额约束 |
+| 单份 snapshot | 最多 512 units、1,024 services；此外仍受整条消息预算约束 |
+| 单条消息 DTO 图 | 最大深度 32、10,000 个唯一对象节点、20,000 个字段/数组槽位边；重复引用不重复算对象但算引用边 |
+| 单条消息预算 | 最大 16MiB budgetBytes，克隆与转移均计入；大文件以产品分块/stream 传输 |
+| 保留载荷预算 | 每 peer、每方向 64MiB；每 Runtime、每方向 256MiB；涵盖等待派发、待回调 item、尚未释放的框架/执行槽载荷 |
+| transfer | 去重后最多 32 项，其中 MessagePort 最多 8；extractor 原始列表也最多 64 项，超过即拒绝而非先无限去重 |
+| 单服务 attributes | 深度 8、256 对象节点、1,024 引用边、16KiB budgetBytes；key 最多 128 UTF-16 code units，字符串值最多 2,048 |
+| 标识符 | callId/peerId 最多 128；operationId/capabilityId/pluginId/unitId/runtimeId/runtimeInstanceId/serviceInstanceId/grantId 最多 256；contractVersion/protocolVersion 最多 64；都非空 |
+| 其他文本 | 普通 DTO 单字符串最多 1,048,576 UTF-16 code units；对象字段名最多 256；错误公开 message 最多 1,024，details 最多 4KiB 且只含准许的脱敏标量字段 |
+
+budgetBytes 是确定性计费值，不称为真实结构化克隆字节数：字符串与 key 按 UTF-16 长度 ×2；number/bigint 按 8（bigint 限有符号 64 位）；boolean/null/undefined 按 8；每个唯一容器 32、每条边 16；ArrayBuffer 按完整 byteLength（共享 backing buffer 只计一次），view 另计 32；Blob/File 按 size 加名称/type 文本；Date 16；MessagePort 64。所有项都累加，达到上限后立即停止遍历。数量边界用于补足字节估计，不能以短字符串填满无限对象图。
+
+入站顺序：端口资源登记 → 有界信封/图/quota 检查 → 契约 parser → 身份/授权 → 执行。出口检查在 post 前完成；不合法本地 timeout 参数同步校验/Promise 拒绝，线上超限返回脱敏 resource_limit_exceeded。已确认身份的合法 call 遇到繁忙额度仅拒绝该 call；畸形/结构超限消息关闭该 peer 并清理其资源，不影响其他 peer。无法安全关联 call 时不得回显任意巨大的客户端字段。
+
+配额预留和检查在同一同步步骤；计数有归属且幂等释放。stream 建立占 pending 并预留 stream slot，ready 时释放 pending、转为 active；不能在 ready 时才发现并发 stream 超限。cancel/error/done 后移除 pending/stream 表项；**不配合的 handler、next()/return() 或在途回调的执行槽及其已计费载荷，直到实际结束才释放**。因此 AT-05 要求 pending=0，但允许 inspect 报告 nonCooperativeExecutionCount>0；连续取消不能绕过执行上限。程序不能强制终止任意 JS Promise，达到该槽上限后拒绝该 peer 新工作，不新建无界“孤儿请求表”。
+
+这些配额保护框架入站后的分配、保留与调度；浏览器在 JS 收到 MessageEvent 前已经执行了结构化反序列化，不能承诺阻止恶意原生 postMessage 的所有预分配，或为同 realm 恶意 parser/handler 提供 CPU/内存沙箱。不得把这项限制写成“任一异常页面绝不可能拖慢浏览器”的保证。
+
 ## 7. Transfer：契约决定所有权
 
-RPC 契约可声明 `transfer.request(value)`、`transfer.response(value)`；stream 可声明 `transfer.item(value)`。未声明则仅结构化克隆，call 不接受临时 transferForRequest/transfer 参数。
+RPC 契约可声明 `transfer.request(value)`、`transfer.response(value)`；stream 同样有订阅请求，必须支持 `transfer.request(value)` 与 `transfer.item(value)`。未声明则仅结构化克隆，call 不接受临时 transferForRequest/transfer 参数。
 
 1. 提取器只能返回该载荷可达且类型允许的 transferable；发送前验证、去重、拒绝非法项。接收的 transfer 资源必须由明确的对应契约字段承载，不能把不在 DTO 内的 port 当侧信道。TypedArray 使用明确声明的 backing buffer，不能猜测任意视图的所有权。
 2. sender parser 先验证规范化值，再基于该值提取 transfer，最后 postMessage；接收端再次使用生产 parser 验证。parser 不得在校验成功前执行 I/O。
@@ -265,6 +339,44 @@ RPC 契约可声明 `transfer.request(value)`、`transfer.response(value)`；str
 9. 不把同一 transferable 对象 fan-out 给多个订阅者；每个订阅拥有独立载荷所有权，或采用不可转移的克隆数据。
 
 Keymaster Window P2P executor 等独立领域数据端口可以作为明确的 typed payload 转移，但其独立协议必须列入迁移清单并说明与 Runtime 控制协议的边界；不得保留 Coordinator 主 RPC/Local bridge 的旧端口作为“领域例外”。
+
+### 7.1 支持的 DTO 图与统一验证器
+
+```ts
+interface StreamTransferDescriptor<TRequest, TItem> {
+  /** 订阅建立请求的所有权转移。 */
+  readonly request?: TransferExtractor<TRequest>;
+  /** 每个流元素的所有权转移。 */
+  readonly item?: TransferExtractor<TItem>;
+}
+```
+
+一个共用 walker/validator 服务 sender、receiver、Provider 与 testing，不允许各自实现可达性近似版本。先检查原始输入图避免 parser 收到 accessor，再验证 parser 输出图，按**规范化输出**提取/匹配 transferable。parser 为受信任的同步代码，不应读网络、注册资源或自行 close/transfer；其返回不得偷偷丢弃或制造载荷的 MessagePort 身份。local capability 的任意本地对象不受 wire DTO 限制。
+
+| 值/容器 | 规则 |
+| --- | --- |
+| 标量 | null/undefined/boolean/string、有限 number、64 位有符号 bigint；其余限制见 6.4 |
+| record | 仅 Object.prototype 或 null prototype，遍历 own enumerable string 数据属性；拒绝 symbol、accessor、非枚举自定义属性，不执行 getter |
+| Array | 只允许 length 与密集索引数据属性；拒绝洞、额外自定义属性、accessor；长度按边预算检查 |
+| ArrayBuffer/TypedArray/DataView | 固定长度、非共享、未 detached；view→buffer 是显式可达边，按整个 backing buffer 计费/转移；不枚举每个字节 |
+| Blob/File/Date | 作为受支持叶节点，读取内建 size/元数据或有限时间值；不遍历用户扩展属性；带自定义属性的值拒绝，不能藏嵌套 port |
+| MessagePort | 叶节点，只允许显式声明且在 transfer list 内的业务资源；Runtime 自己的 port 永久禁止 |
+| Map/Set、类实例、Error、函数、symbol、SharedArrayBuffer、可调整大小 buffer、其他平台对象 | 首版 wire DTO 不支持；产品调用点适配器在进入框架前先转成上述容器/错误标量 DTO（不能指望框架先把被禁止的 raw 值交给 parser）。不要无限扩大 walker 来模仿完整 structured clone |
+
+允许 DAG 重复引用，拒绝循环；active-path 检测循环、visited 去重、节点/边/字节分别计数。深度是最长可达路径，缓存重复节点时也必须校验其子图深度，不能借别名绕过上限；实现采用有界迭代遍历避免递归栈溢出。
+
+Proxy 不是受支持的 DTO。浏览器没有通用、无副作用的 isProxy 检查，getPrototypeOf/ownKeys/descriptor 自身也可能触发 Proxy trap。因此只承诺不主动调用普通对象 getter，不承诺检查任意本地恶意对象绝不执行用户代码；本地调用者/parser 负责提供受支持数据，最终浏览器 clone 拒绝仍映射为 clone error。入站数据以浏览器已克隆的值为基础；fake transport 必须遵守同样的输入前提，不把任意带 getter 的伪 MessageEvent 当真实 wire。
+
+### 7.2 接收端资源发现与关闭责任
+
+接收端在读取 data/parser 前，由 transport 记录 `MessageEvent.ports` 中本次新收到的 port。该数组包含本次转移的 MessagePort，即使业务图无法完整解析也能枚举；参见 [HTML MessagePort postMessage 算法](https://html.spec.whatwg.org/multipage/web-messaging.html#dom-messageport-postmessage)。允许的 raw DTO 图另用于验证这些 port 确实可达，集合必须吻合。不能仅在“成功解析出 request.port”后才开始负责清理。
+
+- 每条消息的接收资源账本只有 transport 持有，不由各 parser 重复关闭。未识别消息、畸形/超限图、错版本/身份、未知 callId、取消后迟到 response/item、parser 或 authorize 失败：关闭该账本中所有尚未移交的 port，再丢弃载荷。
+- 对合法但超出 transfer 数量上限的 event，也逐个关闭已收到 port；这是对本次已分配资源的清理，不创建与数量成比例的持久缓存。禁止靠递归扫描任意 data 发现这些资源。
+- receiver parser 必须保持原始可达 port 集合；丢弃、克隆替换或添加 port 导致 transfer_invalid，并关闭本次资源。接收端提取器得到的 port 集合也必须与该账本吻合，避免未声明 port 被悄悄接受。
+- handler 正式进入、unary result 交付调用者、item 开始调用 onNext 时，才移交相应业务 port 的关闭责任；排队 item 仍归框架。已移交的 port 不因框架后来取消就抢回关闭，业务使用本地 scope/signal 清理。
+- MessageEvent 反序列化失败通常只有 messageerror，没有可访问载荷；只清理运行时确实拿到的资源与本端连接，不宣称能够关闭从未交给 JS 的 port。
+- advanced transport 必须提供等价的“本次接收 port 清单”元信息与所有权移交；metadata 仅本地使用，不增 wire 字段。testing 必须模拟 data 与 ports 的同一对象身份。shared-worker connect 事件用于建立 Runtime 的 port 不属于业务消息资源账本。
 
 ## 8. Typed stream 与事件迁移
 
@@ -288,6 +400,31 @@ await sub.closed;   // 正常结束 resolve；错误/撤销 reject。
 - 长期流没有连接“仍活着”的保证；v4 不新增心跳。底层静默断开、缺少关闭通知时，产品需要自己的有界操作/会话策略；不能声称每次页面崩溃都即时被 Worker 发现。
 - Keymaster 状态订阅必须在生产者同步建立监听与读取初始状态，保证快照和后续变化间没有丢失窗口；领域序号用于恢复检测，与 WebLoom stream sequence 不混用。
 
+### 8.1 终止矩阵与竞态
+
+状态为 opening → active → draining → closed/failed。ready 和 closed 各只能 settle 一次；以下 R(E) 表示以稳定脱敏框架错误拒绝，F 表示 resolve。cancel/失败先于最终 closed settle 时优先终止；已 settled 的 Promise 不被改写。
+
+| 事件 | ready | closed | producer iterator.return()/资源 |
+| --- | --- | --- | --- |
+| ready 前主动 cancel 或外部 signal abort | R(request_cancelled) | R(request_cancelled)，立即 | 若已有 iterator，最多调用一次 return；稍后才创建则一到达就 return，不发送 ready/item |
+| 建立 deadline 到期 | R(call_timeout) | R(call_timeout)，立即 | abort + 一次 return；不等待其配合 |
+| handler 建立失败/订阅授权失败 | R(对应错误) | R(同错误) | 已取得 iterator 则异常回收一次 |
+| producer 已有 iterator，但 streamReady post 失败 | 消费端收到可发送的 error 则 R(transport_unavailable)，否则由建立 deadline/断线拒绝 | 同左；不能声称对端立即知道发送失败 | producer 立即取消建立 timer、释放 pending，abort 并一次 return；不能开始 next |
+| 正常收到 streamReady | F | 保持 pending | producer 才可发送 next；建立 timeout 取消 |
+| active 时主动 cancel | 保持 F | R(request_cancelled)，立即 | 停止新回调、丢弃/清理排队 item、abort + 一次 return |
+| onNext 执行时 exposure revoke/断线 | 已 F 则保持 F；未 ready 则 R | R(service_revoked/transport_unavailable)，立即 | 当前 JS 回调不能强行终止；不再派发下一项、不补 credit；return 一次，执行槽直至实际结束 |
+| onNext 抛错或 Promise 拒绝 | 保持 F | R(handler_failed)，立即 | cancel 对端、清理排队 item、return 一次；不公开回调原始异常内容 |
+| 收到 done，存在未完成回调/已接收 item | 保持 F | 进入 draining，按序完成全部已接收 item 后 F | done 后不接收新 item；正常 iterator 已耗尽，不再重复 return；排队资源逐项移交 |
+| draining 时 cancel/revoke/回调失败 | 保持 F | R(对应错误)，不等剩余回调 | 丢弃未交付 item，已移交资源由业务负责，晚到回调完成不改写失败 |
+| ready 前收到 done/next、错序/超 credit | 未 ready 则 R(invalid_message)，已 F 不改写 | R(invalid_message)，立即 | 终止本流并清理；若无法安全关联则关闭 peer |
+| closed settle 后任何消息/重复 cancel | 不变 | 不变 | 丢弃迟到载荷并关闭其未移交 port，不重复 return |
+
+一个订阅的 onNext 串行执行，最多一个回调在执行；其他已收到 item 在窗口/字节预算内排队。done 仅意味着生产结束，不代表消费完成；draining 不再给 producer 发 credit。若回调永久不结束，closed 在正常 done 路径可以保持 pending，调用者仍能 cancel；不能暗中套回 30 秒流寿命。
+
+return 的调用结果必须有 rejection handler，不产生悬空 unhandled rejection；正在执行的 next()/return() 不强制中断，其资源槽按 6.4 保留。正常 done 之后 consumer 的错误无需再次调用已自然结束的 producer iterator。
+
+`cancel(reason?: string)` 仅供本地调用者关联操作，长度最多 256；不写入 wire、公开 error.message/details、inspect 或日志，公开错误使用固定 request_cancelled 文案。外部 signal.reason 同样不直接序列化；不存在用任意 Error/object reason 跨端传播私密信息的入口。
+
 ## 9. 插件声明与公共 API 收口
 
 普通 `definePlugin` 保留 id/name/description、runtime/unitId、provides、dependencies、permissions、config、contribution、startup、defaultEnabled、canDisable、setup。
@@ -304,7 +441,7 @@ await sub.closed;   // 正常结束 resolve；错误/撤销 reject。
 | capability<T>(string)、call<TRequest,TResult> | 契约推导的 capability(C).call(request) |
 | getProxy/requireProxy、隐含 serviceBridge | Runtime/Context/Peer capability(C)；advanced 内部同样只用一个获取入口 |
 | function/object.handle/{method,args} RPC 猜测 | ctx.handle(C, explicitHandler) |
-| onConnection/onPortConnect | client.expose、configurePeer(PeerHandle) |
+| onConnection/onPortConnect | client.expose、configurePeer(PeerController) |
 | PluginHostProvider/useHost 兼容出口 | WebLoomProvider app + typed hooks；advanced 显式 Host 工具 |
 | 主入口 export * 底层实现 | 四入口白名单，见下文 |
 
@@ -347,7 +484,11 @@ subscribeFn 形如 `(listener) => unsubscribe`，同步安装时如发生 Scope 
 
 App/Handle 提供不可变的 `inspect()` 与 `explain(pluginId | contract)`。结果包含插件/单元/Runtime 状态、依赖阻塞原因链、引用身份、scope 状态，以及 pendingCallCount、activeStreamCount、peerCount 等本端指标。
 
-原因码至少覆盖 missing_provider、contract_mismatch、dependency_blocked、scope_revoked、runtime_disconnected、initialization_failed。原因链循环截断，确定性排序；不存在的 ID 明确 unknown，不返回伪成功。
+诊断字段必须注明 provenance：local（本端事实）、remote-projection（最后接受的对端可见投影）；远端项附 runtimeInstanceId/revision、observedAt（本端接收时间），不称为对端当前实时权威状态。断开后的历史信息标 stale；本端执行槽/计数不能冒充对端内部计数。
+
+PeerView 不提供 Host 管理 inspect。客户端看不到的服务，其 missing 与未授权统一为 capability_unavailable，不返回“存在但你无权限”、实际版本列表或隐藏 provider 信息。只有客户端已见到的 exposure 才可解释其已见版本不匹配/撤销；runtime-error/错误 details 不得绕过此规则。units/graph 的远端投影也只含宿主明确公开的单元，不能通过完整 unit 清单旁路隐藏能力策略。可信本地 App/PeerController inspect 可以查看自己管理的本地状态，但不能默认向 peer 发送。
+
+本地管理原因码至少覆盖 missing_provider、contract_mismatch、dependency_blocked、scope_revoked、runtime_disconnected、initialization_failed。原因链循环截断，确定性排序；不存在的 ID 明确 unknown，不返回伪成功。
 
 诊断从现有状态与计数派生，不维护第二套权威生命周期，不暴露 request/result、密钥、密码、grant token、授权 headers。peerCount 不宣称等于仍活跃浏览器 Tab 数。
 
@@ -396,6 +537,12 @@ Local 桶是 Window `localStorage`，不换 IndexedDB；先选择/导入桶，�
 所有示例去掉字符串 capability、手写调用泛型、providedContracts、required/meta、旧主入口底层 import。同步修改页面代码摘录与说明，禁止运行代码新、教学文本旧。
 
 07 必须演示请求结果推导、实际 transferable 所有权变化、取消、两个页面共用 Worker 单元实例、旧代理/订阅失效，以及 typed 页面反向能力。仍使用实际生产构建 SharedWorker URL，不能用 MessageChannel fake 代替浏览器验收。
+
+### 13.1 浏览器验收口径
+
+本轮必须在生产构建的真实 Chromium 完成完整矩阵，并记录精确版本/平台；这只是已验收支持范围，不意味着所有浏览器自动受支持。Firefox 与 Safari/WebKit 要有明确记录（实际版本、module SharedWorker/双向 transfer/stream 测试结果或未验收），不把 Playwright WebKit 直接写成真 Safari 已通过。
+
+框架按所需特性检测返回明确 unsupported/transport_unavailable，不增加 DedicatedWorker、MessageChannel 或 Window 假 Runtime fallback。其他浏览器未通过时不得宣传“全浏览器验收完成”；若产品发布承诺包含它们，相关真实环境必须成为该产品发布门禁。本文不以 Chromium fixture 代替产品的浏览器支持决策。
 
 ## 14. 验收及发布定义
 

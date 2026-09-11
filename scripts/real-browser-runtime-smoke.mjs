@@ -132,7 +132,17 @@ if (playwright) {
             || first.setupCount !== 1
             || second.setupCount !== 1
             || first.workerRuntimeInstanceId !== second.workerRuntimeInstanceId
-            || first.serviceInstanceId !== second.serviceInstanceId
+            || !first.serviceInstanceId
+            || !second.serviceInstanceId
+            || first.serviceInstanceId === second.serviceInstanceId
+            || first.reverseResult !== "page:reverse"
+            || second.reverseResult !== "page:reverse"
+            || JSON.stringify(first.streamValues) !== JSON.stringify([1, 2, 3])
+            || JSON.stringify(second.streamValues) !== JSON.stringify([1, 2, 3])
+            || first.transferDetached !== true
+            || second.transferDetached !== true
+            || first.transferByteLength !== 8
+            || second.transferByteLength !== 8
             || typeof first.workerUrl !== "string"
             || first.workerUrl.startsWith("data:")
             || first.workerUrl.endsWith(".ts")) {
@@ -150,6 +160,7 @@ if (playwright) {
             || reconnectResult.scenario !== "reconnect"
             || reconnectResult.reconnected !== true
             || reconnectResult.firstRuntimeInstanceId !== reconnectResult.secondRuntimeInstanceId
+            || reconnectResult.firstReverseResult !== "page:reverse"
             || !["service_revoked", "transport_unavailable"].includes(String(reconnectResult.oldProxyError))) {
             throw new Error(`real reconnect assertions failed: ${JSON.stringify(reconnectResult)}`);
           }

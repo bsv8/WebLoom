@@ -12,4 +12,6 @@ export { createResourceRegistry } from "./resources/resourceRegistry.js";
 export { createResourceStore } from "./resources/resourceStore.js";
 export * from "./testing/fakes.js";
 export { connectSharedWorkerForTesting } from "./runtime/connectSharedWorker.js";
+export { startSharedWorkerAppForTesting } from "./runtime/sharedWorkerHost.js";
+export type { StartSharedWorkerAppForTestingOptions, SharedWorkerScopeLike } from "./runtime/sharedWorkerHost.js";
 export type { SharedWorkerFactory } from "./runtime/connectSharedWorker.js";

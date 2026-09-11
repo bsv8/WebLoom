@@ -1,128 +1,99 @@
+// Runtime 装配：把作者的 typed definition 绑定到一个真实 Runtime。
+// 静态 manifest 只含 descriptor；setup 仍然只存在于当前 realm。
+
+import type { PluginDefinition } from "../contracts/plugin.js";
 import type {
-  PluginDefinition,
-} from "../authoring/definePlugin.js";
-import type {
-  PluginDependency,
   PluginManifest,
-  PluginManifestInput,
+  PluginSetup,
   RuntimeUnitDescriptor,
-  RuntimeUnitDescriptorInput,
+  RuntimeUnitDependency,
 } from "../contracts/plugin.js";
-import {
-  defineRuntimeUnitProvidedContracts,
-  runtimeCapabilityContractVersion,
-} from "../contracts/plugin.js";
+import type { Capability } from "../contracts/capability.js";
 import type { RuntimeKind } from "../contracts/lifecycle.js";
 
-// Runtime assembly intentionally accepts definitions with product-specific
-// config/contribution/extension generics. The materializer normalizes those
-// values into the framework's structural manifest before Host registration;
-// keeping this boundary generic avoids making every author cast a valid
-// definePlugin() result just to call createWindowApp().
-export type RuntimePluginDefinition = PluginDefinition<any, any, any> | {
-  readonly manifest: PluginManifest | PluginManifestInput;
-  readonly setup: import("../contracts/plugin.js").PluginSetup<any, any>;
-  /** 多 unit manifest 中 setup 所实现的目标 unit；单一匹配 unit 可省略。 */
+/** 可传给 Runtime 的 v4 插件定义；没有旧 manifest 字段或兼容签名。 */
+export type RuntimePluginDefinition = {
+  /** 静态 manifest。 */
+  readonly manifest: PluginManifest;
+  /** 当前 realm 的 setup 实现。 */
+  readonly setup: PluginSetup;
+  /** 当前 realm 的 typed capability 定义表。 */
+  readonly capabilities?: readonly Capability[];
+  /** 多 unit 定义中的实现目标。 */
   readonly unitId?: string;
 };
 
 export interface MaterializedPluginDefinition {
+  /** 当前 Runtime 可见的静态 manifest。 */
   readonly manifest: PluginManifest;
-  /** 当前 Runtime 中由 setup 实现的 unit。 */
+  /** setup 对应的单元。 */
   readonly unitId: string;
-  readonly setup: import("../contracts/plugin.js").PluginSetup;
+  /** 当前 realm 的 setup。 */
+  readonly setup: PluginSetup;
+  /** 当前 realm 的 capability 定义表。 */
+  readonly capabilities: readonly Capability[];
 }
 
-function normalizeProductDependencies(
-  dependencies: readonly PluginDependency[] | undefined,
+function cloneDependencies(
+  dependencies: readonly RuntimeUnitDependency[] | undefined,
   runtime: RuntimeKind,
-) {
-  return dependencies?.map((dependency) => ({
-    capability: dependency.capability,
-    contractVersion: dependency.contractVersion ?? runtimeCapabilityContractVersion(dependency.capability),
-    sourceRuntime: dependency.sourceRuntime ?? runtime,
-    ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
-    ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
+): readonly RuntimeUnitDependency[] | undefined {
+  if (!dependencies) return undefined;
+  return Object.freeze(dependencies.map((dependency) => {
+    const base = {
+      capability: Object.freeze({ ...dependency.capability }),
+      ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
+      ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
+    };
+    return Object.freeze(dependency.source === "peer"
+      ? { ...base, source: "peer" as const }
+      : { ...base, sourceRuntime: dependency.sourceRuntime ?? runtime });
   }));
 }
 
-/** 将作者定义绑定到真实 Runtime；不把 setup 复制进 manifest。 */
-export function materializePluginDefinition(
+function selectUnit(
   input: RuntimePluginDefinition,
   runtime: RuntimeKind,
-): MaterializedPluginDefinition {
-  const manifest = input.manifest;
-  const setup = input.setup;
-  if (!manifest || typeof manifest.id !== "string" || manifest.id.trim() === "") {
-    throw new Error("Plugin manifest id must be a non-empty string");
+): RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } {
+  const candidates = [...(input.manifest.units ?? [])];
+  if (candidates.length === 0) return { id: input.manifest.id, runtime };
+  const requested = input.unitId;
+  if (requested !== undefined) {
+    const unit = candidates.find((candidate) => candidate.id === requested);
+    if (!unit) throw new Error(`Plugin "${input.manifest.id}" does not declare unit "${requested}"`);
+    if (unit.runtime !== undefined && unit.runtime !== runtime) throw new Error(`Plugin "${input.manifest.id}" unit "${requested}" targets ${unit.runtime}, not ${runtime}`);
+    return { ...unit, runtime };
   }
-  const existingUnits: readonly RuntimeUnitDescriptorInput[] = (manifest.units ?? []) as readonly RuntimeUnitDescriptorInput[];
-  const requestedUnitId = "unitId" in input ? input.unitId : undefined;
-  const matchingUnits = existingUnits.filter((unit) => unit.runtime === undefined || unit.runtime === runtime);
-  let implementationUnitId: string;
-  if (existingUnits.length === 0) {
-    implementationUnitId = manifest.id;
-  } else if (requestedUnitId !== undefined) {
-    const selected = existingUnits.find((unit) => unit.id === requestedUnitId);
-    if (!selected) throw new Error(`Plugin "${manifest.id}" does not declare unit "${requestedUnitId}"`);
-    if (selected.runtime !== undefined && selected.runtime !== runtime) {
-      throw new Error(`Plugin "${manifest.id}" unit "${requestedUnitId}" targets ${selected.runtime}, not ${runtime}`);
-    }
-    implementationUnitId = selected.id;
-  } else if (matchingUnits.length === 1 && matchingUnits[0]) {
-    implementationUnitId = matchingUnits[0].id;
-  } else {
-    throw new Error(
-      `Plugin "${manifest.id}" has ${matchingUnits.length} implementation units for ${runtime}; specify unitId explicitly`,
-    );
-  }
-  const selectedUnit = existingUnits.length > 0
-    ? existingUnits.find((unit) => unit.id === implementationUnitId)
-    : undefined;
-  const units: RuntimeUnitDescriptor[] = selectedUnit
-    ? [(() => {
-        const unitRuntime = selectedUnit.runtime ?? runtime;
-        const provides = [...(selectedUnit.provides ?? [])];
-        const dependencies = selectedUnit.dependencies?.map((dependency): import("../contracts/plugin.js").RuntimeUnitDependency => ({
-          capability: dependency.capability,
-          contractVersion: dependency.contractVersion ?? runtimeCapabilityContractVersion(dependency.capability),
-          sourceRuntime: dependency.sourceRuntime ?? unitRuntime,
-          ...(dependency.reason !== undefined ? { reason: dependency.reason } : {}),
-          ...(dependency.optional !== undefined ? { optional: dependency.optional } : {}),
-        }));
-        return {
-          ...selectedUnit,
-          runtime: unitRuntime,
-          dependencies,
-          ...(provides.length > 0
-            ? { providedContracts: { ...defineRuntimeUnitProvidedContracts(provides), ...(selectedUnit.providedContracts ?? {}) } }
-            : {}),
-        };
-      })()]
-    : [{
-        id: manifest.id,
-        runtime,
-        dependencies: normalizeProductDependencies(manifest.dependencies, runtime),
-        ...(manifest.provides && manifest.provides.length > 0 ? {
-          provides: [...manifest.provides],
-          providedContracts: defineRuntimeUnitProvidedContracts(manifest.provides),
-        } : {}),
-        ...(manifest.permissions !== undefined ? { permissions: [...manifest.permissions] } : {}),
-        ...(manifest.config !== undefined ? { config: manifest.config } : {}),
-        ...(manifest.contribution !== undefined ? { contribution: manifest.contribution } : {}),
-      }];
-  const normalized: PluginManifest = {
-    ...manifest,
-    units,
-    // Product-level declarations are retained only for compatibility with
-    // low-level manifests; the selected unit is the source of truth in Host.
-  };
-  return { manifest: normalized, unitId: implementationUnitId, setup };
+  const matches = candidates.filter((unit) => unit.runtime === undefined || unit.runtime === runtime);
+  if (matches.length !== 1 || !matches[0]) throw new Error(`Plugin "${input.manifest.id}" has ${matches.length} implementation units for ${runtime}; specify unitId explicitly`);
+  return { ...matches[0], runtime };
 }
 
-export function materializePluginDefinitions(
-  inputs: readonly RuntimePluginDefinition[],
-  runtime: RuntimeKind,
-): MaterializedPluginDefinition[] {
+/** 将一个 definition 装配为单 Runtime 的唯一实现单元。 */
+export function materializePluginDefinition(input: RuntimePluginDefinition, runtime: RuntimeKind): MaterializedPluginDefinition {
+  if (!input || !input.manifest || typeof input.manifest.id !== "string" || input.manifest.id.trim() === "") throw new TypeError("Plugin manifest id must be a non-empty string");
+  if (typeof input.setup !== "function") throw new TypeError(`Plugin "${input.manifest.id}" setup must be a function`);
+  const unit = selectUnit(input, runtime);
+  const materializedUnit: RuntimeUnitDescriptor = Object.freeze({
+    ...unit,
+    runtime,
+    ...(cloneDependencies(unit.dependencies, runtime) ? { dependencies: cloneDependencies(unit.dependencies, runtime) } : {}),
+    ...(unit.provides ? { provides: Object.freeze(unit.provides.map((item) => Object.freeze({ ...item }))) } : {}),
+    ...(unit.permissions ? { permissions: Object.freeze([...unit.permissions]) } : {}),
+  });
+  const manifest: PluginManifest = Object.freeze({
+    id: input.manifest.id,
+    name: input.manifest.name,
+    ...(input.manifest.description !== undefined ? { description: input.manifest.description } : {}),
+    startup: input.manifest.startup,
+    defaultEnabled: input.manifest.defaultEnabled,
+    canDisable: input.manifest.canDisable,
+    units: Object.freeze([materializedUnit]),
+  });
+  const capabilities = Object.freeze([...(input.capabilities ?? [])]);
+  return { manifest, unitId: unit.id, setup: input.setup, capabilities };
+}
+
+export function materializePluginDefinitions(inputs: readonly RuntimePluginDefinition[], runtime: RuntimeKind): MaterializedPluginDefinition[] {
   return inputs.map((input) => materializePluginDefinition(input, runtime));
 }

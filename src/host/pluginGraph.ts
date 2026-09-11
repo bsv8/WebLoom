@@ -1,10 +1,14 @@
-// 插件依赖图：依赖 capability，而不是依赖 manifest 顺序或 pluginId 猜测。
+// WebLoom v4 静态插件/能力依赖图。
 //
-// 图是纯描述数据；启停状态由 Host/config store 提供。这样同一份图可以在
-// SharedWorker、页面和测试中复用，页面不会另起一套业务生命周期。
+// 图只处理 descriptor，不保存 parser、transfer extractor 或 setup。真正的
+// capability 对象留在当前 realm，由 Host 在启动时用同一份定义表绑定实现。
 
+import {
+  capabilityKey,
+  isCapabilityDescriptor,
+  type CapabilityDescriptor,
+} from "../contracts/capability.js";
 import type {
-  PluginDependency,
   PluginGraph,
   PluginManifest,
   PluginReverseDep,
@@ -14,548 +18,247 @@ import type {
 } from "../contracts/plugin.js";
 import type { RuntimeKind } from "../contracts/lifecycle.js";
 
-export interface BuildPluginGraphOptions {
-  /** 当前真正运行的插件；不传时使用 manifest.meta.defaultEnabled。 */
-  enabledPluginIds?: ReadonlySet<string>;
-  /** 当前 Host 的真实 Runtime；未选中的 Window/Worker 单元不会进入图。 */
-  runtime?: RuntimeKind;
+export interface PluginGraphOptions {
+  /** 当前 Host 的 Runtime；未指定时只用于静态检查。 */
+  readonly runtime?: RuntimeKind;
+  /** 当前已经启用的插件，用于生成反向依赖状态。 */
+  readonly enabledPluginIds?: ReadonlySet<string>;
+  /** Host-owned 或远端已发布的 descriptor。 */
+  readonly builtinCapabilities?: ReadonlySet<CapabilityDescriptor | string>;
+  /** 是否允许尚未出现在本图中的跨 Runtime provider。 */
+  readonly externalRuntimeDependencies?: boolean;
+  /** registerAll 的调用阶段是否允许缺依赖。 */
+  readonly allowMissingDependencies?: boolean;
 }
 
-export interface ValidatePluginGraphOptions extends BuildPluginGraphOptions {
-  /** 平台内建 capability，不需要由某个 manifest 提供。 */
-  builtinCapabilities?: ReadonlySet<string>;
-  /** 允许多 Provider 的 capability；调用方必须有专门 Registry 选择语义。 */
-  multiProviderCapabilities?: ReadonlySet<string>;
-  /** Host 分批注册时允许 provider 尚未注册；真正装配前仍会进入 blocked。 */
-  allowMissingDependencies?: boolean;
-  /**
-   * 允许依赖当前图之外的另一个真实 Runtime；实际是否 ready 由运行时
-   * snapshot 和 RemoteServiceBridge 在 Host reconcile 时决定。
-   */
-  externalRuntimeDependencies?: boolean;
-}
-
-export interface PluginGraphDiagnostic {
-  /** 稳定诊断码。 */
-  code:
-    | "plugin.duplicate_id"
-    | "capability.duplicate_provider"
-    | "plugin.missing_dependency"
-    | "plugin.dependency_cycle"
-    | "plugin.dependency_contract_invalid"
-    | "plugin.dependency_contract_unavailable"
-    | "plugin.runtime_invalid"
-    | "plugin.runtime_declaration_at_product_level";
-  /** 相关插件或 capability。 */
-  ids: string[];
-  /** 中文诊断原因，供设置页直接显示或再做 i18n 映射。 */
-  message: string;
-}
-
-/** 依赖图不满足装配条件。 */
-export class PluginGraphValidationError extends Error {
-  readonly code = "plugin.graph_invalid" as const;
-  readonly diagnostics: readonly PluginGraphDiagnostic[];
-
-  constructor(diagnostics: readonly PluginGraphDiagnostic[]) {
-    super(diagnostics.map((diagnostic) => diagnostic.message).join("; "));
-    this.name = "PluginGraphValidationError";
-    this.diagnostics = [...diagnostics];
+function unitCandidates(manifest: PluginManifest, runtime?: RuntimeKind): RuntimeUnitDescriptor[] {
+  const units = [...(manifest.units ?? [])];
+  if (units.length === 0) {
+    return [{ id: manifest.id, ...(runtime !== undefined ? { runtime } : {}) }];
   }
+  if (runtime === undefined) return units;
+  return units.filter((unit) => unit.runtime === undefined || unit.runtime === runtime);
 }
 
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values)];
-}
-
-function isRuntimeKind(value: unknown): value is RuntimeKind {
-  return value === "window-main" || value === "shared-worker";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-/**
- * 校验所有显式运行单元的跨环境依赖契约。
- *
- * 多运行单元产品的运行期声明必须全部位于对应 unit；产品级字段只给没有
- * `units` 的简单插件保留兼容性。此函数同时服务 TypeScript 以外导入的
- * manifest，避免运行时只依赖静态类型。
- */
-export function validateRuntimeUnitDependencyContracts(
-  manifests: readonly PluginManifest[]
-): PluginGraphDiagnostic[] {
-  const diagnostics: PluginGraphDiagnostic[] = [];
-  for (const manifest of manifests) {
-    const units = manifest.units;
-    if (units === undefined) continue;
-    const productLevelFields = [
-      ["dependencies", manifest.dependencies],
-      ["permissions", manifest.permissions],
-      ["contribution", manifest.contribution],
-      ["config", manifest.config],
-    ] as const;
-    for (const [field, value] of productLevelFields) {
-      if (value === undefined) continue;
-      diagnostics.push({
-        code: "plugin.runtime_declaration_at_product_level",
-        ids: [manifest.id, field],
-        message: `多运行单元插件 "${manifest.id}" 的 ${field} 必须声明在对应 RuntimeUnitDescriptor 中，不能使用产品级 fallback`,
-      });
-    }
-    if ((manifest.provides?.length ?? 0) > 0) {
-      diagnostics.push({
-        code: "plugin.runtime_declaration_at_product_level",
-        ids: [manifest.id, "provides"],
-        message: `多运行单元插件 "${manifest.id}" 的 provides 必须声明在对应 RuntimeUnitDescriptor 中，不能使用产品级 capability 摘要`,
-      });
-    }
-    if (!Array.isArray(units)) {
-      diagnostics.push({
-        code: "plugin.dependency_contract_invalid",
-        ids: [manifest.id, "units"],
-        message: `插件 "${manifest.id}" 的 units 必须是运行单元数组`,
-      });
-      continue;
-    }
-    units.forEach((unitValue, unitIndex) => {
-      if (!isRecord(unitValue)) {
-        diagnostics.push({
-          code: "plugin.dependency_contract_invalid",
-          ids: [manifest.id, `unit:${unitIndex}`],
-          message: `插件 "${manifest.id}" 的第 ${unitIndex + 1} 个运行单元描述无效`,
-        });
-        return;
-      }
-      const unitId = typeof unitValue.id === "string" && unitValue.id.length > 0
-        ? unitValue.id
-        : `unit:${unitIndex}`;
-      const providedContracts = unitValue.providedContracts;
-      if (providedContracts !== undefined) {
-        if (!isRecord(providedContracts)) {
-          diagnostics.push({
-            code: "plugin.dependency_contract_invalid",
-            ids: [manifest.id, unitId],
-            message: `插件 "${manifest.id}" 的运行单元 "${unitId}" 的 providedContracts（提供契约版本）必须是对象`,
-          });
-        } else {
-          for (const [capability, version] of Object.entries(providedContracts)) {
-            if (typeof version !== "string" || version.trim() === "") {
-              diagnostics.push({
-                code: "plugin.dependency_contract_invalid",
-                ids: [manifest.id, unitId, capability],
-                message: `插件 "${manifest.id}" 的运行单元 "${unitId}" 为能力 "${capability}" 声明的契约版本不能为空`,
-              });
-            }
-          }
-        }
-      }
-      const dependencies = unitValue.dependencies;
-      if (dependencies === undefined) return;
-      if (!Array.isArray(dependencies)) {
-        diagnostics.push({
-          code: "plugin.dependency_contract_invalid",
-          ids: [manifest.id, unitId],
-          message: `插件 "${manifest.id}" 的运行单元 "${unitId}" 的 dependencies 必须是数组`,
-        });
-        return;
-      }
-      dependencies.forEach((dependencyValue, dependencyIndex) => {
-        const dependency = isRecord(dependencyValue)
-          ? dependencyValue as Partial<RuntimeUnitDependency>
-          : {};
-        const errors: string[] = [];
-        if (typeof dependency.capability !== "string" || dependency.capability.trim() === "") {
-          errors.push("capability（能力标识）不能为空");
-        }
-        if (typeof dependency.contractVersion !== "string" || dependency.contractVersion.trim() === "") {
-          errors.push("contractVersion（契约版本）不能为空");
-        }
-        if (!isRuntimeKind(dependency.sourceRuntime)) {
-          errors.push("sourceRuntime（提供者 Runtime）无效");
-        }
-        if (unitValue.runtime !== undefined && !isRuntimeKind(unitValue.runtime)) {
-          errors.push("runtime（目标 Runtime）无效");
-        }
-        if (dependency.reason !== undefined && typeof dependency.reason !== "string") {
-          errors.push("reason（依赖说明）必须是字符串");
-        }
-        if (dependency.optional !== undefined && typeof dependency.optional !== "boolean") {
-          errors.push("optional（是否可选）必须是布尔值");
-        }
-        if (errors.length === 0) return;
-        const capability = typeof dependency.capability === "string" && dependency.capability.length > 0
-          ? dependency.capability
-          : `dependency:${dependencyIndex}`;
-        diagnostics.push({
-          code: "plugin.dependency_contract_invalid",
-          ids: [manifest.id, unitId, capability],
-          message: `插件 "${manifest.id}" 的运行单元 "${unitId}" 第 ${dependencyIndex + 1} 条依赖契约无效：${errors.join("、")}`,
-        });
-      });
-    });
-  }
-  for (const manifest of manifests) {
-    for (const unit of manifest.units ?? []) {
-      if (!isRuntimeKind(unit.runtime)) {
-        diagnostics.push({
-          code: "plugin.runtime_invalid",
-          ids: [manifest.id, unit.id],
-          message: `插件 "${manifest.id}" 的运行单元 "${unit.id}" 声明了不支持的 Runtime；v1 仅支持 window-main/shared-worker`,
-        });
-      }
-    }
-  }
-  return diagnostics;
-}
-
-function unitRuntime(unit: RuntimeUnitDescriptor): RuntimeKind | undefined {
-  return unit.runtime;
-}
-
-function isRuntimeUnit(
-  unit: RuntimeUnitDescriptor,
-): unit is RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } {
-  return typeof unit.id === "string"
-    && unit.id.length > 0
-    && isRuntimeKind(unit.runtime);
-}
-
-function selectedRuntimeUnits(
+/** 选择一个插件在当前 Runtime 中的实现单元；多匹配必须显式消歧。 */
+export function selectRuntimeUnit(
   manifest: PluginManifest,
-  runtime?: RuntimeKind,
-): Array<RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }> {
-  const units = manifest.units ?? [];
-  if (units.length === 0) return [];
-  if (runtime !== undefined) return units.filter((unit): unit is RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind } =>
-    isRuntimeUnit(unit) && unit.runtime === runtime
-  );
-  // 多环境 manifest 没有 Runtime 上下文时 fail closed，不能把所有单元的
-  // capability 合并成一个假 Provider。
-  return units.length === 1 && isRuntimeUnit(units[0]!) ? [units[0]!] : [];
+  runtime: RuntimeKind | undefined,
+): (RuntimeUnitDescriptor & { id: string; runtime: RuntimeKind }) | undefined {
+  const units = unitCandidates(manifest, runtime);
+  if (units.length !== 1) return undefined;
+  const unit = units[0];
+  if (!unit) return undefined;
+  // A host created by the advanced assembly layer may not know its Runtime
+  // until it sees the one explicit unit.  The only implicit choice permitted
+  // here is the ordinary single-runtime Window default; multi-unit manifests
+  // are rejected by the Host before mutation.  This keeps an explicit
+  // single Worker unit selectable when `runtime` is omitted.
+  const selectedRuntime = unit.runtime ?? runtime ?? "window-main";
+  if (selectedRuntime === undefined) return undefined;
+  return { ...unit, runtime: selectedRuntime };
 }
 
-/**
- * 返回当前执行环境的依赖；显式运行单元不会继承产品级依赖。
- * 只有没有 units 的简单插件才读取历史 product-level dependencies。
- */
 export function dependenciesOfManifest(
   manifest: PluginManifest,
   runtime?: RuntimeKind,
-): PluginDependency[] {
-  const byCapability = new Map<string, PluginDependency>();
-  const add = (dependency: PluginDependency) => {
-    const previous = byCapability.get(dependency.capability);
-    if (!previous || (previous.optional === true && dependency.optional !== true)) {
-      byCapability.set(dependency.capability, { ...dependency });
-    }
-  };
-  const units = manifest.units ?? [];
-  if (units.length > 1 && runtime === undefined) return [];
-  const selectedUnits = selectedRuntimeUnits(manifest, runtime);
-  if (units.length > 0 && selectedUnits.length === 0) return [];
-  if (units.length === 0) {
-    for (const dependency of manifest.dependencies ?? []) add(dependency);
-  } else {
-    for (const unit of selectedUnits) {
-      for (const dependency of unit.dependencies ?? []) add(dependency);
-    }
-  }
-  return [...byCapability.values()];
+): readonly RuntimeUnitDependency[] {
+  const unit = selectRuntimeUnit(manifest, runtime);
+  // A peer dependency is resolved against the call-bound PeerView. It must
+  // never turn into a global Host startup edge/provider candidate.
+  return (unit?.dependencies ?? []).filter((dependency) => dependency.source !== "peer");
 }
 
-/** 返回当前执行环境提供的 capability；显式单元不会继承产品级摘要。 */
 export function providesOfManifest(
   manifest: PluginManifest,
   runtime?: RuntimeKind,
-): string[] {
-  const units = manifest.units ?? [];
-  if (units.length > 1 && runtime === undefined) return [];
-  return unique([
-    ...(units.length === 0 ? (manifest.provides ?? []) : []),
-    ...selectedRuntimeUnits(manifest, runtime).flatMap((unit) => unit.provides ?? []),
-  ]);
+): readonly CapabilityDescriptor[] {
+  const unit = selectRuntimeUnit(manifest, runtime);
+  return unit?.provides ?? [];
 }
 
-interface RuntimeUnitProvider {
-  pluginId: string;
-  unitId: string;
-  runtime: RuntimeKind;
-  contractVersion?: string;
+function descriptorKey(value: CapabilityDescriptor): string {
+  return capabilityKey(value);
 }
 
-/** 从完整产品描述中找显式运行单元 Provider；允许消费者跨环境依赖。 */
-function runtimeUnitProviders(
-  manifests: readonly PluginManifest[],
-  capability: string
-): RuntimeUnitProvider[] {
-  const providers: RuntimeUnitProvider[] = [];
+function keysForBuiltin(value: ReadonlySet<CapabilityDescriptor | string> | undefined): Set<string> {
+  const result = new Set<string>();
+  for (const item of value ?? []) result.add(typeof item === "string" ? item : descriptorKey(item));
+  return result;
+}
+
+function freezeRecord<T>(record: Record<string, T>): Readonly<Record<string, T>> {
+  for (const value of Object.values(record)) if (Array.isArray(value)) Object.freeze(value);
+  return Object.freeze(record);
+}
+
+function capabilityLabel(capability: CapabilityDescriptor): string {
+  return `${capability.kind}:${capability.id}@${capability.version}`;
+}
+
+function collectUnits(manifests: readonly PluginManifest[], runtime?: RuntimeKind): Map<string, PluginUnitGraph> {
+  const result = new Map<string, PluginUnitGraph>();
   for (const manifest of manifests) {
-    for (const unit of manifest.units ?? []) {
-      if (!unit.provides?.includes(capability)) continue;
-      if (!isRuntimeUnit(unit)) continue;
-      providers.push({
+    for (const unit of unitCandidates(manifest, runtime)) {
+      const selectedRuntime = unit.runtime ?? runtime;
+      if (!selectedRuntime) continue;
+      result.set(`${manifest.id}\u0000${unit.id}`, {
         pluginId: manifest.id,
         unitId: unit.id,
-        runtime: unit.runtime,
-        contractVersion: unit.providedContracts?.[capability],
+        runtime: selectedRuntime,
+        dependencies: Object.freeze([...(unit.dependencies ?? [])].filter((item) => item.source !== "peer").map((item) => item.capability)),
+        provides: Object.freeze([...(unit.provides ?? [])]),
       });
     }
   }
-  return providers;
+  return result;
 }
 
-function matchingRuntimeUnitProviders(
-  manifests: readonly PluginManifest[],
-  dependency: RuntimeUnitDependency
-): RuntimeUnitProvider[] {
-  return runtimeUnitProviders(manifests, dependency.capability).filter((provider) =>
-    provider.runtime === dependency.sourceRuntime
-    && provider.contractVersion === dependency.contractVersion
-  );
-}
-
-function runtimeDependenciesForValidation(
-  manifest: PluginManifest,
-  runtime?: RuntimeKind,
-): RuntimeUnitDependency[] {
-  const units = manifest.units ?? [];
-  const selected = runtime === undefined
-    ? units
-    : units.filter((unit) => unitRuntime(unit) === runtime);
-  return selected.flatMap((unit) => unit.dependencies ?? []);
-}
-
-/** 从 manifest 列表构造依赖、提供者和反向依赖。 */
+/** 构建不可变图快照；结果顺序始终由 manifest 输入顺序和 descriptor 顺序决定。 */
 export function buildPluginGraph(
-  manifests: PluginManifest[],
-  options: BuildPluginGraphOptions = {}
+  manifests: readonly PluginManifest[],
+  options: PluginGraphOptions = {},
 ): PluginGraph {
-  const provides: Record<string, string[]> = {};
-  const dependencies: Record<string, string[]> = {};
-  const optionalDependencies: Record<string, string[]> = {};
-  const dependencyDetails: Record<string, PluginDependency[]> = {};
+  const dependencies: Record<string, readonly CapabilityDescriptor[]> = {};
+  const optionalDependencies: Record<string, readonly CapabilityDescriptor[]> = {};
+  const provides: Record<string, readonly CapabilityDescriptor[]> = {};
   const providers: Record<string, string[]> = {};
-  const unitGraph: Record<string, PluginUnitGraph> = {};
-  const enabled = options.enabledPluginIds;
-
-  for (const manifest of manifests) {
-    const selectedUnits = selectedRuntimeUnits(manifest, options.runtime);
-    const provided = providesOfManifest(manifest, options.runtime);
-    const dependencyEntries = dependenciesOfManifest(manifest, options.runtime);
-    dependencyDetails[manifest.id] = dependencyEntries.map((dependency) => ({ ...dependency }));
-    const deps = unique(dependencyEntries.map((dependency) => dependency.capability));
-    optionalDependencies[manifest.id] = unique(
-      dependencyEntries
-        .filter((dependency) => dependency.optional)
-        .map((dependency) => dependency.capability)
-    );
-    provides[manifest.id] = provided;
-    dependencies[manifest.id] = deps;
-    for (const unit of selectedUnits) {
-      const unitKey = `${manifest.id}:${unit.id}`;
-      unitGraph[unitKey] = {
-        pluginId: manifest.id,
-        unitId: unit.id,
-        runtime: unit.runtime,
-        dependencies: unique((unit.dependencies ?? []).map((dependency) => dependency.capability)),
-        dependencyDetails: (unit.dependencies ?? []).map((dependency) => ({ ...dependency })),
-        provides: unique(unit.provides ?? []),
-        providedContracts: unit.providedContracts ? { ...unit.providedContracts } : undefined,
-      };
-    }
-    for (const capability of provided) {
-      (providers[capability] ??= []).push(manifest.id);
-    }
-  }
-
-  const providerByCapability = new Map<string, string[]>();
-  for (const [capability, pluginIds] of Object.entries(providers)) {
-    providerByCapability.set(capability, pluginIds);
-  }
-
   const reverse: Record<string, PluginReverseDep[]> = {};
+  const unitMap = collectUnits(manifests, options.runtime);
+  const enabled = options.enabledPluginIds ?? new Set<string>();
+
   for (const manifest of manifests) {
-    const dependentEnabled = enabled?.has(manifest.id) ?? manifest.meta.defaultEnabled;
-    for (const capability of dependencies[manifest.id] ?? []) {
-      // 可选服务只影响局部功能，不应让其 Provider 停掉整个产品。
-      if (optionalDependencies[manifest.id]?.includes(capability)) continue;
-      for (const providerId of providerByCapability.get(capability) ?? []) {
-        if (providerId === manifest.id) continue;
-        const entries = (reverse[providerId] ??= []);
-        let entry = entries.find((item) => item.pluginId === manifest.id);
-        if (!entry) {
-          entry = { pluginId: manifest.id, enabled: dependentEnabled, capabilities: [] };
-          entries.push(entry);
-        }
-        if (!entry.capabilities.includes(capability)) entry.capabilities.push(capability);
+    const deps = [...dependenciesOfManifest(manifest, options.runtime)];
+    dependencies[manifest.id] = Object.freeze(deps.filter((item) => !item.optional).map((item) => item.capability));
+    optionalDependencies[manifest.id] = Object.freeze(deps.filter((item) => item.optional).map((item) => item.capability));
+    const offered = [...providesOfManifest(manifest, options.runtime)];
+    provides[manifest.id] = Object.freeze(offered);
+    for (const capability of offered) (providers[descriptorKey(capability)] ??= []).push(manifest.id);
+  }
+
+  for (const manifest of manifests) {
+    const deps = [...(dependenciesOfManifest(manifest, options.runtime) ?? [])];
+    for (const dependency of deps) {
+      // Optional capabilities do not establish a lifecycle edge.  The
+      // consumer remains usable when the provider is intentionally stopped.
+      if (dependency.optional) continue;
+      for (const providerId of providers[descriptorKey(dependency.capability)] ?? []) {
+        (reverse[providerId] ??= []).push({
+          pluginId: manifest.id,
+          enabled: enabled.has(manifest.id),
+          capabilities: Object.freeze([dependency.capability]),
+        });
       }
     }
   }
 
-  const cycles: string[][] = [];
-  // capability -> provider 取第一个只用于诊断路径；重复 provider 会由
-  // validatePluginGraph 单独报错，不能在这里静默抢占。
-  const firstProvider = new Map<string, string>();
-  for (const [capability, pluginIds] of providerByCapability) {
-    if (pluginIds[0]) firstProvider.set(capability, pluginIds[0]);
-  }
+  const cycles: (readonly string[])[] = [];
+  const byId = new Map(manifests.map((manifest) => [manifest.id, manifest]));
+  const visiting: string[] = [];
   const visited = new Set<string>();
-  const path: string[] = [];
-  const visit = (pluginId: string) => {
+  const visit = (pluginId: string): void => {
+    const start = visiting.indexOf(pluginId);
+    if (start >= 0) {
+      cycles.push(Object.freeze([...visiting.slice(start), pluginId]));
+      return;
+    }
     if (visited.has(pluginId)) return;
-    const position = path.indexOf(pluginId);
-    if (position >= 0) {
-      const cycle = [...path.slice(position), pluginId];
-      if (!cycles.some((item) => item.join("\0") === cycle.join("\0"))) cycles.push(cycle);
-      return;
-    }
-    path.push(pluginId);
-    const manifest = manifests.find((item) => item.id === pluginId);
-    if (!manifest) {
-      path.pop();
-      visited.add(pluginId);
-      return;
-    }
+    const manifest = byId.get(pluginId);
+    if (!manifest) return;
+    visiting.push(pluginId);
     for (const dependency of dependenciesOfManifest(manifest, options.runtime)) {
       if (dependency.optional) continue;
-      const provider = firstProvider.get(dependency.capability);
-      if (provider) visit(provider);
+      for (const providerId of providers[descriptorKey(dependency.capability)] ?? []) visit(providerId);
     }
-    path.pop();
+    visiting.pop();
     visited.add(pluginId);
   };
   for (const manifest of manifests) visit(manifest.id);
 
-  return {
-    plugins: manifests.map((manifest) => manifest.id),
-    dependencies,
-    optionalDependencies,
-    provides,
-    reverse,
-    providers,
-    dependencyDetails,
-    cycles,
-    units: unitGraph,
-  };
+  const reverseFrozen: Record<string, readonly PluginReverseDep[]> = {};
+  for (const [pluginId, values] of Object.entries(reverse)) reverseFrozen[pluginId] = Object.freeze(values);
+  const providerFrozen: Record<string, readonly string[]> = {};
+  for (const [key, values] of Object.entries(providers)) providerFrozen[key] = Object.freeze(values);
+  const units: Record<string, PluginUnitGraph> = {};
+  for (const [key, value] of unitMap) units[key] = value;
+
+  return Object.freeze({
+    plugins: Object.freeze(manifests.map((manifest) => manifest.id)),
+    dependencies: freezeRecord(dependencies),
+    optionalDependencies: freezeRecord(optionalDependencies),
+    provides: freezeRecord(provides),
+    reverse: freezeRecord(reverseFrozen),
+    providers: freezeRecord(providerFrozen),
+    cycles: Object.freeze(cycles),
+    units: Object.freeze(units),
+  });
 }
 
-/** 在任何 setup 前校验重复提供、缺失硬依赖和硬依赖环。 */
+/** 在注册/批量装配前验证 manifest 及其依赖闭包。 */
 export function validatePluginGraph(
   manifests: readonly PluginManifest[],
-  options: ValidatePluginGraphOptions = {}
-): PluginGraph {
-  const diagnostics: PluginGraphDiagnostic[] = [];
-  diagnostics.push(...validateRuntimeUnitDependencyContracts(manifests));
+  options: PluginGraphOptions = {},
+): void {
   const ids = new Set<string>();
+  const providerRuntime = new Map<string, RuntimeKind | undefined>();
   for (const manifest of manifests) {
-    if (ids.has(manifest.id)) {
-      diagnostics.push({
-        code: "plugin.duplicate_id",
-        ids: [manifest.id],
-        message: `插件标识 "${manifest.id}" 重复，无法确定唯一运行实例`,
-      });
-    }
+    if (!manifest || typeof manifest.id !== "string" || manifest.id.trim() === "") throw new TypeError("Plugin id must be a non-empty string");
+    if (ids.has(manifest.id)) throw new Error(`Plugin "${manifest.id}" is duplicated`);
     ids.add(manifest.id);
-  }
-
-  const graph = buildPluginGraph([...manifests], options);
-  const builtins = options.builtinCapabilities ?? new Set<string>();
-  const multiProvider = options.multiProviderCapabilities ?? new Set<string>();
-  for (const [capability, pluginIds] of Object.entries(graph.providers ?? {})) {
-    if (pluginIds.length > 1 && !multiProvider.has(capability)) {
-      diagnostics.push({
-        code: "capability.duplicate_provider",
-        ids: [capability, ...pluginIds],
-        message: `能力 "${capability}" 有多个提供者（${pluginIds.join(", ")}），但未声明专用 Provider Registry`,
-      });
-    }
-  }
-  // 运行单元依赖不能沿用产品级“同名 capability 即可”的兼容规则。
-  // Provider 必须同时声明 Runtime 和 providedContracts 版本；
-  // sourceRuntime 可以指向当前图之外的 Worker，因此这里故意在完整
-  // manifest 集合上查找，而不是只看当前 Window Host 的 providers。
-  for (const manifest of manifests) {
-    const strictDependencies = runtimeDependenciesForValidation(manifest, options.runtime);
-    for (const dependency of strictDependencies) {
-      if (dependency.optional) continue;
-      // Window Host 不应因为 Worker manifest 不在本地 bundle 而在注册阶段
-      // 失败。这里仅放过“来源 Runtime 不同”的依赖；精确 capability、版本和
-      // 当前 provider 身份仍由 remoteServiceReferences/bridge 在运行时检查。
-      if (options.externalRuntimeDependencies
-        && options.runtime !== undefined
-        && dependency.sourceRuntime !== options.runtime) {
-        continue;
+    if (typeof manifest.name !== "string" || manifest.name.trim() === "") throw new TypeError(`Plugin "${manifest.id}" name must be a non-empty string`);
+    if (manifest.startup !== "required" && manifest.startup !== "optional") throw new TypeError(`Plugin "${manifest.id}" startup must be required or optional`);
+    if (typeof manifest.defaultEnabled !== "boolean" || typeof manifest.canDisable !== "boolean") throw new TypeError(`Plugin "${manifest.id}" startup policy is incomplete`);
+    if (manifest.startup === "required" && (!manifest.defaultEnabled || manifest.canDisable)) throw new TypeError(`Plugin "${manifest.id}" required startup policy is inconsistent`);
+    const unitIds = new Set<string>();
+    for (const unit of manifest.units ?? []) {
+      if (!unit || typeof unit.id !== "string" || unit.id.trim() === "" || unitIds.has(unit.id)) throw new TypeError(`Plugin "${manifest.id}" has a duplicate or empty unit id`);
+      unitIds.add(unit.id);
+      if (unit.runtime !== undefined && unit.runtime !== "window-main" && unit.runtime !== "shared-worker") throw new TypeError(`Plugin "${manifest.id}" unit "${unit.id}" has an invalid Runtime`);
+      const seenProvides = new Set<string>();
+      for (const capability of unit.provides ?? []) {
+        if (!isCapabilityDescriptor(capability)) throw new TypeError(`Plugin "${manifest.id}" has an invalid capability descriptor`);
+        const key = descriptorKey(capability);
+        if (seenProvides.has(key)) throw new Error(`Plugin "${manifest.id}" provides ${capabilityLabel(capability)} more than once`);
+        seenProvides.add(key);
+        const previousRuntime = providerRuntime.get(key);
+        if (providerRuntime.has(key) && previousRuntime === unit.runtime) throw new Error(`Capability ${capabilityLabel(capability)} has ambiguous providers`);
+        if (!providerRuntime.has(key)) providerRuntime.set(key, unit.runtime);
       }
-      const matches = matchingRuntimeUnitProviders(manifests, dependency);
-      if (matches.length > 0) {
-        if (matches.length > 1 && !multiProvider.has(dependency.capability)) {
-          diagnostics.push({
-            code: "capability.duplicate_provider",
-            ids: [dependency.capability, ...matches.map((provider) => `${provider.pluginId}:${provider.unitId}`)],
-            message: `能力 "${dependency.capability}" 的运行单元契约有多个匹配 Provider（${matches.map((provider) => `${provider.pluginId}:${provider.unitId}`).join(", ")}），但未声明专用 Provider Registry`,
-          });
+      for (const dependency of unit.dependencies ?? []) {
+        if (!dependency || !isCapabilityDescriptor(dependency.capability)) throw new TypeError(`Plugin "${manifest.id}" has an invalid dependency descriptor`);
+        if (dependency.source !== undefined && dependency.source !== "peer") throw new TypeError(`Plugin "${manifest.id}" has an invalid dependency source`);
+        if (dependency.source === "peer" && dependency.sourceRuntime !== undefined) throw new TypeError(`Plugin "${manifest.id}" peer dependency cannot declare sourceRuntime`);
+        if (dependency.source !== "peer" && dependency.sourceRuntime !== "window-main" && dependency.sourceRuntime !== "shared-worker") throw new TypeError(`Plugin "${manifest.id}" has an invalid dependency Runtime`);
+        if (dependency.source === "peer" && dependency.capability.kind === "local") {
+          // Local capabilities can only be represented by an explicit remote
+          // contract on the wire; a peer dependency itself must be remote.
+          throw new TypeError(`Plugin "${manifest.id}" cannot depend on local capability "${dependency.capability.id}" through a peer`);
         }
-        continue;
-      }
-      const candidates = runtimeUnitProviders(manifests, dependency.capability);
-      // Host 注入的 builtin capability 没有 manifest Provider，但已经在
-      // 当前装配环境内完成契约注册；它不应被误判成缺少远程 Provider。
-      if (builtins.has(dependency.capability) && candidates.length === 0) {
-        continue;
-      }
-      if (candidates.length > 0) {
-        diagnostics.push({
-          code: "plugin.dependency_contract_unavailable",
-          ids: [manifest.id, dependency.capability],
-          message: `插件 "${manifest.id}" 的运行单元依赖 "${dependency.capability}" 没有匹配的契约版本、来源环境或作用域`,
-        });
-      } else if (!options.allowMissingDependencies) {
-        diagnostics.push({
-          code: "plugin.missing_dependency",
-          ids: [manifest.id, dependency.capability],
-          message: `插件 "${manifest.id}" 缺少硬依赖能力 "${dependency.capability}"`,
-        });
+        if (dependency.source !== "peer" && dependency.capability.kind === "local" && dependency.sourceRuntime !== (unit.runtime ?? options.runtime)) {
+          throw new TypeError(`Plugin "${manifest.id}" cannot depend on local capability "${dependency.capability.id}" from another Runtime`);
+        }
       }
     }
   }
+  const graph = buildPluginGraph(manifests, options);
+  if (graph.cycles.length > 0) throw new Error(`Plugin dependency cycle: ${graph.cycles[0]?.join(" -> ") ?? "unknown"}`);
+  const builtin = keysForBuiltin(options.builtinCapabilities);
   for (const manifest of manifests) {
-    const strictDependencyCapabilities = new Set(
-      runtimeDependenciesForValidation(manifest, options.runtime).map((dependency) => dependency.capability)
-    );
     for (const dependency of dependenciesOfManifest(manifest, options.runtime)) {
-      if (dependency.optional) continue;
-      // 上面的严格运行单元校验已经处理了精确契约；这里仅保留没有
-      // units 的简单插件 product-level dependencies 兼容逻辑。
-      if (strictDependencyCapabilities.has(dependency.capability)) continue;
-      const provided = (graph.providers?.[dependency.capability]?.length ?? 0) > 0
-        || builtins.has(dependency.capability);
-      if (!provided && !options.allowMissingDependencies) {
-        diagnostics.push({
-          code: "plugin.missing_dependency",
-          ids: [manifest.id, dependency.capability],
-          message: `插件 "${manifest.id}" 缺少硬依赖能力 "${dependency.capability}"`,
-        });
-      }
+      const key = descriptorKey(dependency.capability);
+      const providerCount = graph.providers[key]?.length ?? 0;
+      const external = options.externalRuntimeDependencies === true && dependency.sourceRuntime !== options.runtime;
+      if (providerCount === 0 && !builtin.has(key) && !external && !dependency.optional && options.allowMissingDependencies !== true) throw new Error(`Plugin "${manifest.id}" requires missing capability ${capabilityLabel(dependency.capability)}`);
+      if (providerCount > 1 && !external) throw new Error(`Capability ${capabilityLabel(dependency.capability)} has ambiguous providers`);
     }
   }
-  for (const cycle of graph.cycles ?? []) {
-    diagnostics.push({
-      code: "plugin.dependency_cycle",
-      ids: cycle,
-      message: `插件存在硬依赖环：${cycle.join(" -> ")}`,
-    });
-  }
-  if (diagnostics.length > 0) throw new PluginGraphValidationError(diagnostics);
-  return graph;
 }
 
-/** 查询当前启用的逆依赖者；禁用提供者时应按此集合先停止消费者。 */
+/** 查询依赖某 provider 的已启用插件。 */
 export function reverseDependentsOf(
   graph: PluginGraph,
   pluginId: string,
-  enabledSet: ReadonlySet<string>
-): PluginReverseDep[] {
-  return (graph.reverse[pluginId] ?? []).filter((dependent) => enabledSet.has(dependent.pluginId));
+  enabledPluginIds?: ReadonlySet<string>,
+): readonly PluginReverseDep[] {
+  return (graph.reverse[pluginId] ?? []).filter((item) => enabledPluginIds === undefined || enabledPluginIds.has(item.pluginId));
 }

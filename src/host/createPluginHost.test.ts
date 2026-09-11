@@ -1,144 +1,127 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { defineCapability } from "../contracts/capability.js";
+import { definePlugin } from "../authoring/definePlugin.js";
 import { createPluginHost } from "./createPluginHost.js";
-import type { CreatePluginHostOptions } from "./createPluginHost.js";
-import type { PluginManifest, PluginSetup } from "../contracts/plugin.js";
+import { createRuntimeUnitImplementationRegistry } from "./runtimeUnitImplementationRegistry.js";
 
-function createFixtureHost(options: CreatePluginHostOptions = {}): {
-  host: ReturnType<typeof createPluginHost>;
-  register(pluginId: string, setup: PluginSetup): void;
-} {
-  const implementations = new Map<string, PluginSetup>();
-  const host = createPluginHost({
-    ...options,
-    runtimeUnitImplementationRegistry: {
-      get(pluginId, unitId) {
-        return implementations.get(`${pluginId}:${unitId}`);
+const requestParser = { parse(value: unknown): { value: string } {
+  if (!value || typeof value !== "object" || typeof (value as { value?: unknown }).value !== "string") throw new Error("value must be a string");
+  return value as { value: string };
+} };
+const responseParser = { parse(value: unknown): { result: string } {
+  if (!value || typeof value !== "object" || typeof (value as { result?: unknown }).result !== "string") throw new Error("result must be a string");
+  return value as { result: string };
+} };
+
+const LocalValue = defineCapability<{ count: number }>({ kind: "local", id: "test.local", version: "1" });
+const Echo = defineCapability({ kind: "rpc", id: "test.echo", version: "1", request: requestParser, response: responseParser });
+
+describe("v4 PluginHost", () => {
+  it("runs typed local and RPC capabilities through declared plugin setup", async () => {
+    const seen: string[] = [];
+    const provider = definePlugin({
+      id: "provider",
+      provides: [LocalValue, Echo] as const,
+      startup: "required" as const,
+      setup(ctx) {
+        ctx.provide(LocalValue, { count: 7 });
+        ctx.handle(Echo, async (request, call) => {
+          seen.push(`${call.origin}:${call.reference.capabilityId}`);
+          return { result: `${request.value}:${ctx.instanceId.length > 0}` };
+        });
       },
-    },
-  });
-  return {
-    host,
-    register(pluginId, setup) {
-      implementations.set(`${pluginId}:${pluginId}`, setup);
-    },
-  };
-}
-
-function manifest(input: Omit<PluginManifest, "setup">): PluginManifest {
-  return input;
-}
-
-describe("WebLoom Plugin Host", () => {
-  it("按依赖顺序启动，并在提供者停止时级联等待依赖者", async () => {
-    const events: string[] = [];
-    const fixture = createFixtureHost({
-      rootAttributes: { session: "one" },
     });
-    const { host } = fixture;
+    const implementations = createRuntimeUnitImplementationRegistry([{
+      pluginId: provider.manifest.id,
+      unitId: provider.descriptor.id,
+      setup: provider.setup,
+      capabilities: provider.capabilities,
+    }]);
+    const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
+    await host.registerAll([provider.manifest]);
 
-    fixture.register("consumer", (ctx) => {
-      events.push("consumer:start");
-      expect(ctx.extension).toEqual({});
-      ctx.onDispose(() => { events.push("consumer:dispose"); });
-    });
-    fixture.register("provider", (ctx) => {
-      events.push("provider:start");
-      ctx.provide("service.value", { value: 1 });
-      return () => { events.push("provider:teardown"); };
-    });
-    await host.registerAll([
-      manifest({
-        id: "consumer",
-        name: "Consumer",
-        meta: { defaultEnabled: true, canDisable: true },
-        dependencies: [{ capability: "service.value" }],
-      }),
-      manifest({
-        id: "provider",
-        name: "Provider",
-        provides: ["service.value"],
-        meta: { defaultEnabled: true, canDisable: true },
-      }),
-    ]);
-
-    expect(host.state("provider").kind).toBe("enabled");
-    expect(host.state("consumer").kind).toBe("enabled");
-    expect(events.slice(0, 2)).toEqual(["provider:start", "consumer:start"]);
-
-    await host.disable("provider");
-    expect(host.state("provider").kind).toBe("disabled");
-    expect(host.state("consumer").kind).toBe("blocked");
-    expect(host.state("consumer").desiredEnabled).toBe(true);
-    expect(events).toContain("consumer:dispose");
-    expect(events).toContain("provider:teardown");
+    expect(host.capability(LocalValue)).toEqual({ count: 7 });
+    await expect(host.capability(Echo).call({ value: "ok" })).resolves.toEqual({ result: "ok:true" });
+    expect(seen).toEqual(["local:test.echo"]);
+    expect(host.serviceReferences()).toHaveLength(1);
     await host.dispose();
   });
 
-  it("通过 Runtime 实例 Scope、Context Extension 和权限策略隔离实例", async () => {
-    let seenScopeId = "";
-    let seenExtension: Readonly<Record<string, unknown>> | undefined;
-    const fixture = createFixtureHost({
-      rootAttributes: { tenant: "alpha" },
-      contextExtension: ({ scope }) => ({
-        service: { scopeId: scope.identity.scopeId },
-      }),
-      permissionPolicy: ({ requested }) => ({
-        approved: requested.filter((permission) => permission !== "write"),
-      }),
+  it("rejects undeclared capability registration and required policy contradictions", async () => {
+    const Other = defineCapability<{ value: number }>({ kind: "local", id: "test.other", version: "1" });
+    const bad = definePlugin({
+      id: "bad-provider",
+      provides: [LocalValue] as const,
+      setup(ctx) {
+        // @ts-expect-error A plugin may only register a declared local capability.
+        ctx.provide(Other, { value: 1 });
+      },
     });
-    const { host } = fixture;
-    fixture.register("isolated", (ctx) => {
-      seenScopeId = ctx.scope.identity.scopeId;
-      seenExtension = ctx.extension;
-      expect(ctx.scope.identity.attributes).toMatchObject({ tenant: "alpha" });
-      expect(ctx.permissions).toEqual(["read"]);
-      expect(() => ctx.permissionLease.assert("write")).toThrow();
-    });
+    const implementations = createRuntimeUnitImplementationRegistry([{
+      pluginId: bad.manifest.id,
+      unitId: bad.descriptor.id,
+      setup: bad.setup,
+      capabilities: bad.capabilities,
+    }]);
+    const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
+    await host.registerAll([bad.manifest]);
+    expect(host.state("bad-provider").kind).toBe("error-disabled");
+    expect(host.serviceReferences()).toEqual([]);
+    await host.dispose();
 
-    await host.register({
-      ...manifest({
-        id: "isolated",
-        name: "Isolated",
-        permissions: ["read", "write"],
-        meta: { defaultEnabled: true, canDisable: true },
-      }),
-    });
+    expect(() => definePlugin({
+      id: "invalid-required",
+      startup: "required",
+      defaultEnabled: false,
+      setup() {},
+    })).toThrow(/required startup policy/);
+  });
 
-    expect(seenScopeId).not.toBe("");
-    expect(seenExtension).toMatchObject({ service: { scopeId: seenScopeId } });
-    const firstInstance = host.state("isolated").instanceId;
-    await host.disable("isolated");
-    await host.enable("isolated");
-    expect(host.state("isolated").instanceId).not.toBe(firstInstance);
+  it("keeps required missing dependencies visible", async () => {
+    const Missing = defineCapability({ kind: "rpc", id: "test.missing", version: "1", request: requestParser, response: responseParser });
+    const required = definePlugin({
+      id: "required-consumer",
+      dependencies: [{ capability: Missing, sourceRuntime: "window-main" }] as const,
+      startup: "required" as const,
+      setup() {},
+    });
+    const implementations = createRuntimeUnitImplementationRegistry([{
+      pluginId: required.manifest.id,
+      unitId: required.descriptor.id,
+      setup: required.setup,
+      capabilities: required.capabilities,
+    }]);
+    const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
+    await expect(host.registerAll([required.manifest])).rejects.toThrow();
+    expect(host.state("required-consumer").kind).toBe("blocked");
     await host.dispose();
   });
 
-  it("初始化期间收到 disable 时不发布 enabled 且释放迟到实例", async () => {
-    let releaseSetup!: () => void;
-    const setupReady = new Promise<void>((resolve) => { releaseSetup = resolve; });
-    const cleanup = vi.fn();
-    const fixture = createFixtureHost();
-    const { host } = fixture;
-    fixture.register("slow", async (ctx) => {
-      await setupReady;
-      ctx.onDispose(cleanup);
+  it("turns enable into a durable desired-enabled transition after disable", async () => {
+    const plugin = definePlugin({
+      id: "reversible",
+      provides: [LocalValue] as const,
+      setup(ctx) {
+        ctx.provide(LocalValue, { count: 11 });
+      },
     });
-    const registering = host.register({
-      ...manifest({
-        id: "slow",
-        name: "Slow",
-        meta: { defaultEnabled: true, canDisable: true },
-      }),
-    });
+    const implementations = createRuntimeUnitImplementationRegistry([{
+      pluginId: plugin.manifest.id,
+      unitId: plugin.descriptor.id,
+      setup: plugin.setup,
+      capabilities: plugin.capabilities,
+    }]);
+    const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
+    await host.registerAll([plugin.manifest]);
+    const firstInstance = host.state("reversible").instanceId;
 
-    await Promise.resolve();
-    expect(host.state("slow").kind).toBe("starting");
-    const disabling = host.disable("slow");
-    releaseSetup();
-    await registering;
-    await disabling;
-    expect(host.state("slow").kind).toBe("disabled");
-    expect(cleanup).toHaveBeenCalledTimes(1);
+    await host.disable("reversible");
+    expect(host.state("reversible")).toMatchObject({ kind: "disabled", desiredEnabled: false });
+
+    await host.enable("reversible");
+    expect(host.state("reversible")).toMatchObject({ kind: "enabled", desiredEnabled: true });
+    expect(host.state("reversible").instanceId).not.toBe(firstInstance);
+    expect(host.capability(LocalValue)).toEqual({ count: 11 });
     await host.dispose();
   });
 });

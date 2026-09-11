@@ -1,289 +1,118 @@
-import type {
-  LifecycleDisposeResult,
-  RemoteServiceBridge,
-  RemoteServiceReference,
-} from "../contracts/lifecycle.js";
+// Window Runtime 装配。
+
+import type { Capability, CapabilityClient } from "../contracts/capability.js";
+import { RUNTIME_PROTOCOL_VERSION } from "./runtimeProtocol.js";
 import type { PluginManifest } from "../contracts/plugin.js";
-import {
-  createPluginHost,
-  type CreatePluginHostOptions,
-  type PluginHost,
-} from "../host/createPluginHost.js";
+import { createPluginHost, StartupPluginError, type CreatePluginHostOptions, type HostInspection, type PluginHost } from "../host/createPluginHost.js";
 import { createRuntimeUnitImplementationRegistry } from "../host/runtimeUnitImplementationRegistry.js";
-import { StartupPluginError } from "../host/createPluginHost.js";
+import type { LifecycleDisposeResult, RuntimeSnapshot } from "../contracts/lifecycle.js";
 import type { RuntimePluginDefinition } from "./pluginDefinitions.js";
 import { materializePluginDefinitions } from "./pluginDefinitions.js";
-import { unitSnapshotFromState } from "./runtimeProtocol.js";
-import {
-  RuntimeInitializationError,
-  RuntimeUnavailableError,
-  type RuntimeStatusListener,
-  type RuntimeStatusSnapshot,
-  type RuntimeHandle,
-  type WindowApp,
-} from "./runtimeTypes.js";
+import { RuntimeInitializationError, RuntimeUnavailableError, type RuntimeStatusListener, type RuntimeStatusSnapshot, type WindowApp } from "./runtimeTypes.js";
+import { cloneFrozenAttributes } from "../transport/dto.js";
 
-export interface CreateWindowAppOptions extends Omit<CreatePluginHostOptions, "runtime" | "runtimeUnitImplementationRegistry"> {
-  /** 逻辑 Runtime 标识；同一页面通常只创建一个 App。 */
-  id?: string;
-  /** 当前 Window 的插件定义；setup 只在当前 Window realm 执行。 */
-  plugins: readonly RuntimePluginDefinition[];
-  /**
-   * 供领域适配层接管分阶段注册时复用已经创建的 Window Host。
-   * 普通插件应省略该字段；传入后由调用方负责后续 register，App 仍负责
-   * Window Runtime 快照、远端投影和最终 dispose。
-   */
-  host?: PluginHost;
-  /** 可选的 SharedWorker Runtime；Window 单元只投影其状态，不创建 Worker 假实例。 */
-  remoteRuntime?: RuntimeHandle;
+export interface CreateWindowAppOptions extends Omit<CreatePluginHostOptions, "runtime" | "runtimeUnitImplementationRegistry" | "runtimeInstanceId" | "runtimeId" | "capabilityBridge"> {
+  /** Window Runtime 逻辑标识。 */
+  readonly id?: string;
+  /** 当前 Window realm 的插件定义。 */
+  readonly plugins: readonly RuntimePluginDefinition[];
 }
 
+export interface CreateWindowAppFromHostOptions extends Omit<CreatePluginHostOptions, "runtime" | "runtimeUnitImplementationRegistry" | "capabilityBridge"> {
+  /** Window Runtime 逻辑标识。 */
+  readonly id?: string;
+  /** 已创建且所有权转移给 App 的 v4 Host。 */
+  readonly host: PluginHost;
+}
+
+const appHosts = new WeakMap<object, PluginHost>();
+const ownedHosts = new WeakSet<object>();
+
 function makeRuntimeInstanceId(runtimeId: string): string {
-  try {
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      return `${runtimeId}:${crypto.randomUUID()}`;
-    }
-  } catch {
-    // 仅用于实例身份，不承担授权或密钥语义。
-  }
+  try { if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return `${runtimeId}:${crypto.randomUUID()}`; } catch { /* fallback */ }
   return `${runtimeId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+function snapshotFromHost(host: PluginHost, id: string, instanceId: string, state: RuntimeSnapshot["state"] = "ready"): RuntimeStatusSnapshot {
+  const units = host.installed().flatMap((pluginId) => host.state(pluginId).units.map((unit) => ({ pluginId: unit.pluginId, unitId: unit.unitId, runtime: unit.runtime, ...(unit.instanceId !== undefined ? { instanceId: unit.instanceId } : {}), state: unit.kind })));
+  const services = state === "ready" ? host.serviceReferences().map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) })) : [];
+  return Object.freeze({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: id, runtimeKind: "window-main", runtimeInstanceId: instanceId, revision: Math.max(1, host.version()), state, units: Object.freeze(units), services: Object.freeze(services) });
 }
 
-function isStartupPluginError(error: unknown): error is StartupPluginError {
-  return error instanceof StartupPluginError
-    && typeof error.details?.pluginId === "string";
-}
-
-function buildLocalServices(
-  host: PluginHost,
-  manifests: readonly PluginManifest[],
-  runtimeInstanceId: string,
-): readonly RemoteServiceReference[] {
-  const services: RemoteServiceReference[] = [];
-  for (const manifest of manifests) {
-    const state = host.state(manifest.id);
-    const unit = manifest.units?.find((candidate) => candidate.id === state.unitId)
-      ?? manifest.units?.[0];
-    if (!unit || unit.runtime === undefined || !state.instanceId || state.kind !== "enabled") continue;
-    for (const capability of unit.provides ?? []) {
-      services.push({
-        capabilityId: capability,
-        contractVersion: unit.providedContracts?.[capability] ?? `${capability}.v1`,
-        runtime: unit.runtime,
-        runtimeInstanceId,
-        serviceInstanceId: state.instanceId,
-        status: "ready",
-        attributes: Object.freeze({}),
-      });
-    }
-  }
-  return services;
-}
-
-/** 创建当前 Window 的唯一 window-main Runtime。 */
-export async function createWindowApp(options: CreateWindowAppOptions): Promise<WindowApp> {
-  const runtimeId = options.id ?? "window-main";
-  const remoteRuntime = options.remoteRuntime;
-  const runtimeInstanceId = makeRuntimeInstanceId(runtimeId);
-  let currentState: RuntimeStatusSnapshot = {
-    runtimeId,
-    runtimeKind: "window-main",
-    runtimeInstanceId,
-    state: "starting",
-    revision: 0,
-    units: [],
-    services: [],
-  };
-  const listeners = new Set<RuntimeStatusListener>();
+async function createAppFromHost(id: string, instanceId: string, host: PluginHost): Promise<WindowApp> {
+  if (ownedHosts.has(host as object)) throw new Error("This WebLoom Host is already owned by a WindowApp");
+  let current = snapshotFromHost(host, id, instanceId, "starting");
   let disposed = false;
   let disposePromise: Promise<LifecycleDisposeResult> | undefined;
-
-  const emit = (next: RuntimeStatusSnapshot): void => {
-    currentState = Object.freeze({
-      ...next,
-      units: Object.freeze([...next.units]),
-      services: Object.freeze([...next.services]),
-    });
-    for (const listener of [...listeners]) {
-      try { listener(currentState); } catch { /* 观察者不能改变 Runtime 状态。 */ }
-    }
+  const listeners = new Set<RuntimeStatusListener>();
+  const emit = (state?: RuntimeSnapshot["state"]): void => {
+    current = snapshotFromHost(host, id, instanceId, state ?? (disposed ? "disposed" : "ready"));
+    for (const listener of [...listeners]) { try { listener(current); } catch { /* observers isolated */ } }
   };
-
-  let materialized: ReturnType<typeof materializePluginDefinitions>;
-  try {
-    materialized = materializePluginDefinitions(options.plugins, "window-main");
-  } catch (error) {
-    throw new RuntimeInitializationError({ phase: "validate", error: errorMessage(error) });
-  }
-  const manifests = materialized.map((item) => item.manifest);
-  let implementations: ReturnType<typeof createRuntimeUnitImplementationRegistry>;
-  try {
-    const duplicate = manifests.find((manifest, index) => (
-      manifests.findIndex((candidate) => candidate.id === manifest.id) !== index
-    ));
-    if (duplicate) throw new Error(`Plugin "${duplicate.id}" is declared more than once`);
-    implementations = createRuntimeUnitImplementationRegistry(
-      materialized.map((item) => ({
-        pluginId: item.manifest.id,
-        unitId: item.unitId,
-        setup: item.setup,
-      })),
-    );
-  } catch (error) {
-    throw new RuntimeInitializationError({ phase: "validate", error: errorMessage(error) });
-  }
-
-  let host: PluginHost;
-  const suppliedHost = options.host;
-  const remoteServiceBridge = remoteRuntime
-    ? (remoteRuntime as RuntimeHandle & { readonly serviceBridge: RemoteServiceBridge }).serviceBridge
-    : undefined;
-  try {
-    const {
-      id: _id,
-      plugins: _plugins,
-      host: _host,
-      remoteRuntime: _remoteRuntime,
-      ...hostOptions
-    } = options;
-    const suppliedBridgeFactory = hostOptions.serviceBridgeForPlugin;
-    host = suppliedHost ?? createPluginHost({
-        ...hostOptions,
-        runtime: "window-main",
-        externalRuntimeDependencies: remoteRuntime !== undefined || hostOptions.externalRuntimeDependencies,
-        remoteServiceReferences: () => remoteRuntime?.state().services ?? hostOptions.remoteServiceReferences?.() ?? [],
-        runtimeSnapshots: () => remoteRuntime
-          ? remoteRuntime.state().units.map((unit) => ({
-              pluginId: unit.pluginId,
-              unitId: unit.unitId,
-              runtime: unit.runtime,
-              ...(unit.instanceId !== undefined ? { instanceId: unit.instanceId } : {}),
-              state: unit.state,
-            }))
-          : hostOptions.runtimeSnapshots?.() ?? [],
-        serviceBridgeForPlugin: (pluginId, instanceId) => (
-          suppliedBridgeFactory?.(pluginId, instanceId) ?? remoteServiceBridge
-        ),
-        rootAttributes: {
-          ...(hostOptions.rootAttributes ?? {}),
-          runtimeId,
-          runtimeInstanceId,
-        },
-        runtimeUnitImplementationRegistry: implementations,
-      });
-  } catch (error) {
-    throw new RuntimeInitializationError({ phase: "validate", error: errorMessage(error) });
-  }
-
-  let removeRemoteSubscription: (() => void) | undefined;
-
-  const manifestsForSnapshot = (): readonly PluginManifest[] => {
-    if (!suppliedHost) return manifests;
-    return suppliedHost.manifests()
-      .map((pluginId) => suppliedHost.getManifest(pluginId))
-      .filter((manifest): manifest is PluginManifest => manifest !== undefined);
-  };
-
-  const refresh = (): void => {
-    const snapshotManifests = manifestsForSnapshot();
-    const units = snapshotManifests.flatMap((manifest) => {
-      const state = host.state(manifest.id);
-      return (state.units ?? []).map((unit) => unitSnapshotFromState(
-        unit,
-        unit.runtime,
-      ));
-    });
-    const revision = Math.max(currentState.revision + 1, host.version());
-    emit({
-      ...currentState,
-      revision,
-      units,
-      services: [
-        ...buildLocalServices(host, snapshotManifests, runtimeInstanceId),
-        ...(remoteRuntime?.state().services ?? []),
-      ],
-    });
-  };
-  const removeHostSubscription = host.subscribe(refresh);
-
-  try {
-    if (!suppliedHost) await host.registerAll(manifests);
-    const failedRequired = suppliedHost ? undefined : manifests.find((manifest) => {
-      const required = manifest.meta.startup === "required" || manifest.meta.canDisable === false;
-      return required && host.state(manifest.id).kind !== "enabled";
-    });
-    if (failedRequired) {
-      const state = host.state(failedRequired.id);
-      throw new StartupPluginError({
-        pluginId: failedRequired.id,
-        unitId: state.unitId ?? failedRequired.units?.[0]?.id ?? failedRequired.id,
-        capabilities: [],
-        state: state.kind,
-        error: state.error ?? `Required plugin is ${state.kind}${state.blockedBy ? `: ${state.blockedBy.join(", ")}` : ""}`,
-      });
-    }
-  } catch (error) {
-    refresh();
-    const pluginId = isStartupPluginError(error) ? error.details.pluginId : undefined;
-    const manifest = pluginId ? manifests.find((candidate) => candidate.id === pluginId) : undefined;
-    const required = manifest?.meta.startup === "required" || manifest?.meta.canDisable === false;
-    if (required || !isStartupPluginError(error)) {
-      removeHostSubscription();
-      removeRemoteSubscription?.();
-      await host.dispose("window runtime initialization failed").catch(() => undefined);
-      if (error instanceof RuntimeInitializationError) throw error;
-      throw new RuntimeInitializationError({
-        pluginId,
-        unitId: isStartupPluginError(error) ? error.details.unitId : manifest?.units?.[0]?.id,
-        phase: "startup",
-        error: errorMessage(error),
-      });
-    }
-    // 非 required 插件的失败保留在 Host 快照中；App 本身仍可观察并继续运行。
-  }
-  refresh();
-  emit({ ...currentState, state: "ready" });
-  removeRemoteSubscription = remoteRuntime?.subscribe(() => {
-    host.refreshRuntimeUnitSnapshots();
-    void host.reconcile().catch(() => undefined);
-  });
-
+  const removeHost = host.subscribe(() => emit());
   const app: WindowApp = {
     runtimeKind: "window-main",
-    runtimeId,
-    runtimeInstanceId,
-    host,
-    state: () => currentState,
-    capability<T>(capabilityId: string): T {
-      if (disposed || currentState.state === "disposed" || currentState.state === "stopping") {
-        throw new RuntimeUnavailableError("Window Runtime has been disposed");
-      }
-      return host.capabilities.get<T>(capabilityId);
+    runtimeId: id,
+    runtimeInstanceId: instanceId,
+    state: () => current,
+    pluginState: (pluginId) => host.state(pluginId),
+    capability<C extends Capability>(capability: C): CapabilityClient<C> {
+      if (disposed) throw new RuntimeUnavailableError("Window Runtime has been disposed");
+      return host.capability(capability);
     },
-    subscribe(listener) {
-      listeners.add(listener);
-      listener(currentState);
-      return () => listeners.delete(listener);
+    optionalCapability<C extends Capability>(capability: C): CapabilityClient<C> | undefined {
+      if (disposed) return undefined;
+      return host.optionalCapability(capability);
     },
+    inspect(): HostInspection { return host.inspect(); },
+    subscribe(listener) { listeners.add(listener); listener(current); return () => listeners.delete(listener); },
     dispose(reason = "window runtime disposed") {
       if (disposePromise) return disposePromise;
       disposed = true;
-      emit({ ...currentState, state: "stopping" });
-      removeHostSubscription();
-      removeRemoteSubscription?.();
-      disposePromise = host.dispose(reason).then((result) => {
-        emit({ ...currentState, state: "disposed" });
-        return result;
-      }, (error) => {
-        emit({ ...currentState, state: "failed", error: errorMessage(error) });
-        throw error;
-      });
+      emit("stopping");
+      removeHost();
+      disposePromise = host.dispose(reason).then((result) => { emit("disposed"); return result; }, (error) => { emit("failed"); throw error; });
       return disposePromise;
     },
   };
+  appHosts.set(app as object, host);
+  ownedHosts.add(host as object);
+  emit("ready");
   return app;
+}
+
+/** 创建当前 Window 的 v4 Runtime；本地插件启动完成后 resolve。 */
+export async function createWindowApp(options: CreateWindowAppOptions): Promise<WindowApp> {
+  const id = options.id ?? "window-main";
+  const instanceId = makeRuntimeInstanceId(id);
+  let materialized: ReturnType<typeof materializePluginDefinitions>;
+  try { materialized = materializePluginDefinitions(options.plugins, "window-main"); }
+  catch (error) { throw new RuntimeInitializationError({ phase: "validate", error: message(error) }); }
+  const implementations = createRuntimeUnitImplementationRegistry(materialized.map((item) => ({ pluginId: item.manifest.id, unitId: item.unitId, setup: item.setup, capabilities: item.capabilities })));
+  const { id: _id, plugins: _plugins, ...hostOptions } = options;
+  const host = createPluginHost({ ...hostOptions, runtime: "window-main", runtimeId: id, runtimeInstanceId: instanceId, runtimeUnitImplementationRegistry: implementations });
+  try {
+    await host.registerAll(materialized.map((item) => item.manifest));
+  } catch (error) {
+    await host.dispose("window Runtime initialization failed").catch(() => undefined);
+    if (error instanceof StartupPluginError) throw new RuntimeInitializationError({ pluginId: error.details.pluginId, unitId: error.details.unitId, phase: "startup", error: error.details.error ?? error.message });
+    throw new RuntimeInitializationError({ phase: "startup", error: message(error) });
+  }
+  return createAppFromHost(id, instanceId, host);
+}
+
+/** advanced：接管一个现有 v4 Host，不复制 Host。 */
+export async function createWindowAppFromHost(options: CreateWindowAppFromHostOptions): Promise<WindowApp> {
+  const id = options.id ?? options.host.runtimeId;
+  if (options.host.runtimeKind !== "window-main") throw new TypeError("createWindowAppFromHost requires a window-main Host");
+  return createAppFromHost(id, options.host.runtimeInstanceId, options.host);
+}
+
+/** advanced 装配层查询 App 所拥有的 Host。 */
+export function hostForWindowApp(app: WindowApp): PluginHost {
+  const host = appHosts.get(app as object);
+  if (!host) throw new Error("WindowApp is not owned by a WebLoom Host");
+  return host;
 }

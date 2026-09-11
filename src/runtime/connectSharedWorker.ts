@@ -1,349 +1,216 @@
-import type {
-  RemoteServiceCallContext,
-  RemoteServiceTransport,
-} from "../contracts/lifecycle.js";
-import { createServiceBridge } from "../transport/serviceBridge.js";
-import { createMessagePortServiceTransport } from "../transport/messagePortServiceTransport.js";
-import {
-  createRuntimeMessageCodec,
-  isRuntimeError,
-  isRuntimeSnapshot,
-  isRuntimeSnapshotProtocol,
-  RUNTIME_PROTOCOL_VERSION,
-  type RuntimeErrorMessage,
-  type RuntimeSnapshot,
-} from "./runtimeProtocol.js";
-import {
-  RuntimeInitializationError,
-  RuntimeUnavailableError,
-  type RuntimeHandle,
-  type RuntimeStatusListener,
-  type RuntimeStatusSnapshot,
-} from "./runtimeTypes.js";
+// Window → SharedWorker 的 v4 双向连接。
+
+import type { CapabilityBridge, CapabilityClient, CapabilityPeer, RemoteCapability, ServiceReference } from "../contracts/capability.js";
+import { capabilityKey } from "../contracts/capability.js";
+import type { LifecycleDisposeResult, RuntimeSnapshot } from "../contracts/lifecycle.js";
+import { WebLoomError } from "../contracts/lifecycle.js";
+import { createCapabilityPeerView, createPeerScopeView } from "./peerView.js";
+import { cloneFrozenAttributes, createRuntimeBudget, normalizeRuntimeLimits, type RuntimeBudget, type RuntimeLimitsInput } from "../transport/dto.js";
+import type { WindowApp, RuntimeHandle, RuntimeStatusListener, RuntimeStatusSnapshot } from "./runtimeTypes.js";
+import { RuntimeUnavailableError } from "./runtimeTypes.js";
+import { createCapabilityBridge } from "../transport/serviceBridge.js";
+import { createMessagePortRuntimeTransport, type MessagePortLike } from "../transport/messagePortServiceTransport.js";
+import { createMessagePortServiceProvider } from "../transport/messagePortServiceProvider.js";
+import { invokeCapabilityHandler } from "../host/capabilityRegistry.js";
+import { hostForWindowApp } from "./windowRuntime.js";
+import { RUNTIME_ERROR_TYPE, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE } from "./runtimeProtocol.js";
 
 export interface SharedWorkerLike {
+  /** SharedWorker 主端口。 */
   readonly port: MessagePort;
+  /** Worker error callback。 */
   onerror?: (event: Event) => void;
   addEventListener?(type: "error", listener: (event: Event) => void): void;
   removeEventListener?(type: "error", listener: (event: Event) => void): void;
 }
 
-export type SharedWorkerFactory = (
-  url: string | URL,
-  options: { type: "module"; name?: string; credentials?: RequestCredentials },
-) => SharedWorkerLike;
+export type SharedWorkerFactory = (url: string | URL, options: { type: "module"; name?: string; credentials?: RequestCredentials }) => SharedWorkerLike;
 
-/**
- * 临时迁移接缝：下游 typed transfer API 完成前允许领域代码在同一
- * 物理端口安装 listener。它不参与 Runtime 授权，也不传 connectionId。
- */
-export interface SharedWorkerConnectionContext {
-  readonly worker: SharedWorkerLike;
-  readonly port: MessagePort;
+export interface SharedWorkerClientExposure {
+  /** 已完成本地初始化的 WindowApp。 */
+  readonly app: WindowApp;
+  /** 明确暴露给 Worker 的 RPC/stream capability。 */
+  readonly expose?: readonly RemoteCapability[];
 }
 
 export interface ConnectSharedWorkerOptions {
-  id: string;
-  url: string | URL;
-  name?: string;
-  credentials?: RequestCredentials;
-  defaultCallTimeoutMs?: number;
-  /** SWCF-009 完成前的临时同端口迁移接缝。 */
-  onConnection?: (context: SharedWorkerConnectionContext) => void;
+  /** Worker Runtime 逻辑标识。 */
+  readonly id: string;
+  /** Worker 构建 URL。 */
+  readonly url: string | URL;
+  /** SharedWorker name。 */
+  readonly name?: string;
+  /** 请求 credentials。 */
+  readonly credentials?: RequestCredentials;
+  /** 默认 call 预算。 */
+  readonly defaultCallTimeoutMs?: number;
+  /** 可信 transport 配额；只能使用默认值或收紧。 */
+  readonly limits?: RuntimeLimitsInput;
+  /** 可选的页面反向能力。 */
+  readonly client?: SharedWorkerClientExposure;
 }
 
-interface InternalConnectSharedWorkerOptions extends ConnectSharedWorkerOptions {
-  workerFactory?: SharedWorkerFactory;
-}
+interface InternalOptions extends ConnectSharedWorkerOptions { readonly workerFactory?: SharedWorkerFactory; }
+const handleBridges = new WeakMap<object, CapabilityBridge>();
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function ensureTimeout(value: number | undefined): number {
-  const timeout = value ?? 30_000;
-  if (!Number.isFinite(timeout) || timeout <= 0) {
-    throw new TypeError("defaultCallTimeoutMs must be a finite number greater than zero");
-  }
-  return timeout;
-}
-
-function addMessageListener(port: MessagePort, listener: (event: MessageEvent) => void): () => void {
-  port.addEventListener("message", listener);
-  return () => port.removeEventListener("message", listener);
-}
-
-/** 给极简测试端口补齐事件目标；真实 MessagePort 不改变其行为。 */
-function ensureMessageEventTarget(port: MessagePort): void {
-  const target = port as unknown as {
-    onmessage: ((this: MessagePort, event: MessageEvent) => unknown) | null;
-    addEventListener?: (this: MessagePort, type: string, listener: (event: MessageEvent) => void) => void;
-    removeEventListener?: (this: MessagePort, type: string, listener: (event: MessageEvent) => void) => void;
-  };
-  if (target.addEventListener && target.removeEventListener) return;
-  const listeners = new Set<(event: MessageEvent) => void>();
-  const original = target.onmessage;
-  target.addEventListener = function add(type, listener) {
-    if (type === "message") listeners.add(listener);
-  };
-  target.removeEventListener = function remove(type, listener) {
-    if (type === "message") listeners.delete(listener);
-  };
-  target.onmessage = (event) => {
-    original?.call(port, event);
-    for (const listener of [...listeners]) listener(event);
-  };
-}
-
-function makeWorker(options: InternalConnectSharedWorkerOptions): SharedWorkerLike {
-  const workerOptions = {
-    type: "module" as const,
-    ...(options.name ? { name: options.name } : {}),
-    ...(options.credentials ? { credentials: options.credentials } : {}),
-  };
+function makeWorker(options: InternalOptions): SharedWorkerLike {
+  const workerOptions = { type: "module" as const, ...(options.name !== undefined ? { name: options.name } : {}), ...(options.credentials !== undefined ? { credentials: options.credentials } : {}) };
   if (options.workerFactory) return options.workerFactory(options.url, workerOptions);
-  const WorkerConstructor = (globalThis as unknown as {
-    SharedWorker?: new (
-      url: string | URL,
-      options: { type: "module"; name?: string; credentials?: RequestCredentials },
-    ) => SharedWorkerLike;
-  }).SharedWorker;
+  const WorkerConstructor = (globalThis as unknown as { SharedWorker?: new (url: string | URL, options: typeof workerOptions) => SharedWorkerLike }).SharedWorker;
   if (!WorkerConstructor) throw new RuntimeUnavailableError("SharedWorker is not supported by this browser");
   return new WorkerConstructor(options.url, workerOptions);
 }
 
-/**
- * 同步创建本地 RuntimeHandle。
- *
- * 该函数只执行参数校验、SharedWorker 构造、监听器/Transport 安装和
- * port.start()；它不等待任何 Worker 回包。远端就绪、协议不兼容和服务
- * 不存在都在 capability().call() 的 Promise 边界收敛。
- */
-function connectSharedWorkerInternal(options: InternalConnectSharedWorkerOptions): RuntimeHandle {
-  if (!options || typeof options.id !== "string" || options.id.trim() === "") {
-    throw new Error("SharedWorker runtime id must be a non-empty string");
+function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+function snapshotForClient(app: WindowApp, runtimeId: string, runtimeInstanceId: string, exposed: readonly RemoteCapability[], revision: number): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } {
+  const allowed = new Set(exposed.map((capability) => capabilityKey(capability)));
+  const state = app.state();
+  const runtimeState: RuntimeSnapshot["state"] = state.state === "disconnected" ? "failed" : state.state;
+  return {
+    type: RUNTIME_SNAPSHOT_TYPE,
+    protocolVersion: RUNTIME_PROTOCOL_VERSION,
+    runtimeId,
+    runtimeKind: "window-main",
+    runtimeInstanceId,
+    revision,
+    state: runtimeState,
+    units: state.units,
+    services: runtimeState === "ready" ? state.services.filter((service) => allowed.has(capabilityKey({ kind: service.kind, id: service.capabilityId, version: service.contractVersion }))).map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) })) : [],
+  };
+}
+
+function connectInternal(options: InternalOptions): RuntimeHandle {
+  if (!options || typeof options.id !== "string" || options.id.trim() === "") throw new TypeError("SharedWorker runtime id must be a non-empty string");
+  const requestedClientHost = options.client ? hostForWindowApp(options.client.app) : undefined;
+  const exposed = options.client?.expose ?? [];
+  for (const capability of exposed) {
+    if ((capability as { readonly kind?: string }).kind !== "rpc" && (capability as { readonly kind?: string }).kind !== "stream") throw new TypeError(`Capability "${(capability as { readonly id?: string }).id ?? "unknown"}" is not remotely exposable`);
+    if (!requestedClientHost?.capabilities.registration(capability)) throw new TypeError(`Capability "${capability.id}" is not registered by the WindowApp`);
   }
-  const defaultCallTimeoutMs = ensureTimeout(options.defaultCallTimeoutMs);
   const worker = makeWorker(options);
   const port = worker.port;
   if (!port) throw new RuntimeUnavailableError("SharedWorker did not expose a MessagePort");
-  ensureMessageEventTarget(port);
-
+  const limits = normalizeRuntimeLimits(options.limits);
+  const transport = createMessagePortRuntimeTransport({
+    addEventListener(type, listener) { port.addEventListener(type, listener); },
+    removeEventListener(type, listener) { port.removeEventListener(type, listener); },
+    postMessage(messageValue, transfer) { (port as unknown as MessagePortLike).postMessage(messageValue, transfer ? [...transfer] : undefined); },
+    start() { port.start(); },
+    close() { try { port.close(); } catch { /* noop */ } },
+  }, { limits });
+  const outboundBudget: RuntimeBudget = createRuntimeBudget(limits);
+  const inboundBudget: RuntimeBudget = createRuntimeBudget(limits);
+  const bridge = createCapabilityBridge({ transport, remoteRuntimeKind: "shared-worker", remoteRuntimeId: options.id, defaultCallTimeoutMs: options.defaultCallTimeoutMs, limits, budget: outboundBudget });
   const listeners = new Set<RuntimeStatusListener>();
-  const codec = createRuntimeMessageCodec();
+  const workerInstanceId = { value: "" };
+  const localRuntimeInstanceId = options.client?.app.runtimeInstanceId ?? `window:${Date.now().toString(36)}`;
+  let revision = 0;
   let disposed = false;
-  let runtimeInstanceId: string | undefined;
-  let removeRuntimeMessage: (() => void) | undefined;
-  let transport: (RemoteServiceTransport & { dispose(): void }) | undefined;
-  let restoreWorkerError = (): void => undefined;
+  let current: RuntimeStatusSnapshot = Object.freeze({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId: "", state: "starting", revision: 0, units: [], services: [] });
+  const clientHost = requestedClientHost;
+  const clientPeerScope = options.client && clientHost
+    ? clientHost.rootScope.child("peer", { attributes: { peerId: `peer:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}` } })
+    : undefined;
+  const clientPeerScopeView = clientPeerScope ? createPeerScopeView(clientPeerScope) : undefined;
+  const clientPeer: CapabilityPeer | undefined = clientPeerScope && clientPeerScopeView ? createCapabilityPeerView({
+    peerId: clientPeerScope.identity.attributes.peerId as string,
+    scope: clientPeerScopeView,
+    bridge,
+    capabilityScope: clientPeerScope,
+  }) : undefined;
+  const provider = options.client && clientHost ? createMessagePortServiceProvider({
+    transport,
+    peerScope: clientPeerScope,
+    peer: clientPeer,
+    budget: inboundBudget,
+    limits,
+    services: () => clientHost.serviceReferences().filter((service) => exposed.some((capability) => capabilityKey(capability) === capabilityKey({ kind: service.kind, id: service.capabilityId, version: service.contractVersion }))),
+    peerForCall: (_call, reference) => {
+      const registration = clientHost.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
+      return clientPeerScope && clientPeerScopeView ? createCapabilityPeerView({
+        peerId: clientPeerScope.identity.attributes.peerId as string,
+        scope: clientPeerScopeView,
+        bridge,
+        allowed: registration?.peerDependencies ?? [],
+        capabilityScope: clientPeerScope,
+      }) : undefined;
+    },
+    prepareRequest: (call) => {
+      const registration = clientHost.capabilities.registration({ kind: call.mode === "stream" ? "stream" : "rpc", id: call.capabilityId, version: call.contractVersion });
+      if (!registration || registration.capability.kind !== (call.mode === "stream" ? "stream" : "rpc")) throw new WebLoomError("service_stale", "Window service exposure is stale", "dispatch");
+      const capability = registration.capability as typeof registration.capability & { request: { parse(value: unknown): unknown }; transfer?: { request?: (value: unknown) => readonly Transferable[] } };
+      let value: unknown;
+      try { value = capability.request.parse(call.request); } catch { throw new WebLoomError("request_validation_failed", "Capability request failed validation", "receive"); }
+      return { value, transfer: capability.transfer?.request?.(value) };
+    },
+    handleCall: async ({ request, reference, signal, deadlineAt, peer }) => {
+      const registration = clientHost.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
+      if (!registration) throw new WebLoomError("service_stale", "Window exposure is no longer available", "dispatch");
+      const handler = registration.handler as ((value: unknown, context: import("../contracts/capability.js").HandlerCallContext) => unknown | Promise<unknown>) | undefined;
+      if (!handler) throw new WebLoomError("service_stale", "Window service handler is unavailable", "dispatch");
+      return handler(request, { signal, deadlineAt, reference, origin: "remote", peer });
+    },
+    prepareResult: (value, call) => {
+      const registration = clientHost.capabilities.registration({ kind: "rpc", id: call.capabilityId, version: call.contractVersion });
+      if (!registration || registration.capability.kind !== "rpc") throw new Error("Window RPC registration disappeared");
+      const rpc = registration.capability as typeof registration.capability & { response: { parse(value: unknown): unknown }; transfer?: { response?: (value: unknown) => readonly Transferable[] } };
+      const parsed = rpc.response.parse(value);
+      return { value: parsed, transfer: rpc.transfer?.response?.(parsed) };
+    },
+    prepareItem: (value, call) => {
+      const registration = clientHost.capabilities.registration({ kind: "stream", id: call.capabilityId, version: call.contractVersion });
+      if (!registration || registration.capability.kind !== "stream") throw new Error("Window stream registration disappeared");
+      const stream = registration.capability as typeof registration.capability & { item: { parse(value: unknown): unknown }; transfer?: { item?: (value: unknown) => readonly Transferable[] } };
+      const parsed = stream.item.parse(value);
+      return { value: parsed, transfer: stream.transfer?.item?.(parsed) };
+    },
+  }) : undefined;
 
-  let currentSnapshot: RuntimeStatusSnapshot = {
-    runtimeId: options.id,
-    runtimeKind: "shared-worker",
-    runtimeInstanceId: "",
-    state: "starting",
-    revision: 0,
-    units: [],
-    services: [],
-  };
-
-  const emit = (next: RuntimeStatusSnapshot): void => {
-    currentSnapshot = Object.freeze({
-      ...next,
-      units: Object.freeze([...next.units]),
-      services: Object.freeze([...next.services]),
-    });
-    for (const listener of [...listeners]) {
-      try { listener(currentSnapshot); } catch { /* observer isolation */ }
-    }
-  };
-
-  const bridgeTransport: RemoteServiceTransport = {
-    call<TRequest, TResult>(request: TRequest, context: RemoteServiceCallContext): Promise<TResult> {
-      if (!transport) {
-        return Promise.reject(new RuntimeUnavailableError("SharedWorker connection is unavailable"));
+  const emit = (next: RuntimeStatusSnapshot): void => { current = Object.freeze({ ...next, units: Object.freeze([...next.units]), services: Object.freeze([...next.services]) }); for (const listener of [...listeners]) { try { listener(current); } catch { /* observer isolation */ } } };
+  const sendClientSnapshot = (): void => { if (!options.client || disposed) return; revision += 1; try { transport.send(snapshotForClient(options.client.app, `${options.client.app.runtimeId}`, localRuntimeInstanceId, exposed, revision)); } catch { /* bridge deadline handles disconnect */ } };
+  const removeRaw = transport.subscribe((messageValue) => {
+    if (messageValue.type === RUNTIME_SNAPSHOT_TYPE && messageValue.runtimeKind === "shared-worker") {
+      const applied = bridge.applySnapshot(messageValue);
+      if (applied.accepted) {
+        workerInstanceId.value = messageValue.runtimeInstanceId;
+        emit({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: messageValue.runtimeId, runtimeKind: messageValue.runtimeKind, runtimeInstanceId: messageValue.runtimeInstanceId, state: messageValue.state, revision: messageValue.revision, units: messageValue.units, services: messageValue.services });
       }
-      return transport.call<TRequest, TResult>(request, context);
-    },
-  };
-  const bridge = createServiceBridge({
-    protocolVersion: RUNTIME_PROTOCOL_VERSION,
-    transport: bridgeTransport,
-    defaultCallTimeoutMs,
+    } else if (messageValue.type === RUNTIME_ERROR_TYPE) {
+      bridge.invalidate(messageValue.message);
+      emit({ ...current, state: "failed", error: messageValue.message, units: [], services: [] });
+    }
   });
+  const onError = (): void => { if (!disposed) { clientPeerScope?.revoke("SharedWorker disconnected"); provider?.dispose(); bridge.disconnect("SharedWorker disconnected"); emit({ ...current, state: "disconnected", runtimeInstanceId: "", revision: 0, units: [], services: [], error: "SharedWorker disconnected" }); } };
+  port.addEventListener("messageerror", onError);
+  if (worker.addEventListener) worker.addEventListener("error", onError);
+  else worker.onerror = onError;
+  sendClientSnapshot();
+  const removeClient = options.client?.app.subscribe(() => sendClientSnapshot());
 
-  const cleanup = (): void => {
-    removeRuntimeMessage?.();
-    removeRuntimeMessage = undefined;
-    port.removeEventListener("messageerror", onWorkerError);
-    transport?.dispose();
-    transport = undefined;
-    try { port.close(); } catch { /* noop */ }
-    if (worker.removeEventListener) worker.removeEventListener("error", onWorkerError);
-    restoreWorkerError();
-    restoreWorkerError = () => undefined;
+  const handle: RuntimeHandle = {
+    runtimeKind: "shared-worker", runtimeId: options.id,
+    get runtimeInstanceId() { return workerInstanceId.value; },
+    state: () => current,
+    capability<C extends RemoteCapability>(capability: C): CapabilityClient<C> { return bridge.getClient(capability); },
+    optionalCapability<C extends RemoteCapability>(capability: C): CapabilityClient<C> | undefined { return bridge.services().some((service) => service.kind === capability.kind && service.capabilityId === capability.id && service.contractVersion === capability.version) ? bridge.getClient(capability) : undefined; },
+    inspect: () => Object.freeze({ ...current, pendingCallCount: bridge.pendingCallCount, activeStreamCount: bridge.activeStreamCount, peerCount: current.state === "ready" ? 1 : 0 }),
+    subscribe(listener) { listeners.add(listener); listener(current); return () => listeners.delete(listener); },
+    dispose(reason = "SharedWorker connection disposed"): Promise<void> { if (disposed) return Promise.resolve(); disposed = true; emit({ ...current, state: "stopping" }); removeClient?.(); removeRaw(); clientPeerScope?.revoke(reason); provider?.dispose(); bridge.dispose(reason); port.removeEventListener("messageerror", onError); worker.removeEventListener?.("error", onError); transport.close?.(); emit({ ...current, state: "disposed", runtimeInstanceId: "", revision: 0, units: [], services: [] }); return clientPeerScope ? clientPeerScope.dispose({ reason }).then(() => undefined) : Promise.resolve(); },
   };
-
-  const disconnect = (reason: string, failure?: unknown): void => {
-    if (disposed) return;
-    cleanup();
-    bridge.disconnect(reason);
-    emit({
-      ...currentSnapshot,
-      state: "disconnected",
-      runtimeInstanceId: "",
-      revision: 0,
-      units: [],
-      services: [],
-      error: failure ? errorMessage(failure) : reason,
-    });
-    runtimeInstanceId = undefined;
-  };
-
-  const onRuntimeError = (message: RuntimeErrorMessage): void => {
-    const error = new RuntimeInitializationError({
-      pluginId: message.pluginId,
-      unitId: message.unitId,
-      phase: message.phase === "snapshot" ? "snapshot" : "startup",
-      error: message.message,
-    });
-    if (message.code === "protocol_mismatch") bridge.markProtocolMismatch(message.message);
-    else if (message.code === "runtime_initialization_failed") bridge.markInitializationFailed(message.message);
-    else bridge.disconnect(message.message);
-    emit({ ...currentSnapshot, state: "failed", error: error.message, units: [], services: [] });
-  };
-
-  const onSnapshot = (snapshot: RuntimeSnapshot): void => {
-    if (snapshot.runtimeId !== options.id || snapshot.runtimeKind !== "shared-worker") return;
-    if (!isRuntimeSnapshotProtocol(snapshot)) {
-      bridge.markProtocolMismatch(`Runtime protocol ${snapshot.protocolVersion} is not supported`);
-      emit({
-        ...currentSnapshot,
-        state: "failed",
-        error: `Runtime protocol ${snapshot.protocolVersion} is not supported`,
-        units: [],
-        services: [],
-      });
-      return;
-    }
-    const applied = bridge.applySnapshot(snapshot);
-    if (!applied.accepted) return;
-    runtimeInstanceId = snapshot.runtimeInstanceId;
-    emit({
-      runtimeId: snapshot.runtimeId,
-      runtimeKind: snapshot.runtimeKind,
-      runtimeInstanceId: snapshot.runtimeInstanceId,
-      state: snapshot.state === "ready" ? "ready" : snapshot.state,
-      revision: snapshot.revision,
-      units: snapshot.units,
-      services: snapshot.services,
-    });
-  };
-
-  const onWorkerError = (event: Event): void => {
-    const detail = event.type ? `SharedWorker error: ${event.type}` : "SharedWorker error";
-    disconnect(detail);
-  };
-
-  const onMessage = (event: MessageEvent): void => {
-    if (disposed) return;
-    if (isRuntimeError(event.data)) {
-      onRuntimeError(event.data);
-      return;
-    }
-    if (isRuntimeSnapshot(event.data)) {
-      onSnapshot(event.data);
-      return;
-    }
-    // 完全无法解析的对端消息不改变状态；正在等待的 call 由自己的
-    // deadline 收敛为 call_timeout，而不是伪造一个握手错误。
-    const decoded = codec.decode(event.data);
-    if (decoded?.type === codec.type("error")) {
-      // Remote service transport owns response matching. Runtime 只处理它的
-      // own snapshot/error namespace。
-    }
-  };
-
-  try {
-    // 临时迁移钩子必须先于 Runtime listener 安装，以便复用同一端口。
-    options.onConnection?.({ worker, port });
-    transport = createMessagePortServiceTransport({
-      port,
-      codec,
-      defaultCallTimeoutMs,
-      closeOnDispose: false,
-    });
-    removeRuntimeMessage = addMessageListener(port, onMessage);
-    port.addEventListener("messageerror", onWorkerError);
-    if (worker.addEventListener) worker.addEventListener("error", onWorkerError);
-    else {
-      const previous = worker.onerror;
-      const fallbackHandler = (event: Event): void => {
-        previous?.(event);
-        onWorkerError(event);
-      };
-      worker.onerror = fallbackHandler;
-      restoreWorkerError = () => {
-        if (worker.onerror === fallbackHandler) worker.onerror = previous;
-      };
-    }
-    port.start();
-  } catch (error) {
-    cleanup();
-    throw error;
-  }
-
-  // 供 Window Runtime 的内部装配使用；不写入 RuntimeHandle 公共接口，
-  // 也不暴露原始 MessagePort。
-  const handle = {
-    runtimeKind: "shared-worker" as const,
-    runtimeId: options.id,
-    get runtimeInstanceId() { return runtimeInstanceId; },
-    serviceBridge: bridge,
-    state: () => currentSnapshot,
-    capability<T = unknown>(capabilityId: string, capabilityOptions: { contractVersion?: string } = {}) {
-      const proxy = bridge.requireProxy({
-        capabilityId,
-        contractVersion: capabilityOptions.contractVersion ?? `${capabilityId}.v1`,
-      });
-      return proxy as typeof proxy & { readonly serviceType?: T };
-    },
-    subscribe(listener: RuntimeStatusListener) {
-      listeners.add(listener);
-      listener(currentSnapshot);
-      return () => listeners.delete(listener);
-    },
-    dispose(reason = "SharedWorker connection disposed"): Promise<void> {
-      if (disposed) return Promise.resolve();
-      // 先同步撤销代理并拒绝 transport pending，再做端口清理。
-      disposed = true;
-      emit({ ...currentSnapshot, state: "stopping" });
-      bridge.dispose(reason);
-      cleanup();
-      runtimeInstanceId = undefined;
-      emit({
-        ...currentSnapshot,
-        state: "disposed",
-        runtimeInstanceId: "",
-        revision: 0,
-        units: [],
-        services: [],
-      });
-      return Promise.resolve();
-    },
-  };
-  return handle as RuntimeHandle;
+  handleBridges.set(handle as object, bridge);
+  return handle;
 }
 
-/** 创建生产 RuntimeHandle；测试工厂不属于生产公共选项。 */
-export function connectSharedWorker(options: ConnectSharedWorkerOptions): RuntimeHandle {
-  return connectSharedWorkerInternal(options);
-}
+/** 同步创建 RuntimeHandle；ready 由 state/capability Promise 观察。 */
+export function connectSharedWorker(options: ConnectSharedWorkerOptions): RuntimeHandle { return connectInternal(options); }
 
-/** 仅由 `webloom-framework/testing` 暴露的 SharedWorker 工厂注入入口。 */
-export function connectSharedWorkerForTesting(
-  options: ConnectSharedWorkerOptions,
-  workerFactory: SharedWorkerFactory,
-): RuntimeHandle {
-  return connectSharedWorkerInternal({ ...options, workerFactory });
+/** testing 入口才允许注入可控 Worker 工厂。 */
+export function connectSharedWorkerForTesting(options: ConnectSharedWorkerOptions, workerFactory: SharedWorkerFactory): RuntimeHandle { return connectInternal({ ...options, workerFactory }); }
+
+/** advanced 装配层取得连接 bridge；普通 RuntimeHandle 不暴露该实现细节。 */
+export function bridgeForRuntimeHandle(handle: RuntimeHandle): CapabilityBridge {
+  const bridge = handleBridges.get(handle as object);
+  if (!bridge) throw new Error("RuntimeHandle is not owned by WebLoom");
+  return bridge;
 }

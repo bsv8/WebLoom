@@ -1,6 +1,6 @@
 {
   "name": "webloom-framework",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "通用前端插件生命周期框架",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -32,6 +32,10 @@
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js"
     },
+    "./advanced": {
+      "types": "./dist/advanced.d.ts",
+      "import": "./dist/advanced.js"
+    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
@@ -42,9 +46,12 @@
     "test": "vitest run",
     "build": "tsup",
     "lint:boundaries": "node scripts/check-boundaries.mjs",
+    "lint:v4": "node scripts/check-v4-boundary.mjs",
+    "test:types": "tsc -p tsconfig.json --noEmit && node scripts/check-contract-inventory.mjs",
+    "test:contract-inventory": "node scripts/check-contract-inventory.mjs",
     "test:browser:install": "playwright install chromium",
     "test:browser": "pnpm run test:browser:install && node scripts/real-browser-runtime-smoke.mjs",
-    "prepack": "pnpm typecheck && pnpm test && pnpm build && pnpm lint:boundaries",
+    "prepack": "pnpm test:types && pnpm test && pnpm build && pnpm lint:boundaries && pnpm lint:v4",
     "pack": "npm pack",
     "pack:consumer": "pnpm run prepack && node scripts/pack-consumer-smoke.mjs"
   },

@@ -1,102 +1,167 @@
-import { describe, expect, it, vi } from "vitest";
-import type { RemoteServicePortResponseMessage } from "./messagePortServiceTransport.js";
-import { createMessagePortServiceProvider } from "./messagePortServiceProvider.js";
+import { describe, expect, it } from "vitest";
+import { defineCapability } from "../contracts/capability.js";
+import { WebLoomError } from "../contracts/lifecycle.js";
+import {
+  RUNTIME_CALL_TYPE,
+  RUNTIME_CANCEL_TYPE,
+  RUNTIME_ERROR_MESSAGE_TYPE,
+  RUNTIME_PROTOCOL_VERSION,
+} from "../runtime/runtimeProtocol.js";
+import { createMessagePortServiceProvider, type MessagePortServiceCallInput } from "./messagePortServiceProvider.js";
+import type { MessagePortLike } from "./messagePortServiceTransport.js";
 
-function reference(serviceInstanceId = "provider:1") {
-  return {
-    capabilityId: "test.service",
-    contractVersion: "test.service.v1",
-    runtime: "shared-worker" as const,
-    runtimeInstanceId: "runtime:1",
-    serviceInstanceId,
-    status: "ready" as const,
-    attributes: { tenancy: "shared" },
-  };
+const Echo = defineCapability({
+  kind: "rpc",
+  id: "provider.echo",
+  version: "1",
+  request: { parse(value: unknown): { value: string } { return value as { value: string }; } },
+  response: { parse(value: unknown): { result: string } { return value as { result: string }; } },
+});
+const Events = defineCapability({
+  kind: "stream",
+  id: "provider.events",
+  version: "1",
+  request: { parse(value: unknown): { topic: string } { return value as { topic: string }; } },
+  item: { parse(value: unknown): number { return value as number; } },
+});
+const reference = { kind: "rpc" as const, capabilityId: Echo.id, contractVersion: Echo.version, runtime: "shared-worker" as const, runtimeInstanceId: "worker:one", serviceInstanceId: "echo:one", attributes: {} };
+const streamReference = { kind: "stream" as const, capabilityId: Events.id, contractVersion: Events.version, runtime: "shared-worker" as const, runtimeInstanceId: "worker:one", serviceInstanceId: "events:one", attributes: {} };
+
+class FakePort implements MessagePortLike {
+  readonly sent: unknown[] = [];
+  private listener?: (event: MessageEvent) => void;
+  addEventListener(_type: "message" | "messageerror", listener: (event: MessageEvent) => void): void { this.listener = listener; }
+  removeEventListener(_type: "message" | "messageerror", listener: (event: MessageEvent) => void): void { if (this.listener === listener) this.listener = undefined; }
+  postMessage(message: unknown): void { this.sent.push(message); }
+  emit(message: unknown): void { this.listener?.({ data: message } as MessageEvent); }
 }
 
-function callMessage(overrides: Partial<{
-  callId: string;
-  serviceInstanceId: string;
-  protocolVersion: string;
-}> = {}) {
-  return {
-    type: "webloom.remote-service.call",
-    protocolVersion: "webloom.remote-service.v2",
-    callId: overrides.callId ?? "call:1",
-    capabilityId: "test.service",
-    contractVersion: "test.service.v1",
-    serviceInstanceId: overrides.serviceInstanceId ?? "provider:1",
-    request: { type: "read" },
-    ...(overrides.protocolVersion ? { protocolVersion: overrides.protocolVersion } : {}),
-  };
+function callMessage(callId = "call:one") {
+  return { type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId, capabilityId: Echo.id, contractVersion: Echo.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary" as const, timeoutMs: 500, request: { value: "ok" } };
 }
 
-async function waitForResponse(responses: readonly RemoteServicePortResponseMessage[], callId: string): Promise<RemoteServicePortResponseMessage> {
-  await vi.waitFor(() => expect(responses.some((response) => response.callId === callId)).toBe(true));
-  return responses.find((response) => response.callId === callId)!;
+function streamCallMessage(callId = "stream:one", initialCredit = 1) {
+  return { type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId, capabilityId: Events.id, contractVersion: Events.version, serviceInstanceId: streamReference.serviceInstanceId, mode: "stream" as const, timeoutMs: 500, request: { topic: "updates" }, initialCredit };
 }
 
-describe("MessagePort service provider", () => {
-  it("根据本地权威目录验证 serviceInstanceId，拒绝客户端伪造目录", async () => {
-    const channel = new MessageChannel();
-    const responses: RemoteServicePortResponseMessage[] = [];
-    channel.port2.addEventListener("message", (event) => {
-      if (event.data?.type === "webloom.remote-service.result" || event.data?.type === "webloom.remote-service.error") {
-        responses.push(event.data as RemoteServicePortResponseMessage);
-      }
-    });
-    channel.port2.start();
-    const handler = vi.fn(async ({ message }: { message: { request: unknown } }) => ({ request: message.request }));
+describe("v4 MessagePort provider", () => {
+  it("ignores old protocol messages and dispatches only exact exposures", async () => {
+    const port = new FakePort();
     const provider = createMessagePortServiceProvider({
-      port: channel.port1,
-      services: () => [reference()],
-      handleCall: handler as never,
+      port,
+      services: () => [reference],
+      handleCall: ({ message }: MessagePortServiceCallInput) => ({ result: (message.request as { value: string }).value }),
     });
-    try {
-      channel.port2.postMessage(callMessage());
-      await expect(waitForResponse(responses, "call:1")).resolves.toMatchObject({
-        type: "webloom.remote-service.result",
-        result: { request: { type: "read" } },
-      });
-      channel.port2.postMessage(callMessage({ callId: "call:stale", serviceInstanceId: "provider:old" }));
-      await expect(waitForResponse(responses, "call:stale")).resolves.toMatchObject({
-        type: "webloom.remote-service.error",
-        error: { code: "service_stale" },
-      });
-      expect(handler).toHaveBeenCalledTimes(1);
-    } finally {
-      provider.dispose();
-      channel.port2.close();
-    }
+    const rejectedProtocol = ["webloom.runtime", "v2"].join(".");
+    port.emit({ ...callMessage(), type: `${rejectedProtocol}.call`, protocolVersion: rejectedProtocol });
+    expect(port.sent).toEqual([]);
+    port.emit({ ...callMessage(), serviceInstanceId: "echo:old" });
+    await Promise.resolve();
+    expect(port.sent.at(-1)).toMatchObject({ type: `${RUNTIME_PROTOCOL_VERSION}.error`, error: { code: "service_stale" } });
+    provider.dispose();
   });
 
-  it("取消消息只影响同一个 callId + serviceInstanceId", async () => {
-    const channel = new MessageChannel();
-    let requestSignal!: AbortSignal;
-    let resolveHandler!: () => void;
+  it("aborts an uncooperative handler on cancel and removes the framework record", async () => {
+    const port = new FakePort();
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
     const provider = createMessagePortServiceProvider({
-      port: channel.port1,
-      services: () => [reference()],
-      handleCall: ({ signal }) => {
-        requestSignal = signal;
-        return new Promise<void>((resolve) => { resolveHandler = resolve; });
+      port,
+      services: () => [reference],
+      handleCall: async ({ signal }) => {
+        entered();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        throw new WebLoomError("request_cancelled", "cancelled", "dispose");
       },
     });
-    try {
-      channel.port2.start();
-      channel.port2.postMessage(callMessage({ callId: "call:cancel" }));
-      await vi.waitFor(() => expect(requestSignal).toBeDefined());
-      channel.port2.postMessage({
-        type: "webloom.remote-service.cancel",
-        protocolVersion: "webloom.remote-service.v2",
-        callId: "call:cancel",
-        serviceInstanceId: "provider:1",
-      });
-      await vi.waitFor(() => expect(requestSignal.aborted).toBe(true));
-      resolveHandler();
-    } finally {
-      provider.dispose();
-      channel.port2.close();
-    }
+    const call = callMessage();
+    port.emit(call);
+    await enteredPromise;
+    expect(provider.pendingCount()).toBe(1);
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.pendingCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("keeps a never-settling execution bounded after cancellation", async () => {
+    const port = new FakePort();
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const provider = createMessagePortServiceProvider({
+      port,
+      limits: { maxExecutionSlotsPerPeer: 1, maxExecutionSlotsPerRuntime: 1 },
+      services: () => [reference],
+      handleCall: async () => {
+        entered();
+        await new Promise<void>(() => undefined);
+      },
+    });
+    const first = callMessage("call:never");
+    port.emit(first);
+    await enteredPromise;
+    expect(provider.pendingCount()).toBe(1);
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: first.callId, serviceInstanceId: first.serviceInstanceId });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.pendingCount()).toBe(0);
+    expect(provider.executionCount()).toBe(1);
+    expect(provider.nonCooperativeExecutionCount()).toBe(1);
+    expect(provider.retainedPayloadBytes()).toBeGreaterThan(0);
+
+    port.emit(callMessage("call:blocked"));
+    await Promise.resolve();
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "resource_limit_exceeded" } });
+    expect(provider.executionCount()).toBe(1);
+    provider.dispose();
+  });
+
+  it("retains an execution slot while an iterator waits for more credit", async () => {
+    const port = new FakePort();
+    let returned = 0;
+    const iterator: AsyncIterator<number> = {
+      async next() { return { value: 1, done: false }; },
+      async return() { returned += 1; return { value: undefined, done: true }; },
+    };
+    const provider = createMessagePortServiceProvider({
+      port,
+      limits: { maxExecutionSlotsPerPeer: 1, maxExecutionSlotsPerRuntime: 1 },
+      services: () => [streamReference],
+      handleCall: () => ({ [Symbol.asyncIterator]: () => iterator }),
+    });
+    port.emit(streamCallMessage());
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: `${RUNTIME_PROTOCOL_VERSION}.result`, streamReady: true }),
+      expect.objectContaining({ type: `${RUNTIME_PROTOCOL_VERSION}.next`, sequence: 1 }),
+    ]));
+    expect(provider.executionCount()).toBe(1);
+
+    port.emit(streamCallMessage("stream:two"));
+    await Promise.resolve();
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "resource_limit_exceeded" } });
+    expect(provider.executionCount()).toBe(1);
+
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: "stream:one", serviceInstanceId: streamReference.serviceInstanceId });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(returned).toBe(1);
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("enforces the receiving runtime's stream credit limit", async () => {
+    const port = new FakePort();
+    let entered = 0;
+    const provider = createMessagePortServiceProvider({
+      port,
+      limits: { maxStreamCredit: 1 },
+      services: () => [streamReference],
+      handleCall: () => { entered += 1; return { [Symbol.asyncIterator]: async function* () { yield 1; } }; },
+    });
+    port.emit(streamCallMessage("stream:over-credit", 2));
+    await Promise.resolve();
+    expect(entered).toBe(0);
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "stream_overflow" } });
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
   });
 });

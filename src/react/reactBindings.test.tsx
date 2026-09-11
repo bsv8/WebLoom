@@ -1,198 +1,68 @@
-// WebLoom React 子入口独立回归测试。
-//
-// 覆盖 Provider/Host 切换、Host 生命周期重渲染、capability 撤销，以及
-// useResourceSelector 的相等判断和订阅清理。测试只使用 WebLoom 通用 fake，
-// 不依赖具体产品或其它产品包。
-
 // @vitest-environment jsdom
 
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  PluginHostProvider,
-  useOptionalCapability,
-  usePluginRuntime,
-  useResourceSelector,
-} from "../react.js";
-import { createRuntimeUnitImplementationRegistry } from "../host/runtimeUnitImplementationRegistry.js";
-import { createFakePluginHost } from "../testing/fakes.js";
+import { defineCapability } from "../contracts/capability.js";
+import { definePlugin } from "../authoring/definePlugin.js";
+import { createWindowApp, hostForWindowApp } from "../runtime/windowRuntime.js";
+import { WebLoomProvider } from "./PluginHostProvider.js";
+import { useOptionalCapability } from "./useCapability.js";
+import { usePluginRuntime, usePluginState } from "./usePluginRuntime.js";
 
-afterEach(() => {
-  cleanup();
-});
+afterEach(() => cleanup());
 
-function CapabilityValue({ capability, onRender }: { capability: string; onRender?: () => void }) {
+const Value = defineCapability<{ value: string }>({ kind: "local", id: "react.value", version: "1" });
+const Other = defineCapability<{ value: string }>({ kind: "local", id: "react.other", version: "1" });
+
+function CapabilityView({ onRender }: { onRender?: () => void }) {
   onRender?.();
-  const value = useOptionalCapability<string>(capability);
-  return <output data-testid="capability">{value ?? "missing"}</output>;
+  const value = useOptionalCapability(Value);
+  return <output data-testid="value">{value?.value ?? "missing"}</output>;
 }
 
-describe("WebLoom React bindings", () => {
-  it("switches Provider hosts and unsubscribes the previous host", async () => {
-    const firstHost = createFakePluginHost({ capabilities: { "demo.value": "first" } });
-    const secondHost = createFakePluginHost({ capabilities: { "demo.value": "second" } });
+describe("v4 React bindings", () => {
+  it("switches the App Provider and unsubscribes the previous App", async () => {
+    const first = await createWindowApp({ plugins: [definePlugin({ id: "first", provides: [Value] as const, setup(ctx) { ctx.provide(Value, { value: "first" }); } })] });
+    const second = await createWindowApp({ plugins: [definePlugin({ id: "second", provides: [Value] as const, setup(ctx) { ctx.provide(Value, { value: "second" }); } })] });
     let renders = 0;
-
-    function View() {
-      return <CapabilityValue capability="demo.value" onRender={() => { renders += 1; }} />;
-    }
-
-    const rendered = render(
-      <PluginHostProvider host={firstHost}>
-        <View />
-      </PluginHostProvider>,
-    );
-    expect(screen.getByTestId("capability").textContent).toBe("first");
-
-    await act(async () => {
-      rendered.rerender(
-        <PluginHostProvider host={secondHost}>
-          <View />
-        </PluginHostProvider>,
-      );
-    });
-    expect(screen.getByTestId("capability").textContent).toBe("second");
-    const rendersAfterSwitch = renders;
-
-    // 旧 Host 的通知不应再进入当前 React 树。
-    await act(async () => {
-      firstHost.provide("old-host-only", true);
-    });
-    expect(renders).toBe(rendersAfterSwitch);
-
-    await act(async () => {
-      secondHost.provide("new-host-only", true);
-    });
-    await waitFor(() => expect(renders).toBeGreaterThan(rendersAfterSwitch));
+    const view = render(<WebLoomProvider app={first}><CapabilityView onRender={() => { renders += 1; }} /></WebLoomProvider>);
+    expect(screen.getByTestId("value").textContent).toBe("first");
+    await act(async () => { view.rerender(<WebLoomProvider app={second}><CapabilityView onRender={() => { renders += 1; }} /></WebLoomProvider>); });
+    expect(screen.getByTestId("value").textContent).toBe("second");
+    const afterSwitch = renders;
+    await first.dispose();
+    expect(renders).toBe(afterSwitch);
+    await second.dispose();
   });
 
-  it("rerenders for register, enable, disable, and unregister transitions", async () => {
-    const plugin = {
-      id: "demo-plugin",
-      name: "Demo plugin",
-      meta: { defaultEnabled: true, canDisable: true },
-    };
-    const host = createFakePluginHost({
-      runtimeUnitImplementationRegistry: createRuntimeUnitImplementationRegistry([{
-        pluginId: plugin.id,
-        unitId: plugin.id,
-        setup(ctx) {
-          ctx.provide("demo.service", "running");
-        },
-      }]),
-    });
+  it("does not rerender a capability consumer for an unrelated App change", async () => {
+    const app = await createWindowApp({ plugins: [
+      definePlugin({ id: "value", provides: [Value] as const, startup: "required" as const, setup(ctx) { ctx.provide(Value, { value: "stable" }); } }),
+      definePlugin({ id: "other", provides: [Other] as const, setup(ctx) { ctx.provide(Other, { value: "other" }); } }),
+    ] });
+    const host = hostForWindowApp(app);
+    let renders = 0;
+    render(<WebLoomProvider app={app}><CapabilityView onRender={() => { renders += 1; }} /></WebLoomProvider>);
+    expect(screen.getByTestId("value").textContent).toBe("stable");
+    const before = renders;
+    await act(async () => { await host.disable("other"); });
+    await waitFor(() => expect(host.state("other").kind).toBe("disabled"));
+    expect(screen.getByTestId("value").textContent).toBe("stable");
+    expect(renders).toBe(before);
+    await app.dispose();
+  });
 
-    function RuntimeState() {
+  it("exposes typed plugin lifecycle state through the App Provider", async () => {
+    const app = await createWindowApp({ plugins: [definePlugin({ id: "lifecycle", setup() {} })] });
+    function StateView() {
+      const state = usePluginState("lifecycle");
       const runtime = usePluginRuntime();
-      return <output data-testid="runtime-state">{runtime.state(plugin.id).kind}</output>;
+      return <output data-testid="state">{`${state?.kind}:${runtime.isEnabled("lifecycle")}`}</output>;
     }
-
-    render(
-      <PluginHostProvider host={host}>
-        <RuntimeState />
-      </PluginHostProvider>,
-    );
-    expect(screen.getByTestId("runtime-state").textContent).toBe("disabled");
-
-    await act(async () => {
-      await host.register(plugin);
-    });
-    await waitFor(() => expect(screen.getByTestId("runtime-state").textContent).toBe("enabled"));
-
-    await act(async () => {
-      await host.disable(plugin.id);
-    });
-    await waitFor(() => expect(screen.getByTestId("runtime-state").textContent).toBe("disabled"));
-
-    await act(async () => {
-      await host.enable(plugin.id);
-    });
-    await waitFor(() => expect(screen.getByTestId("runtime-state").textContent).toBe("enabled"));
-
-    await act(async () => {
-      await host.unregister(plugin.id);
-    });
-    await waitFor(() => expect(screen.getByTestId("runtime-state").textContent).toBe("disabled"));
-    expect(host.installed()).not.toContain(plugin.id);
-  });
-
-  it("returns the new hook state after a capability is revoked", async () => {
-    const host = createFakePluginHost({ capabilities: { "demo.capability": "available" } });
-
-    render(
-      <PluginHostProvider host={host}>
-        <CapabilityValue capability="demo.capability" />
-      </PluginHostProvider>,
-    );
-    expect(screen.getByTestId("capability").textContent).toBe("available");
-
-    await act(async () => {
-      host.capabilities.revoke("demo.capability");
-      // capability registry 的直接 revoke 不负责 Host 版本；真实 Host
-      // 生命周期会 bump，这里用一次 Host 内建 capability 变更模拟该边界。
-      host.provide("revision.tick", true);
-    });
-    await waitFor(() => expect(screen.getByTestId("capability").textContent).toBe("missing"));
-  });
-
-  it("keeps resource selector output stable and removes provider subscriptions", async () => {
-    const host = createFakePluginHost();
-    let value = 1;
-    let subscribeCount = 0;
-    let unsubscribeCount = 0;
-    const invalidators = new Set<() => void>();
-    host.resourceRegistry.register<{ value: number }, readonly string[]>({
-      id: "demo.resource",
-      scope: "global",
-      key: (args) => ["demo.resource", args[0] ?? "default"],
-      load: async () => ({ value }),
-      subscribe: (_args, _context, invalidate) => {
-        subscribeCount += 1;
-        invalidators.add(invalidate);
-        return () => {
-          unsubscribeCount += 1;
-          invalidators.delete(invalidate);
-        };
-      },
-      equals: (previous, next) => previous?.value === next?.value,
-      invalidation: "immediate",
-    });
-
-    let renders = 0;
-    function ResourceView() {
-      renders += 1;
-      const selected = useResourceSelector<{ value: number }, number>(
-        host.resourceStore,
-        "demo.resource",
-        ["stable"],
-        (snapshot) => snapshot.data?.value ?? -1,
-      );
-      return <output data-testid="resource-value">{selected}</output>;
-    }
-
-    const rendered = render(<ResourceView />);
-    await waitFor(() => expect(screen.getByTestId("resource-value").textContent).toBe("1"));
-    expect(subscribeCount).toBe(1);
-    const rendersBeforeEqualInvalidation = renders;
-
-    await act(async () => {
-      for (const invalidate of invalidators) invalidate();
-    });
-    await waitFor(() => expect(screen.getByTestId("resource-value").textContent).toBe("1"));
-    expect(renders).toBe(rendersBeforeEqualInvalidation);
-
-    value = 2;
-    await act(async () => {
-      for (const invalidate of invalidators) invalidate();
-    });
-    await waitFor(() => expect(screen.getByTestId("resource-value").textContent).toBe("2"));
-
-    rendered.unmount();
-    expect(unsubscribeCount).toBe(1);
-    const rendersAfterUnmount = renders;
-    await act(async () => {
-      host.resourceStore.invalidate("demo.resource", ["stable"]);
-    });
-    expect(renders).toBe(rendersAfterUnmount);
+    render(<WebLoomProvider app={app}><StateView /></WebLoomProvider>);
+    expect(screen.getByTestId("state").textContent).toBe("enabled:true");
+    await hostForWindowApp(app).disable("lifecycle");
+    await waitFor(() => expect(screen.getByTestId("state").textContent).toBe("disabled:false"));
+    await app.dispose();
   });
 });

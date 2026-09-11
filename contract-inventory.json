@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "kind": "local",
+      "id": "webloom.resource.registry",
+      "version": "1",
+      "module": "src/contracts/resource.ts",
+      "moduleFingerprint": "2f3563fc1c6cbdbc4914dfc21a1cc0ccdf45dd1f84171b10d3a37a53366bb817",
+      "dependencyFingerprints": [
+        {
+          "path": "src/contracts/capability.ts",
+          "fingerprint": "afe0e3c789d962f9488f79499135637b0a42b642e75b6d083ad4f721b8a2adb4"
+        },
+        {
+          "path": "src/contracts/lifecycle.ts",
+          "fingerprint": "c1062cfe5ea770c1e052f584b3661cd7b131a1573916eb7321a6d079bba0a192"
+        }
+      ],
+      "contractTestVersion": "webloom-v4-contract-tests.1",
+      "auditEvidence": "Initial v4 inventory: the shipped source defines one local Resource Registry capability; parser/transfer fields are intentionally absent and the static capability/type boundary is covered by the v4 unit and typecheck gates."
+    }
+  ]
+}

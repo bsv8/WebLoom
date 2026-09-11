@@ -49,6 +49,10 @@ interface ResourceEntry {
   error?: string;
 }
 
+type MutableDisposeResult = {
+  -readonly [K in keyof LifecycleDisposeResult]: LifecycleDisposeResult[K];
+};
+
 export interface CreateResourceScopeOptions {
   /** 可选固定作用域标识；生产代码通常省略，让实现生成不可复用 ID。 */
   scopeId?: string;
@@ -85,6 +89,26 @@ function isPositiveFiniteNumber(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value >= 0;
 }
 
+function cloneScopeAttributes(value: Readonly<Record<string, unknown>> | undefined): Readonly<Record<string, unknown>> {
+  let clone: unknown;
+  try {
+    const structuredCloneFn = (globalThis as unknown as { structuredClone?: (input: unknown) => unknown }).structuredClone;
+    clone = structuredCloneFn ? structuredCloneFn(value ?? {}) : { ...(value ?? {}) };
+  } catch {
+    throw new TypeError("Lifecycle scope attributes must be structured-cloneable");
+  }
+  if (!clone || typeof clone !== "object" || Array.isArray(clone)) throw new TypeError("Lifecycle scope attributes must be a record");
+  const freeze = (current: unknown, seen: Set<object>): void => {
+    if (!current || typeof current !== "object" || seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) for (const item of current) freeze(item, seen);
+    else for (const item of Object.values(current as Record<string, unknown>)) freeze(item, seen);
+    Object.freeze(current);
+  };
+  freeze(clone, new Set<object>());
+  return clone as Readonly<Record<string, unknown>>;
+}
+
 /**
  * 创建一个可嵌套的生命周期作用域。
  *
@@ -92,12 +116,13 @@ function isPositiveFiniteNumber(value: number | undefined): value is number {
  * 模块按“作用域”或“资源”语义调用；两者不代表两套实现。
  */
 export function createLifecycleScope(options: CreateResourceScopeOptions): LifecycleScope {
+  const metadata = options.metadata;
   const identity: LifecycleScopeIdentity = {
     scopeId: options.scopeId ?? makeId(`scope:${options.kind}`),
     instanceId: options.instanceId ?? makeId("instance"),
     kind: options.kind,
-    attributes: {},
-    ...options.metadata,
+    ...metadata,
+    attributes: cloneScopeAttributes(metadata?.attributes),
   };
   const controller = new AbortController();
   const revokeListeners = new Set<(reason: string) => void>();
@@ -445,7 +470,7 @@ export function createLifecycleScope(options: CreateResourceScopeOptions): Lifec
       const lateReleased = new Set<string>();
       let released = 0;
       let attempted = 0;
-      let resultSnapshot: LifecycleDisposeResult | undefined;
+      let resultSnapshot: MutableDisposeResult | undefined;
       let resultPublished = false;
 
       const publishDisposeResult = (): void => {
@@ -723,6 +748,78 @@ export function createLifecycleScope(options: CreateResourceScopeOptions): Lifec
     return childScope;
   }
 
+  function listen(
+    target: EventTarget,
+    event: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: AddEventListenerOptions | boolean,
+  ): () => void {
+    assertActive();
+    if (!target || typeof target.addEventListener !== "function" || typeof target.removeEventListener !== "function") {
+      throw new TypeError("Lifecycle scope listen target must be an EventTarget");
+    }
+    let active = true;
+    target.addEventListener(event, listener, options);
+    let removeRevoke: (() => void) | undefined;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      target.removeEventListener(event, listener, options);
+      removeRevoke?.();
+    };
+    removeRevoke = onRevoke(release);
+    if (!active) release();
+    return release;
+  }
+
+  function interval(callback: () => void, milliseconds: number): () => void {
+    assertActive();
+    if (typeof callback !== "function") throw new TypeError("Lifecycle scope interval callback must be a function");
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) throw new TypeError("Lifecycle scope interval milliseconds must be a finite non-negative number");
+    const handle = setInterval(callback, milliseconds);
+    let active = true;
+    let removeRevoke: (() => void) | undefined;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      clearInterval(handle);
+      removeRevoke?.();
+    };
+    removeRevoke = onRevoke(release);
+    if (!active) release();
+    return release;
+  }
+
+  function subscribe(
+    subscribeFn: (listener: () => void) => () => void,
+    listener: () => void,
+  ): () => void {
+    assertActive();
+    if (typeof subscribeFn !== "function" || typeof listener !== "function") {
+      throw new TypeError("Lifecycle scope subscribe requires functions");
+    }
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    let removeRevoke: (() => void) | undefined;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      removeRevoke?.();
+      unsubscribe?.();
+    };
+    removeRevoke = onRevoke(release);
+    try {
+      const candidate = subscribeFn(listener);
+      if (typeof candidate !== "function") throw new TypeError("Lifecycle subscribe function must return an unsubscribe function");
+      unsubscribe = candidate;
+      if (!active) unsubscribe();
+    } catch (error) {
+      release();
+      throw error;
+    }
+    return release;
+  }
+
   Object.assign(publicScope, {
     identity,
     signal: controller.signal,
@@ -735,6 +832,9 @@ export function createLifecycleScope(options: CreateResourceScopeOptions): Lifec
     dispose,
     assertActive,
     resources,
+    listen,
+    interval,
+    subscribe,
   });
   // Object.assign 会读取 getter 的当前值，不能用它暴露动态 state；必须
   // 保持状态只读且随 revoke/dispose 实时变化。

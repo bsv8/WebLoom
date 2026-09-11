@@ -5,6 +5,7 @@ import {
 } from "../../src/index.ts";
 import workerUrl from "./worker.ts?sharedworker&url";
 import incompatibleWorkerUrl from "./incompatible-worker.ts?sharedworker&url";
+import { Events, PageRpc, TransferRpc, WorkerRpc } from "./contracts.ts";
 
 declare global {
   interface Window {
@@ -38,25 +39,37 @@ function updateTerminalReady(
   };
 }
 
+const pagePlugin = definePlugin({
+  id: "browser-window-page",
+  provides: [PageRpc] as const,
+  startup: "required" as const,
+  setup(ctx) {
+    ctx.handle(PageRpc, (request) => ({ result: `page:${request.value}` }));
+  },
+});
+
 void (async () => {
   let runtime: Awaited<ReturnType<typeof connectSharedWorker>> | undefined;
   let app: Awaited<ReturnType<typeof createWindowApp>> | undefined;
   try {
+    if (scenario !== "terminal-late" && scenario !== "protocol-mismatch") {
+      app = await createWindowApp({ plugins: [pagePlugin] });
+    }
     runtime = connectSharedWorker({
       id: "browser-fixture-runtime",
       url: selectedWorkerUrl,
       defaultCallTimeoutMs: 5_000,
+      ...(app ? { client: { app, expose: [PageRpc] as const } } : {}),
     });
     if (scenario === "terminal-trigger" || scenario === "terminal-observer") {
       // A synchronous handle is not yet a physical connection. Wait for the
       // first Runtime snapshot so the barrier exposes an actual port.
-      await waitFor(() => runtime!.runtimeInstanceId !== undefined);
+      await waitFor(() => runtime!.runtimeInstanceId !== "");
       updateTerminalReady({ connected: true });
     }
     if (scenario === "protocol-mismatch") {
-      const proxy = runtime.capability("fixture.worker", { contractVersion: "fixture.worker.v1" });
       try {
-        await proxy.call({}, { timeoutMs: 1_000 });
+        await runtime.capability(WorkerRpc).call({ type: "health" }, { timeoutMs: 1_000 });
         throw new Error("incompatible fixture unexpectedly completed a call");
       } catch (error) {
         if (!(error instanceof Error) || !/protocol/i.test(error.message)) throw error;
@@ -73,7 +86,7 @@ void (async () => {
     if (scenario === "terminal-late") {
       const states: string[] = [];
       const removeSubscription = runtime.subscribe((snapshot) => states.push(snapshot.state));
-      await waitFor(() => states.includes("disposed"));
+      await waitFor(() => states.includes("disposed") || states.includes("failed"));
       removeSubscription();
       publish({
         ok: states.includes("disposed") && !states.includes("stopping"),
@@ -83,36 +96,9 @@ void (async () => {
       });
       return;
     }
-    app = await createWindowApp({
-      remoteRuntime: runtime,
-      plugins: [definePlugin({
-        id: "browser-window-consumer",
-        dependencies: [{
-          capability: "fixture.worker",
-          contractVersion: "fixture.worker.v1",
-          sourceRuntime: "shared-worker",
-        }],
-        provides: ["fixture.window"],
-        setup(ctx) {
-          const worker = ctx.serviceBridge?.requireProxy({
-            capabilityId: "fixture.worker",
-            contractVersion: "fixture.worker.v1",
-            runtime: "shared-worker",
-          }, ctx.scope);
-          if (!worker) throw new Error("SharedWorker service bridge is unavailable");
-          ctx.provide("fixture.window", worker);
-        },
-      })],
-    });
-    await waitFor(() => app?.state().units.some((unit) => unit.state === "enabled"));
-    const callWindowService = async (): Promise<{ result: Record<string, unknown>; serviceInstanceId?: string }> => {
-      const proxy = app!.capability<{
-        call: (request: unknown, options?: { timeoutMs?: number }) => Promise<Record<string, unknown>>;
-        reference?: { serviceInstanceId: string };
-      }>("fixture.window");
-      const result = await proxy.call({}, { timeoutMs: 5_000 });
-      return { result, serviceInstanceId: proxy.reference?.serviceInstanceId };
-    };
+
+    const worker = runtime.capability(WorkerRpc);
+    const callWorker = async (request: { type?: string; reverse?: boolean }) => worker.call(request, { timeoutMs: 5_000 });
     if (scenario === "terminal-trigger" || scenario === "terminal-observer") {
       await waitFor(() => runtime!.state().state === "ready");
       updateTerminalReady({ runtimeReady: true });
@@ -127,21 +113,20 @@ void (async () => {
             resolve();
           };
         });
-        const shutdownProxy = runtime.capability("fixture.worker", { contractVersion: "fixture.worker.v1" });
-        await shutdownProxy.call({ type: "shutdown" }, { timeoutMs: 2_000 });
+        await callWorker({ type: "shutdown" });
       }
-      await waitFor(() => states.includes("stopping") && states.includes("disposed"));
-      const oldProxy = runtime.capability("fixture.worker", { contractVersion: "fixture.worker.v1" });
+      await waitFor(() => states.includes("stopping") && (states.includes("disposed") || states.includes("disconnected")));
+      const oldProxy = runtime.capability(WorkerRpc);
       const startedAt = performance.now();
       try {
-        await oldProxy.call({}, { timeoutMs: 2_000 });
+        await oldProxy.call({ type: "health" }, { timeoutMs: 2_000 });
       } catch (error) {
         oldProxyError = (error as Error & { code?: unknown }).code as string | undefined;
       }
       const elapsedMs = performance.now() - startedAt;
       removeSubscription();
       publish({
-        ok: states.includes("stopping") && states.includes("disposed")
+        ok: states.includes("stopping") && (states.includes("disposed") || states.includes("disconnected"))
           && oldProxyError !== undefined && elapsedMs < 500,
         scenario,
         workerUrl: selectedWorkerUrl,
@@ -154,12 +139,13 @@ void (async () => {
     }
     if (scenario === "reconnect") {
       const firstRuntime = runtime;
-      const firstCall = await callWindowService();
-      const firstRuntimeInstanceId = firstRuntime.runtimeInstanceId;
+      const firstServiceInstanceId = firstRuntime.state().services.find((service) => service.capabilityId === WorkerRpc.id)?.serviceInstanceId;
+      const firstProxy = firstRuntime.capability(WorkerRpc);
+      const firstResult = await callWorker({ type: "health", reverse: true });
       await firstRuntime.dispose("browser fixture explicit reconnect");
       let oldProxyError: string | undefined;
       try {
-        await app!.capability<{ call: (request: unknown) => Promise<unknown> }>("fixture.window").call({});
+        await firstProxy.call({ type: "health" });
       } catch (error) {
         oldProxyError = (error as Error & { code?: unknown }).code as string | undefined;
       }
@@ -167,34 +153,54 @@ void (async () => {
         id: "browser-fixture-runtime",
         url: workerUrl,
         defaultCallTimeoutMs: 5_000,
+        ...(app ? { client: { app, expose: [PageRpc] as const } } : {}),
       });
-      const secondProxy = runtime.capability("fixture.worker", { contractVersion: "fixture.worker.v1" });
-      const secondResult = await secondProxy.call< Record<string, never>, Record<string, unknown>>({}, { timeoutMs: 5_000 });
+      const secondProxy = runtime.capability(WorkerRpc);
+      const secondResult = await secondProxy.call({ type: "health" });
+      const secondServiceInstanceId = runtime.state().services.find((service) => service.capabilityId === WorkerRpc.id)?.serviceInstanceId;
       publish({
         ok: true,
         scenario,
         workerUrl,
-        firstRuntimeInstanceId,
+        firstRuntimeInstanceId: firstRuntime.runtimeInstanceId,
         secondRuntimeInstanceId: runtime.runtimeInstanceId,
-        firstServiceInstanceId: firstCall.serviceInstanceId,
-        secondServiceInstanceId: secondProxy.reference?.serviceInstanceId,
+        firstServiceInstanceId,
+        secondServiceInstanceId,
         oldProxyError,
         reconnected: firstRuntime !== runtime,
+        firstReverseResult: firstResult.reverseResult,
         ...secondResult,
-        runtimeInstanceId: runtime.runtimeInstanceId,
       });
       return;
     }
-    const { result, serviceInstanceId } = await callWindowService();
+
+    await waitFor(() => runtime!.state().state === "ready");
+    const workerResult = await callWorker({ type: "health", reverse: true });
+    const transferBuffer = new ArrayBuffer(8);
+    new Uint8Array(transferBuffer)[0] = 7;
+    const transferResult = await runtime.capability(TransferRpc).call({ buffer: transferBuffer });
+    const streamValues: number[] = [];
+    const stream = runtime.capability(Events).subscribe({ count: 3 }, {
+      initialCredit: 1,
+      onNext: (value) => { streamValues.push(value); },
+      timeoutMs: 5_000,
+    });
+    await stream.ready;
+    await stream.closed;
+    const serviceInstanceId = runtime.state().services.find((service) => service.capabilityId === WorkerRpc.id)?.serviceInstanceId;
     publish({
       ok: true,
       scenario,
-      workerUrl,
-      windowRealm: "document" in globalThis && "window" in globalThis ? "Window" : "unknown",
-      ...result,
+      workerUrl: selectedWorkerUrl,
+      windowRealm: "Window",
+      ...workerResult,
+      reverseResult: workerResult.reverseResult,
+      streamValues,
+      transferDetached: transferBuffer.byteLength === 0,
+      transferByteLength: transferResult.byteLength,
       runtimeInstanceId: runtime.runtimeInstanceId,
       serviceInstanceId,
-      windowRuntimeInstanceId: app.runtimeInstanceId,
+      windowRuntimeInstanceId: app?.runtimeInstanceId,
     });
   } catch (error) {
     publish({

@@ -1,5 +1,7 @@
 // WebLoom 通用资源缓存契约。
 
+import { defineCapability } from "./capability.js";
+
 /** 资源键：稳定、可比较且不含秘密的字符串元组。 */
 export type ResourceKey = readonly [resourceId: string, ...parts: readonly string[]];
 
@@ -66,5 +68,9 @@ export interface ResourceRegistry {
   _ids(): string[];
 }
 
-/** Resource Registry 的 capability 标识。 */
-export const RESOURCE_REGISTRY_CAPABILITY = "webloom.resource.registry";
+/** Host 内置的 typed Resource Registry capability。 */
+export const RESOURCE_REGISTRY = defineCapability<ResourceRegistry>({
+  kind: "local",
+  id: "webloom.resource.registry",
+  version: "1",
+});

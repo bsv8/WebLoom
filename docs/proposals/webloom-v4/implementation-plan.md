@@ -1,9 +1,10 @@
 # WebLoom v4 三仓施工单
 
-- 状态：全部待实施；勾选框仅在对应证据齐全后勾选。
+- 状态：源码已有未提交实施；已执行结果见 verification.md，外部与产品验收仍按该文件标为未关闭。2026-09-10 设计冻结修订。
 - 规范：[需求与设计](./requirements.md)，V4-R01–V4-R16。
 - 交付版本：`webloom-framework@0.4.0`，唯一 wire `webloom.runtime.v1`。
-- 本轮只编写文档；以下程序任务与命令均为后续实施要求，不能作为已执行记录。
+- 当前工作树已有未提交实施；本文件记录冻结任务与验收要求，已执行证据统一见
+  [verification.md](./verification.md)。任务勾选只表示对应证据已关闭，不把未勾选理解为工作树没有实现。
 
 ## 1. 执行规则与依赖顺序
 
@@ -11,11 +12,15 @@
 
 保留用户现有工作树；先记录三仓 diff，再在原有修改上增量施工。任务拆分是职责边界，不授权覆盖其他任务/用户修改。实施期间发现基线漂移，以当前源码补充清单，不复原旧快照。
 
+当前已提交 proposal 为 `4d3a1f6`，历史 review commit 3781738 只用于比较。2026-09-10 读取的工作树 package.json 已是 0.4.0，contracts/runtime/transport 等有大规模未提交修改。V4-001 必须对这批修改逐项归属任务并保存 staged/unstaged/untracked 的内容指纹，再继续增量施工；不 checkout 旧 commit 重开实现。
+
+wire 命名不再作为待决项：按用户决定固定 `webloom.runtime.v1`。源码检查里的 v2 是前期开发版本，不触发生产升级兼容或新 family 设计。
+
 主依赖链：
 
 ```text
 001 基线
- └─002 契约 →003 插件/Host →004 调用可靠性 →005 双向 peer
+ └─002 契约 →003 插件/Host →004a 共同模型冻结 →004b 调用可靠性 →005 双向 peer
                                              ├─006 transfer →007 stream
                                              └─008 Scope →009 诊断 →010 React
 002–010 →011 入口/包 →012 Keymaster 契约 →013 Keymaster Host
@@ -24,6 +29,8 @@
 011 →017 Demo
 004–017 →018 三仓验收/消融 →019 发布闭环
 ```
+
+004a 是 V4-004 内的前置验收门，不新增/重排已有任务编号：先冻结 unary/stream 共用 wire union、调用终止、transfer 资源账本与配额，再由 004b/005/006/007 实现各部分。不能把 stream 的 Promise/credit 语义留到 007 才反向重写 transport。
 
 其中 012 的业务清单可在 001 后提前整理，但不能在 005–007 公共契约未确定时做旧消息包装实现。每个任务完成后跑针对性验证；最后执行三仓门禁。不可通过降低旧测试覆盖率或放宽安全断言解决失败。
 
@@ -71,7 +78,7 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 
 ### V4-001 · 固定工作基线与可复现回归
 
-- [ ] 记录三仓 HEAD、git status、已有 diff，列出用户改动，不混入本轮基线“修复”。
+- [ ] 记录三仓 HEAD、git status、staged/unstaged diff 和 untracked 文件内容指纹；列出已有实现归属及未验证项目。保留用户改动，不拿 3781738 或仅 HEAD 作为当前工作基线。
 - [ ] 完整搜索 WebLoom import/re-export、字符串 capability、旧 Runtime hooks、raw 主 RPC、transfer 及订阅调用点，形成带文件/符号的 migration inventory。
 - [ ] 运行三仓可用的现有 typecheck/test/build，保存失败原因与日志；已存在失败标记 baseline，不伪称本轮引入。
 - [ ] 为 review 四问题建立“修复前确实失败”的生产路径回归，保留确定性时序；不要靠 20ms MessageChannel 竞争证明错误响应匹配。
@@ -84,7 +91,7 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 
 - [ ] 实现 defineCapability 的 local/rpc/stream 判别联合；id/version 必填，parser、transfer 函数与静态 DTO 分离。
 - [ ] 实现契约类型推导、RpcClient/StreamClient、ValueParser；禁止消费端覆盖请求/结果泛型。
-- [ ] 定义静态 identity 比较、重复/歧义检查；各 realm 可分别导入相同契约模块，不依赖引用相等。
+- [ ] 定义静态 identity 比较、重复/歧义检查；各 realm 可分别导入相同契约模块，不依赖引用相等。新增构建期 contract inventory 与差异门禁，记录 parser/依赖指纹及契约用例版本；不使用 Function.toString 判语义，不增 wire schemaId。
 - [ ] 删除 `.v1` 默认版本推导及 providedContracts helper；更新测试中的显式契约。
 - [ ] 在 sender/receiver 的 request、response、item 边界使用 parser。错误统一脱敏。
 
@@ -106,7 +113,15 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 
 覆盖 V4-R08；负责 serviceBridge/transport/provider。
 
-- [ ] 建立唯一 settle/revoke 路径，cancel、timeout、替换、dispose 同步删除 pending 并移除监听/timer。
+**004a 必须先过的共同模型门：**
+
+- [ ] 冻结 unary/stream 判别 wire union（含 streamReady/done 互斥）、waiting/dispatched/opening/active/draining/terminal 状态、单次 settle 与 first-terminal-wins。
+- [ ] 冻结需求 6.4 的 limits/计费/执行槽，7.1–7.2 的共用 DTO walker 和 receive-port 账本接口，8.1 完整终止矩阵。advanced/fake transport 的 receive metadata 不得漏 ports。
+- [ ] 给出模型测试：ready 前后 cancel、done 排队、onNext 中 revoke、return 不配合、clone/ready post 失败、配额原子预留与释放。此步固定公共边界，后续实现不得分叉出第二份 pending/资源清理规则。
+
+**004b 调用可靠性实现：**
+
+- [ ] 建立唯一 settle/revoke 路径，cancel、timeout、替换、dispose 同步删除 pending 并移除监听/timer；仍执行的 handler/iterator/callback 保留独立有界执行槽与预算，不因取消提前释放准入额度。
 - [ ] handler 永不 settle 时仍回收框架 Map；业务闭包可能继续存活的边界在文档说明。
 - [ ] 保留记录对象身份与授权/实例 fence，迟到 finally 不能删除其他调用，迟到结果不能恢复旧代理。
 - [ ] failed/stopping/disposed 统一撤销，矛盾快照整份拒绝。
@@ -114,14 +129,16 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 - [ ] result clone/validation 失败返回结构化错误，不能 best-effort 吞掉正常响应错误。
 - [ ] 清理空 message listener、无作用 decode、startupError 存储及重复 proxy alias。
 
-验收：四条 review 回归全部转绿；100 次“不配合 handler + cancel”之后本端 pending/timer/listener 计数归零；错 serviceInstanceId/旧 callId 响应不能 settle；无自动重发。内存断言针对框架拥有的记录，不宣称 JS 可以终止任意 Promise。
+验收：四条 review 回归全部转绿；按 limits 发起“不配合 handler + cancel”，pending/每调用 timer/listener 计数归零；未结束执行槽达到上限后，新调用必须被拒绝，不能通过重复 cancel 绕过；错 serviceInstanceId/旧 callId 响应不能 settle；无自动重发。内存断言针对框架拥有的记录，不宣称 JS 可以终止任意 Promise。
 
 ### V4-005 · 双向 peer、暴露与紧凑快照
 
 覆盖 V4-R04、R13；负责 Runtime、Host exposure 与 wire schema。
 
 - [ ] 实现 connectSharedWorker 的 client.app/expose，startSharedWorkerApp 的 expose/configurePeer。
-- [ ] 实现 PeerHandle、peer.scope、capability/expose/inspect 与 exposure revoke；Runtime 主 port 始终私有。
+- [ ] 实现独立冻结的 PeerView/PeerScopeView 与 PeerController；View 无 expose/管理 inspect，scope 无 revoke/dispose/child 等方法。禁止仅通过 as/接口缩窄隐藏同一管理对象；Runtime 主 port 始终私有。
+- [ ] View 身份来自当前框架连接，对端 runtime 未观察时为 undefined；普通反向 capability 按 source: peer 消费声明收窄，不能把逐 peer 依赖放进全局 Worker 启动依赖图。
+- [ ] configurePeer 的 controller 仅存可信 host-owned sessions 私有闭包；SessionOpen 按需求 5.3 用注入的 peerId 找 live controller、完成领域授权及 await 后 fence，exposeGroup 原子提交 allowlist 内 owner/crypto，再发送成功结果。失败/重入/过期 open 不部分开放。
 - [ ] Window/Worker 同一端口均可发起调用，方向独立关联；反向能力只绑定当前 peer。
 - [ ] exposure 同时绑定 plugin/peer/领域 scope；授权异步返回后再检查，授权变化 revoke+新 serviceInstanceId。
 - [ ] 实现 per-peer revision 的紧凑完整快照：仅 ready services，省略重复 runtime/runtimeInstanceId/status；Window→Worker 快照同规则。
@@ -136,10 +153,12 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 
 覆盖 V4-R05；负责契约 adapters/transport/provider/真实 fixture。
 
-- [ ] 按 request/response/item descriptor 提取去重 transferable，验证可达性与允许类型。
-- [ ] sender parser → transfer extractor → post，receiver parser → handler/consumer 的顺序固定。
+- [ ] RPC request/response 与 stream request/item 全部支持对应 TransferDescriptor 泛型；给 stream 订阅请求 buffer/port 加正向类型及 browser 所有权用例。
+- [ ] 按需求 7.1 的有限 DTO 图实现同一 walker：容器白名单、拒绝循环/accessor、DAG 别名与最长深度、view/backing-buffer、节点/边/字节及 transfer 数量；不承诺无副作用检测任意 Proxy。
+- [ ] sender 原始图检查 → parser → 规范化图/quota → extractor → post；receiver 先登记 event.ports → 图/quota/schema → parser → 授权/handler。parser 必须保持 port 身份集合；unsupported 容器在调用适配处先转为 DTO。
 - [ ] 删除 call 级 transfer 数组、Runtime 裸端口 escape hatch；业务自有 port 必须有明确契约及关闭责任。
-- [ ] 实现迟到 transferable 资源清理，特别是不再交付的 MessagePort；不自动重传 detached 数据。
+- [ ] transport 独占接收 port 账本；覆盖未知消息、解析失败、超深超量、未知 callId、错身份、迟到结果/item、未开始回调的排队项清理。只在正式交付 handler/消费者时移交业务关闭责任，不因后续 cancel 抢回已交付 port。
+- [ ] advanced/fake transport 保持 data 与 receive ports 的对象身份；messageerror 未交给 JS 的资源不伪称已清理。不自动重传 detached 数据。
 - [ ] 发送正常响应失败时发可克隆结构化错误；故障细节脱敏。
 
 验收：真实 Chromium 验证 request/result buffer detach、多个视图同属一个 buffer、重复 transfer 去重、不可达 port 拒绝、发送前取消不 detach、发送后取消不恢复、Worker 退出/服务替换后迟到资源不交付。不能只用 structuredClone 单元测试替代 browser postMessage。
@@ -152,7 +171,8 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 - [ ] 实现 call/streamReady/next/credit/done/error/cancel 唯一 schema，不能另造产品级事件 transport。
 - [ ] 默认 credit 16、最大 256；next sequence 连续；consumer 回调完成再补 credit；producer 无 credit 不拉 iterator。
 - [ ] 提供有界 push→AsyncIterable 适配 helper（advanced/testing 可用），overflow 终止，不静默丢失。
-- [ ] ready 仅受建立 deadline；活跃流受 scope/signal/cancel；拒绝与消费者未观察 Promise 的清理行为明确。
+- [ ] 按需求 8.1 逐行实现 Promise 矩阵：ready 前 cancel 两 Promise 拒绝；ready post 失败 producer 立即清理但 consumer 按错误/断线/deadline 收敛；done 等已接收 item 消费完成；draining 可被取消。
+- [ ] 单订阅 onNext 串行；onNext 中 revoke 立即拒绝 closed、不补 credit、不等不配合回调；return 最多一次且 rejection 被处理；cancel reason 不进入 wire/error/日志。
 - [ ] 取消立即移除 framework pending；iterator.return 不配合不能阻止本端回收。
 
 验收：慢消费者不产生无界队列；第 257 个非法 credit 被拒绝；无 credit 不继续生产；错误/重复 sequence 终止；一个回调失败不影响其他 stream；取消后新 item 不调用旧消费者；两页面不共享可转移载荷所有权；服务重建需显式新订阅。
@@ -175,6 +195,7 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 - [ ] 实现 inspect/explain，稳定原因码、确定性顺序、依赖环截断、unknown 身份处理。
 - [ ] 暴露 framework-owned pendingCallCount/activeStreamCount/peerCount，不暴露业务载荷或 grant token。
 - [ ] 从已有状态派生，删除“复制所有状态再维护一份”的实现路线。
+- [ ] 区分 local 与 remote-projection/stale；对未见服务的 missing/unauthorized 统一 capability_unavailable。units/graph 同样做公开投影，防止诊断泄露隐藏 provider/版本/授权原因。
 - [ ] 统一错误 code/phase/context；超时不能被描述为服务端确定未执行。
 
 验收：缺 provider、契约不匹配、scope 撤销、Worker 断开、required 初始化失败均有准确原因链；注入密码/密钥/headers 请求后诊断与错误快照不含该载荷；诊断读取不改变 revision/调用次数。
@@ -209,7 +230,7 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 覆盖 V4-R14；负责 packages/contracts 及新增专用契约模块。
 
 - [ ] 将 001 inventory 中每个 Coordinator request kind、response、event、reverse I/O、transfer 列成迁移表：旧符号 → 新 contract → parser → handler → caller → 测试。
-- [ ] 按领域组织 contracts（session、storage、crypto、events、executor）；无需“一方法一个文件”，但每个请求/结果必须保持类型对应关系。
+- [ ] 按领域组织 contracts（session、storage、crypto、events、executor）；无需“一方法一个文件”，但每个请求/结果必须保持类型对应关系。记录现有合法最大载荷/并发/超时与容器类型，对照 6.4/7.1；超限路径须明确分块、限流或先修订预算再验收，不能将正常产品操作直接变成运行时报错后宣称迁移完成。
 - [ ] 使用现有生产 parser/领域检查；若领域类型没有 parser，在领域层补齐，不把 owner/CAS 等规则移入 WebLoom。
 - [ ] 从业务 metadata 提取 bootstrapStage/scopeKind，迁到 contribution/领域 catalog。保留明确的四阶段排序来源。
 - [ ] 标明真实保留的独立 P2P/Connect/媒体协议，不以全局 grep 删除它们的合法 connectionId/requestId/handshake。
@@ -233,7 +254,7 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 覆盖 V4-R03–R06、R08、R14；负责 client/worker 及关联测试。
 
 - [ ] 所有主请求改 typed capability，保留产品 facade 名称时内部直接消费 v4；删除 sendRequest pending/raw 主 listener。
-- [ ] session.open/close、activity、refresh bootstrap 是 typed RPC，不再创建/传递 servicePort 或 LocalStorageBridge port。
+- [ ] session.open/close、activity、refresh bootstrap 是 typed RPC，不再创建/传递 servicePort 或 LocalStorageBridge port。SessionOpen 管理授权在 host-owned sessions closure 中；普通业务 handler/call.peer 不能开放其他 Host 能力，scope 也不能撤销整个 peer。
 - [ ] 旧 subscribeTopic/broadcast 实现改 typed stream；产品 facade 可转接 typed stream，但不得保留旧 event wire。
 - [ ] 建立监听与初始状态读取原子顺序；重订阅从产品新快照恢复，不静默补造遗漏事件。
 - [ ] owner/crypto 等敏感 capability 按 peer 授权后 expose，lock/owner/bucket/grant 变化同步 revoke，必要时建立全新 exposure。
@@ -284,9 +305,10 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 
 覆盖 V4-R01、R13、R16。
 
-- [ ] 执行第 4 节 AT-01–20、AT-22 的发布前验收，记录 commit、产物 hash、浏览器版本、运行方式、结果与失败日志。AT-21 明确留给 019 发布后验收，不作为上传前循环依赖。
+- [ ] 执行第 4 节 AT-01–20、AT-22–30 的发布前验收，记录 commit、产物 hash、浏览器版本、运行方式、结果与失败日志。AT-21 明确留给 019 发布后验收，不作为上传前循环依赖。
 - [ ] 旧 API/wire 正反例检查；显式拒绝旧协议，不能依赖“旧客户端大概会超时”。无法解析的第三方垃圾消息仍按定义忽略/本次 deadline 收敛。
-- [ ] 重跑必要消融，确保 deadline、cancel、实例匹配、原子目录、同步 revoke 的测试能检测移除机制。
+- [ ] 重跑必要消融，确保 deadline、cancel、实例匹配、原子目录、同步 revoke 的测试能检测移除机制；新增权限/配额/资源账本用例不能只断言类型表面不存在字段。
+- [ ] Chromium 全量真实测试记录精确版本/平台；Firefox、真实 Safari 与 Playwright WebKit 分别记录通过/失败/未验收，不能混写或推断支持。产品承诺支持的平台未过时，阻止该产品对应发布宣传。
 - [ ] 全库 static inventory 收尾：只允许历史文档与拒绝旧协议的测试出现旧 token，例外精确到文件/用途，不设任意目录通配。
 - [ ] 对 ready-only compact snapshots、公共基础快照构建与 React render 数量保存测量基准；不报告未经测量的速度倍数。
 - [ ] 单元/模拟、浏览器、三仓 tarball、registry/生产分别标状态；有一层未完成不得写“全部完成”。
@@ -331,6 +353,14 @@ Keymaster 当前 owner/crypto 目录会发布 `status: unavailable`。迁移时�
 | AT-20 | 四入口 tarball 类型/runtime；core 无 React；三仓同一产物且无本地路径/旧版本 | R01/R12/R16 | 打包消费 |
 | AT-21 | registry integrity 与已测包一致，下游 frozen install/发布门禁通过 | R01/R16 | registry 消费 |
 | AT-22 | 关闭 cancel/deadline/实例过滤/目录校验/revoke 后对应测试必须失败；恢复后通过 | R08/R16 | 临时副本消融 |
+| AT-23 | 普通 handler 在运行时也无 expose/controller/revoke scope；越界反向能力被拒；SessionOpen 仅宿主管理、双 exposure 原子提交、旧 open 不复活 | R03/R04/R14 | 类型 + 单元 + 产品浏览器 |
+| AT-24 | stream request 的 buffer/业务 port 在 post 后转移；ready 前 cancel、验证失败/结果未知保持约定所有权 | R05/R06 | 类型 + 真实浏览器 |
+| AT-25 | DTO 容器/循环/DAG/getter/最长深度/多 view 规则；unknown/超限/parser 丢 port/迟到 item 时 event.ports 未移交项关闭 | R05/R08 | 单元 + 真实浏览器 |
+| AT-26 | limits 的 N/N+1、原子预留、pending/stream/执行槽/字节释放；重复取消不绕上限、单 peer 超限不撤销其他 peer | R08/R10/R16 | 可控异步 + 多 peer 浏览器 |
+| AT-27 | 需求 8.1 每行状态矩阵、done 有在途回调、draining 再 cancel、return 永不结束、cancel reason 脱敏 | R06/R08 | 状态模型 + 单元 + 浏览器 |
+| AT-28 | parser/依赖指纹变动触发 contract inventory 审阅；业务行为改动必须升 version，纯重构需证据 | R02/R16 | 构建/契约用例 |
+| AT-29 | 未 exposure 能力的 missing/unauthorized 对端不可区分；units/graph 无侧漏；远端状态注明投影与 stale | R04/R10 | 单元 + 多 peer |
+| AT-30 | Chromium 完整证据与精确版本；Firefox/Safari/WebKit 分别记验收状态；unsupported 不落入假 Runtime fallback | R15/R16 | 浏览器兼容报告 |
 
 R 编号均指需求文件中的 V4-Rxx。AT-17/18 的外部 S3、公开服务等条件缺失时标记未验收；不得用 mock 通过替代。已有 Keymaster release 门禁保持原力度。
 
@@ -408,6 +438,6 @@ pnpm verify:lifecycle-release
 
 ## 7. 完成定义
 
-仅当 V4-001–019 和 AT-01–22 所需证据全部满足，才能称“三仓 v4 迭代完成”。如果只完成代码与本地验收，最终报告必须准确写到该层。
+仅当 V4-001–019 和 AT-01–30 所需证据全部满足，才能称“三仓 v4 迭代完成”。如果只完成代码与本地验收，最终报告必须准确写到该层。
 
 最终交付包含：三仓代码/依赖/教程变更、需求与施工单状态更新、verification 证据、旧 API 清除报告、同一 tarball/registry integrity、产品恢复与部署状态。没有额外的“以后再去掉兼容层”或 SWCF-009 尾项。
