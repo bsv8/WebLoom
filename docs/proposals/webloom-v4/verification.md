@@ -84,9 +84,15 @@ registry-only frozen install。用户已确认 0.4.0 已发布，本轮不重复
   审计均通过。
 - `git diff --check`：通过。
 
-上述 Keymaster type/test/build 证据使用本地依赖树。Local/S3 真实浏览器、CORS/CAS、重启、
-多 tab、恢复、app-view 外部环境和公开部署仍需产品环境证据；单元测试通过不等价于这些
-验收已经关闭。
+另外，在提交 `1edc117` 的 detached 临时 checkout 中执行
+`pnpm install --frozen-lockfile --ignore-scripts && pnpm test:types && pnpm test`：安装
+成功，`test:types` 通过，随后 216 个测试文件（18 个常规批次加 2 个重型隔离批次）全部
+通过。该 fresh-install 结果也覆盖了 `@keymaster/plugin-token-bsv21` 对
+`@noble/secp256k1` 的直接声明，以及根测试 setup 对 `@noble/secp256k1` 和
+`@noble/hashes` 的直接声明。
+
+Local/S3 真实浏览器、CORS/CAS、重启、多 tab、恢复、app-view 外部环境和公开部署仍需
+产品环境证据；单元测试和 fresh-install 通过不等价于这些验收已经关闭。
 
 ## 4. 发布与 registry 边界
 
