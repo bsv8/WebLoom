@@ -34,6 +34,12 @@ const sourceRootOptions = optionValues("--source-root");
 const sourceRoots = sourceRootOptions.length > 0
   ? sourceRootOptions.map((sourceRoot) => resolve(root, sourceRoot))
   : [resolve(root, "src")];
+const baselineRefValues = optionValues("--baseline-ref");
+if (baselineRefValues.length > 1 || (args.has("--baseline-ref") && baselineRefValues.length === 0)) {
+  throw new Error("--baseline-ref requires exactly one Git ref");
+}
+const baselineRef = baselineRefValues[0] ?? "HEAD";
+const hasExplicitBaselineRef = baselineRefValues.length === 1;
 
 const sourceExtensions = [".ts", ".tsx"];
 const sourceFilePattern = /\.(?:ts|tsx)$/u;
@@ -335,9 +341,16 @@ async function readInventory() {
   }
 }
 
-async function readHeadInventory() {
+async function readBaselineInventory() {
+  if (hasExplicitBaselineRef) {
+    try {
+      await execFileAsync("git", ["rev-parse", "--verify", `${baselineRef}^{commit}`], { cwd: root, maxBuffer: 2 * 1024 * 1024 });
+    } catch {
+      throw new Error(`Cannot resolve contract inventory baseline ref ${JSON.stringify(baselineRef)}`);
+    }
+  }
   try {
-    const { stdout } = await execFileAsync("git", ["show", `HEAD:${rel(inventoryPath)}`], { cwd: root, maxBuffer: 2 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("git", ["show", `${baselineRef}:${rel(inventoryPath)}`], { cwd: root, maxBuffer: 2 * 1024 * 1024 });
     const value = JSON.parse(stdout);
     return value?.schemaVersion === 1 && Array.isArray(value.entries) ? value : undefined;
   } catch {
@@ -429,7 +442,7 @@ if (args.has("--print")) {
   console.log(JSON.stringify({ schemaVersion: 1, entries: sortEntries(observed).map(normalizeEntry) }, null, 2));
   process.exitCode = scanned.errors.length > 0 ? 1 : 0;
 } else {
-  const errors = [...scanned.errors, ...compareInventory(observed, inventory, await readHeadInventory())];
+  const errors = [...scanned.errors, ...compareInventory(observed, inventory, await readBaselineInventory())];
   if (errors.length > 0) {
     console.error(errors.join("\n"));
     process.exitCode = 1;

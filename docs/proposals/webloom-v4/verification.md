@@ -10,9 +10,11 @@
 
 以下本地门禁均通过：
 
-- `pnpm test:types`：TypeScript 检查、`.typecheck.ts` 负向类型 fixture 和契约 inventory
-  gate 通过；正式源码 inventory 为 1 个 capability identity。负向 fixture 覆盖错误
-  request/response/item、local capability 跨 Runtime、错误 parser 和旧字符串获取。
+- `pnpm test:types`：TypeScript 检查、`.typecheck.ts` 负向类型 fixture、契约 inventory
+  gate 和临时 Git 基线回归自测均通过；正式源码 inventory 为 1 个 capability identity。
+  负向 fixture 覆盖错误 request/response/item、local capability 跨 Runtime、错误 parser
+  和旧字符串获取。基线自测验证“源码与 inventory 同时进入新 HEAD、但
+  `contractTestVersion` 未变”会在显式旧 commit 基线下失败。
 - `pnpm test -- --reporter=dot`：17 个测试文件、106 个测试通过。
 - `pnpm vitest run src/runtime/v4Acceptance.test.ts --reporter=verbose`：9 个 v4 acceptance
   测试通过，包括 AT-16。
@@ -46,6 +48,14 @@ Safari 和 Playwright WebKit 本轮未执行，不能宣称兼容性已验收。
 AT-16 的 `1/10/100 services × 1/2/10 peers` 测量在 `v4Acceptance.test.ts` 中执行：每次
 广播只构建一个公共 base snapshot，wire 侧按 peer 投影 grant，且不重复公开 runtime 字段。
 
+### Contract inventory 基线策略
+
+本地 `node scripts/check-contract-inventory.mjs` 保持以当前 `HEAD` 作为默认基线，便于
+检查未提交工作树。提交级 CI 应执行 `pnpm run test:contract-inventory:ci`：它优先使用
+`CONTRACT_INVENTORY_BASELINE_REF` 或 GitHub Actions 的 `GITHUB_BASE_SHA`，否则使用
+`git merge-base HEAD origin/main`，最终显式传入 `--baseline-ref <sha>`。该门禁不会把
+包含新源码和新 inventory 的当前提交当作自己的历史基线。
+
 ## 2. DemoWebLoom
 
 以下门禁均通过：
@@ -63,8 +73,9 @@ registry-only frozen install。用户已确认 0.4.0 已发布，本轮不重复
 
 以下本地代码门禁均通过：
 
-- `pnpm test:types`：`tsc -b` 与 Keymaster contract inventory gate 通过，inventory 为
-  75 个 identity；Coordinator response/result 负向类型 fixture 通过编译保护。
+- `pnpm test:types`：`tsc -b`、Keymaster contract inventory gate 和临时 Git 基线回归自测
+  通过，inventory 为 75 个 identity；Coordinator response/result 负向类型 fixture 通过
+  编译保护。
 - `pnpm test`：216 个测试文件全部通过（18 个常规批次加 2 个重型隔离批次）；其中
   Coordinator worker 113 tests、Vault service 79 tests 均通过。
 - `pnpm build`：Vite production build 通过，3982 个 module transformed；生产产物扫描
@@ -79,10 +90,11 @@ registry-only frozen install。用户已确认 0.4.0 已发布，本轮不重复
 
 ## 4. 发布与 registry 边界
 
-按用户提供的当前外部状态，`webloom-framework@0.4.0` 已发布；本轮不再运行 npm publish、
-registry release checker 或 registry-only frozen install，也不修改下游 lockfile 来伪造
-registry integrity。若日后需要重新审计，应从 registry 读取真实 `dist.integrity`，再单独
-执行三仓 frozen-install 消费验证。
+上一轮已实际完成 `webloom-framework@0.4.0` 的 registry integrity、Keymaster/Demo
+lockfile 一致性、release-boundary 和 registry-only consumer 验证；用户确认该版本已发布。
+本轮只修复 Keymaster 的隔离依赖声明和 inventory 基线门禁，不重复 npm publish，也不修改
+下游 lockfile 来伪造 registry integrity。若日后需要重新审计，应从 registry 读取真实
+`dist.integrity`，再单独执行三仓 frozen-install 消费验证。
 
 ## 5. 尚未关闭的跨环境验收
 
