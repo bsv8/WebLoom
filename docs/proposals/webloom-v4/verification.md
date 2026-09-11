@@ -3,8 +3,9 @@
 更新时间：2026-09-11（工作树验证）。本记录只写已经执行的命令和观察到的结果；
 未执行的跨浏览器、产品部署和 registry-only 验收不会由本地测试推断为通过。
 
-用户已确认 `webloom-framework@0.4.0` 已发布。本轮按要求不重复发布，也不把发布条目
-作为代码阻塞重新处理。
+用户已确认 `webloom-framework@0.4.0` 已发布。本轮针对同一 v4 wire 的 patch 版本
+`webloom-framework@0.4.1` 执行发布；发布后的 registry integrity 与消费验证将在上传后
+补记。
 
 ## 1. WebLoom 本仓库
 
@@ -67,7 +68,8 @@ AT-16 的 `1/10/100 services × 1/2/10 peers` 测量在 `v4Acceptance.test.ts` �
   service identity。
 
 Demo 的验证使用当前本地 WebLoom 工作树链接；这证明源码类型和真实浏览器交互，不替代
-registry-only frozen install。用户已确认 0.4.0 已发布，本轮不重复执行发布闭环。
+registry-only frozen install。0.4.0 是上一轮已发布基线；本轮 0.4.1 的 registry-only
+消费验证在发布后单独记录。
 
 ## 3. Keymaster
 
@@ -97,10 +99,9 @@ Local/S3 真实浏览器、CORS/CAS、重启、多 tab、恢复、app-view 外�
 ## 4. 发布与 registry 边界
 
 上一轮已实际完成 `webloom-framework@0.4.0` 的 registry integrity、Keymaster/Demo
-lockfile 一致性、release-boundary 和 registry-only consumer 验证；用户确认该版本已发布。
-本轮只修复 Keymaster 的隔离依赖声明和 inventory 基线门禁，不重复 npm publish，也不修改
-下游 lockfile 来伪造 registry integrity。若日后需要重新审计，应从 registry 读取真实
-`dist.integrity`，再单独执行三仓 frozen-install 消费验证。
+lockfile 一致性、release-boundary 和 registry-only consumer 验证；该版本是本轮的已发布
+基线。本轮发布 `webloom-framework@0.4.1`，发布后必须从 registry 读取真实 `dist.integrity`
+并单独执行三仓 frozen-install 消费验证，不能用本地 tarball 或下游 lockfile 代替。
 
 ## 5. 尚未关闭的跨环境验收
 
@@ -110,5 +111,5 @@ lockfile 一致性、release-boundary 和 registry-only consumer 验证；用户
   生产门禁没有本轮完整外部证据。
 
 因此当前结论是：本轮四类 review 代码阻塞已完成修复，WebLoom/Demo 的本地与 Chromium
-证据已补齐，0.4.0 发布条目按用户指示忽略；跨浏览器与 Keymaster 产品/部署验收仍保持
-明确的未验收状态。
+证据已补齐，0.4.1 的 registry 发布与三仓消费验证待本轮上传后补记；跨浏览器与 Keymaster
+产品/部署验收仍保持明确的未验收状态。

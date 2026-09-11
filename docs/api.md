@@ -1,6 +1,6 @@
 # WebLoom v4 API 说明
 
-WebLoom 0.4.0 只支持两个真实 JavaScript realm：`window-main` 和
+WebLoom 0.4.1 只支持两个真实 JavaScript realm：`window-main` 和
 `shared-worker`。`runtime` 是受限的 `RuntimeKind`，不是可自由填写的环境标签；不支持
 的 Runtime 在装配边界 fail closed。
 

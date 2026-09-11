@@ -1,6 +1,6 @@
 # WebLoom
 
-WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.4.0 管理真实的
+WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.4.1 管理真实的
 `window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、依赖图、
 ResourceScope、权限租约、typed capability、服务桥和资源缓存；路由、存储、日志、
 国际化等产品能力由插件或下游应用注入。

@@ -51,7 +51,7 @@ for (const directory of sourceFiles) {
 }
 
 const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-if (packageJson.version !== "0.4.0") violations.push(`package.json version is ${packageJson.version}, expected 0.4.0`);
+if (packageJson.version !== "0.4.1") violations.push(`package.json version is ${packageJson.version}, expected 0.4.1`);
 const exports = Object.keys(packageJson.exports ?? {});
 for (const entry of [".", "./advanced", "./react", "./testing"]) if (!exports.includes(entry)) violations.push(`package.json is missing export ${entry}`);
 for (const entry of exports) if (![".", "./advanced", "./react", "./testing"].includes(entry)) violations.push(`package.json exposes non-v4 entry ${entry}`);
