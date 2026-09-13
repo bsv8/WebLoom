@@ -1,7 +1,7 @@
 // v4 MessagePort provider：同一物理端口上的反向 call/stream 分派。
 
 import type { CapabilityPeer, HandlerCallContext, ServiceReference } from "../contracts/capability.js";
-import { WebLoomError, type LifecycleScope } from "../contracts/lifecycle.js";
+import { WebLoomError, type LifecycleScope, type RuntimeEndpointBinding, type RuntimeDrainResult } from "../contracts/lifecycle.js";
 import {
   assertReceivedPortSet,
   createReceivePortLedger,
@@ -28,6 +28,7 @@ import {
 } from "../runtime/runtimeProtocol.js";
 import { createMessagePortRuntimeTransport, type MessagePortLike } from "./messagePortServiceTransport.js";
 import type { RuntimeTransport } from "./serviceBridge.js";
+import { createRuntimeEndpointBinding, createRuntimeEndpointSession, sameRuntimeEndpointBinding, type RuntimeEndpointSession } from "../runtime/runtimeSession.js";
 
 export interface MessagePortServiceCallInput {
   /** 已验证的 call message；request 已由生产 parser 规范化。 */
@@ -40,6 +41,8 @@ export interface MessagePortServiceCallInput {
   readonly signal: AbortSignal;
   /** 本端以接收时钟计算的调用截止时间。 */
   readonly deadlineAt: number;
+  /** 发起此调用的物理 endpoint binding。 */
+  readonly binding: RuntimeEndpointBinding;
   /** 对端 peer 视图。 */
   readonly peer?: CapabilityPeer;
 }
@@ -78,6 +81,12 @@ export interface MessagePortServiceProviderOptions {
   readonly limits?: RuntimeLimitsInput;
   /** 可选的 Runtime 方向共享计数器。 */
   readonly budget?: RuntimeBudget;
+  /** 当前物理 endpoint 的框架 binding；省略时由 provider 生成。 */
+  readonly binding?: RuntimeEndpointBinding;
+  /** 与同一端口 bridge 共用的 endpoint session。 */
+  readonly session?: RuntimeEndpointSession;
+  /** 关闭握手默认 drain deadline。 */
+  readonly drainTimeoutMs?: number;
 }
 
 interface ActiveCall {
@@ -148,6 +157,10 @@ function safeErrorMessage(code: string): string {
 export function createMessagePortServiceProvider(options: MessagePortServiceProviderOptions): {
   setServices(): void;
   dispose(): void;
+  readonly binding: RuntimeEndpointBinding;
+  readonly endpointState: "active" | "closing" | "closed";
+  beginClose(reason?: string): void;
+  drain(timeoutMs?: number): Promise<RuntimeDrainResult>;
   pendingCount(): number;
   executionCount(): number;
   nonCooperativeExecutionCount(): number;
@@ -159,9 +172,14 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
   const configuredTransport = options.transport ?? (options.port ? createMessagePortRuntimeTransport(options.port, { limits }) : undefined);
   if (!configuredTransport) throw new TypeError("MessagePort service provider requires transport or port");
   const transport: RuntimeTransport = configuredTransport;
+  const ownsSession = options.session === undefined;
+  const session = options.session ?? createRuntimeEndpointSession(options.binding ?? createRuntimeEndpointBinding(`provider:${Date.now().toString(36)}`), { defaultDrainTimeoutMs: options.drainTimeoutMs });
+  if (options.binding && !sameRuntimeEndpointBinding(options.binding, session.binding)) throw new TypeError("MessagePort service provider binding disagrees with endpoint session");
+  const localBinding = session.binding;
   const activeCalls = new Map<string, ActiveCall>();
   const streams = new Map<string, StreamEntry>();
   const executionSlots = new Map<string, ActiveCall>();
+  const executionDrainWaiters = new Set<() => void>();
   let peerRetainedPayloadBytes = 0;
   let disposed = false;
 
@@ -189,6 +207,7 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     post(transport, codec, {
       type: RUNTIME_ERROR_MESSAGE_TYPE,
       protocolVersion: RUNTIME_PROTOCOL_VERSION,
+      binding: localBinding,
       callId: call.callId,
       serviceInstanceId: call.serviceInstanceId,
       error: { code, message: safeErrorMessage(code), phase },
@@ -204,6 +223,10 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     budget.retainedPayloadBytes = Math.max(0, budget.retainedPayloadBytes - active.requestBytes);
     active.removePeerRevoke?.();
     active.removePeerRevoke = undefined;
+    if (executionSlots.size === 0) {
+      for (const resolve of [...executionDrainWaiters]) resolve();
+      executionDrainWaiters.clear();
+    }
   };
 
   const releaseStreamReservation = (active: ActiveCall): void => {
@@ -344,14 +367,14 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
         if (entry.closed || entry.active.cancelled) break;
         if (next.done) {
           entry.iteratorDone = true;
-          if (post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: entry.call.callId, serviceInstanceId: entry.reference.serviceInstanceId, done: true })) closeStream(entry, true);
+          if (post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: entry.call.callId, serviceInstanceId: entry.reference.serviceInstanceId, done: true })) closeStream(entry, true);
           else { sendError(entry.call, "transport_unavailable", "receive"); closeStream(entry, true); }
           break;
         }
         try {
           const prepared = options.prepareItem?.(next.value, entry.call) ?? { value: next.value };
           const output = prepareOutput(prepared);
-          if (!post(transport, codec, { type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: entry.call.callId, serviceInstanceId: entry.reference.serviceInstanceId, sequence: entry.sequence, item: output.value }, output.transfer)) {
+          if (!post(transport, codec, { type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: entry.call.callId, serviceInstanceId: entry.reference.serviceInstanceId, sequence: entry.sequence, item: output.value }, output.transfer)) {
             sendError(entry.call, "response_clone_failed", "receive");
             closeStream(entry);
             break;
@@ -374,6 +397,33 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
   const onMessage = (message: RuntimeWireMessage, metadata?: import("./serviceBridge.js").RuntimeReceiveMetadata): void => {
     const ledger = metadata?.ledger ?? createReceivePortLedger(metadata?.ports, { limits, phase: "receive" });
     if (!ledger.valid) { failClose(); return; }
+
+    try {
+      // Every RuntimeTransport, including advanced/testing transports, must
+      // pass the same strict wire codec.  There is no missing-binding
+      // compatibility path here.
+      if (!metadata?.decoded) message = codec.decode(message);
+    } catch {
+      ledger.closeUndelivered();
+      failClose();
+      return;
+    }
+
+    // The transport codec checks the binding shape; the endpoint session checks
+    // that this physical port never changes peer identity mid-connection.
+    const bindingAccepted = session.acceptRemoteBinding(message.binding);
+    // A close-ack can arrive after the shared session has already transitioned
+    // to closed. Provider does not consume ACKs, but must discard this late
+    // same-binding control message without turning a completed close into a
+    // second terminal failure. A different binding is still terminal.
+    const closedKnownControl = !bindingAccepted
+      && session.state === "closed"
+      && sameRuntimeEndpointBinding(session.remoteBinding, message.binding);
+    if (!bindingAccepted && !closedKnownControl) {
+      ledger.closeUndelivered();
+      failClose();
+      return;
+    }
 
     if (message.type === RUNTIME_CANCEL_TYPE) {
       ledger.closeUndelivered();
@@ -407,10 +457,17 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     // invalid provider message and their business ports must remain available
     // to that listener.
     if (message.type !== RUNTIME_CALL_TYPE) return;
+    if (session.state !== "active" || disposed) {
+      ledger.closeUndelivered();
+      sendError(message, "service_revoked", "dispose");
+      return;
+    }
     const reference = serviceFor(message);
     if (!reference) { ledger.closeUndelivered(); sendError(message, serviceErrorCode(message), "dispatch"); return; }
     if (activeCalls.has(message.callId) || executionSlots.has(message.callId)) { ledger.closeUndelivered(); sendError(message, "invalid_message", "dispatch"); return; }
-    if (message.grantId !== undefined && message.grantId !== reference.grantId) { ledger.closeUndelivered(); sendError(message, "permission_denied", "dispatch"); return; }
+    // A published domain grant is part of the service exposure identity.  A
+    // caller must echo it exactly; omission is not equivalent to possession.
+    if (message.grantId !== reference.grantId) { ledger.closeUndelivered(); sendError(message, "permission_denied", "dispatch"); return; }
     const initialCredit = message.initialCredit;
     if (message.mode === "stream" && (!Number.isSafeInteger(initialCredit) || (initialCredit as number) < 1 || (initialCredit as number) > limits.maxStreamCredit)) {
       ledger.closeUndelivered();
@@ -437,7 +494,7 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
       let stream: StreamEntry | undefined;
       try {
         if (active.cancelled || disposed) { releaseExecution(active); return; }
-        const result = await options.handleCall({ message: active.call, request: request.value, reference, signal: controller.signal, deadlineAt: active.deadlineAt, peer: callPeer });
+        const result = await options.handleCall({ message: active.call, request: request.value, reference, signal: controller.signal, deadlineAt: active.deadlineAt, binding: active.call.binding, peer: callPeer });
         if (active.cancelled || disposed || executionSlots.get(message.callId) !== active) {
           if (message.mode === "stream") await closeLateIterable(result);
           releaseExecution(active);
@@ -446,7 +503,7 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
         if (message.mode === "unary") {
           try {
             const output = prepareOutput(options.prepareResult?.(result, active.call) ?? { value: result });
-            if (!active.cancelled && !post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: message.callId, serviceInstanceId: reference.serviceInstanceId, result: output.value }, output.transfer)) sendError(message, "response_clone_failed", "receive");
+            if (!active.cancelled && !post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: message.callId, serviceInstanceId: reference.serviceInstanceId, result: output.value }, output.transfer)) sendError(message, "response_clone_failed", "receive");
           } catch (error) { if (!active.cancelled) sendError(message, safeErrorCode(error, "response_validation_failed"), "receive"); }
           finishPending(active);
           releaseExecution(active);
@@ -459,7 +516,7 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
         // completed iterator.return().
         stream = { active, call: active.call, controller, reference, window: message.initialCredit ?? 16, iterator, credit: message.initialCredit ?? 16, sequence: 1, running: false, closed: false, iteratorDone: false, returnStarted: false, returnDone: false, pumpDone: false };
         streams.set(message.callId, stream);
-        if (!post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: message.callId, serviceInstanceId: reference.serviceInstanceId, streamReady: true })) {
+        if (!post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: message.callId, serviceInstanceId: reference.serviceInstanceId, streamReady: true })) {
           sendError(message, "transport_unavailable", "dispatch");
           closeStream(stream);
           return;
@@ -478,23 +535,48 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     });
   };
 
+  const drainExecutions = (): Promise<void> => {
+    if (executionSlots.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => executionDrainWaiters.add(resolve));
+  };
+  session.registerDrainParticipant({
+    drain: drainExecutions,
+    pending: () => executionSlots.size,
+  });
+
+  let removeTransport: () => void = () => undefined;
   function dispose(): void {
     if (disposed) return;
     disposed = true;
     for (const active of [...activeCalls.values()]) cancelActive(active, "service_revoked");
     for (const stream of [...streams.values()]) closeStream(stream);
     removeTransport();
+    if (ownsSession) session.close();
   }
 
   function failClose(): void {
     dispose();
     try { transport.close?.(); } catch { /* best effort */ }
+    session.close();
   }
 
-  const removeTransport = transport.subscribe(onMessage);
+  removeTransport = transport.subscribe(onMessage);
+  // Closing the shared endpoint synchronously fences provider admission and
+  // aborts its active handlers before any asynchronous drain/transport I/O.
+  let removeSessionBeginClose: () => void = () => undefined;
+  removeSessionBeginClose = session.onBeginClose(() => dispose());
+  session.onClosed(() => {
+    // Keep the participant registered after physical close so a later drain
+    // still reports non-cooperative execution slots truthfully.
+    removeSessionBeginClose();
+  });
   return {
     setServices() { /* provider reads the current projection at dispatch time */ },
     dispose,
+    get binding() { return localBinding; },
+    get endpointState() { return session.state; },
+    beginClose(reason = "Runtime endpoint closing") { session.beginClose(reason); },
+    drain(timeoutMs) { return session.drain(timeoutMs); },
     pendingCount() { return activeCalls.size; },
     executionCount() { return executionSlots.size; },
     nonCooperativeExecutionCount() { return [...executionSlots.values()].filter((active) => active.frameworkSettled).length; },

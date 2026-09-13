@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { defineCapability } from "../contracts/capability.js";
-import { WebLoomError, type RuntimeSnapshot } from "../contracts/lifecycle.js";
-import { RUNTIME_PROTOCOL_VERSION } from "../runtime/runtimeProtocol.js";
+import { WebLoomError } from "../contracts/lifecycle.js";
+import { RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE, type RuntimeSnapshotMessage } from "../runtime/runtimeProtocol.js";
 import { createCapabilityBridge } from "./serviceBridge.js";
 import { createMessagePortRuntimeTransport } from "./messagePortServiceTransport.js";
 import { createMessagePortServiceProvider } from "./messagePortServiceProvider.js";
@@ -29,12 +29,15 @@ const Numbers = defineCapability({
   } },
 });
 
+const workerBinding = { runtimeInstanceId: "worker:one", connectionId: "direct:worker:one" } as const;
+
 function reference(capability: typeof Echo | typeof Numbers, serviceInstanceId: string): import("../contracts/capability.js").ServiceReference {
   return { kind: capability.kind, capabilityId: capability.id, contractVersion: capability.version, runtime: "shared-worker", runtimeInstanceId: "worker:one", serviceInstanceId, attributes: {} };
 }
 
-function snapshot(): RuntimeSnapshot {
+function snapshot(): RuntimeSnapshotMessage {
   return {
+    type: RUNTIME_SNAPSHOT_TYPE,
     protocolVersion: RUNTIME_PROTOCOL_VERSION,
     runtimeId: "worker",
     runtimeKind: "shared-worker",
@@ -46,6 +49,7 @@ function snapshot(): RuntimeSnapshot {
       { kind: "rpc", capabilityId: Echo.id, contractVersion: Echo.version, serviceInstanceId: "echo:one", attributes: {} },
       { kind: "stream", capabilityId: Numbers.id, contractVersion: Numbers.version, serviceInstanceId: "numbers:one", attributes: {} },
     ],
+    binding: workerBinding,
   };
 }
 
@@ -55,6 +59,7 @@ describe("v4 MessagePort runtime transport", () => {
     const clientTransport = createMessagePortRuntimeTransport(channel.port1);
     const provider = createMessagePortServiceProvider({
       port: channel.port2,
+      binding: workerBinding,
       services: () => [reference(Echo, "echo:one")],
       handleCall: ({ message }) => ({ result: (message.request as { value: string }).value.toUpperCase() }),
       prepareResult: (value) => ({ value: parseResponse.parse(value) }),
@@ -72,6 +77,7 @@ describe("v4 MessagePort runtime transport", () => {
     const clientTransport = createMessagePortRuntimeTransport(channel.port1);
     const provider = createMessagePortServiceProvider({
       port: channel.port2,
+      binding: workerBinding,
       services: () => [reference(Echo, "echo:one")],
       handleCall: () => ({ wrong: true }),
       prepareResult: (value) => ({ value: parseResponse.parse(value) }),
@@ -91,6 +97,7 @@ describe("v4 MessagePort runtime transport", () => {
     const firstItem = new Promise<void>((resolve) => {
       const provider = createMessagePortServiceProvider({
         port: channel.port2,
+        binding: workerBinding,
         services: () => [reference(Numbers, "numbers:one")],
         handleCall: async ({ message }) => (async function* () {
           for (let value = 1; value <= (message.request as { count: number }).count; value += 1) {

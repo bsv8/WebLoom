@@ -10,15 +10,15 @@
       "dependencyFingerprints": [
         {
           "path": "src/contracts/capability.ts",
-          "fingerprint": "afe0e3c789d962f9488f79499135637b0a42b642e75b6d083ad4f721b8a2adb4"
+          "fingerprint": "bb81b43f702946b44b66108a4ad765e7ca4a29359873cab0c81a3ffca60bc162"
         },
         {
           "path": "src/contracts/lifecycle.ts",
-          "fingerprint": "c1062cfe5ea770c1e052f584b3661cd7b131a1573916eb7321a6d079bba0a192"
+          "fingerprint": "df30e83f456f865a82e838fcd7d21bbdbd01c0356460ab3e1c17947b4315db03"
         }
       ],
-      "contractTestVersion": "webloom-v4-contract-tests.1",
-      "auditEvidence": "Initial v4 inventory: the shipped source defines one local Resource Registry capability; parser/transfer fields are intentionally absent and the static capability/type boundary is covered by the v4 unit and typecheck gates."
+      "contractTestVersion": "webloom-v4-contract-tests.2",
+      "auditEvidence": "Reviewed v4 inventory after endpoint-binding and lifecycle API additions: the shipped source still defines one local Resource Registry capability; parser/transfer fields remain intentionally absent, and the static capability/type boundary is covered by the v4 unit and typecheck gates."
     }
   ]
 }

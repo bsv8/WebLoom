@@ -1,5 +1,5 @@
 import type { Capability, CapabilityClient, RemoteCapability } from "../contracts/capability.js";
-import type { LifecycleDisposeResult, RuntimeKind, RuntimeSnapshot } from "../contracts/lifecycle.js";
+import type { LifecycleDisposeResult, RuntimeDrainResult, RuntimeEndpointBinding, RuntimeEndpointState, RuntimeKind, RuntimeSnapshot } from "../contracts/lifecycle.js";
 import type { PluginState } from "../contracts/plugin.js";
 import type { PluginHost, HostInspection } from "../host/createPluginHost.js";
 
@@ -10,6 +10,8 @@ export interface RuntimeStatusSnapshot extends Omit<RuntimeSnapshot, "protocolVe
   readonly protocolVersion: string;
   /** Runtime 当前状态。 */
   readonly state: RuntimeAppState;
+  /** 当前观察到的远端物理 endpoint binding；本地 WindowApp 不填写。 */
+  readonly binding?: RuntimeEndpointBinding;
   /** 脱敏 Runtime 错误。 */
   readonly error?: string;
 }
@@ -45,10 +47,18 @@ export interface WindowApp extends AppLike {
 
 export interface RuntimeHandle extends AppLike {
   readonly runtimeKind: "shared-worker";
+  /** 当前 Window ↔ Worker 物理 endpoint 的不可复用框架 binding。 */
+  readonly binding: RuntimeEndpointBinding;
+  /** 当前物理连接生命周期；不等同于远端 Runtime state。 */
+  readonly endpointState: RuntimeEndpointState;
   /** 获取远程 typed RPC/stream capability；代理构造不等待 Worker。 */
   capability<C extends RemoteCapability>(capability: C): CapabilityClient<C>;
   /** 当前已观察到的 remote capability。 */
   optionalCapability<C extends RemoteCapability>(capability: C): CapabilityClient<C> | undefined;
+  /** 同步停止新调用与本端反向 handler admission。 */
+  beginClose(reason?: string): void;
+  /** 等待本端及远端框架执行槽的 bounded drain。 */
+  drain(timeoutMs?: number): Promise<RuntimeDrainResult>;
 }
 
 export class RuntimeInitializationError extends Error {

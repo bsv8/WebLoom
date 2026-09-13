@@ -6,8 +6,16 @@ import { connectSharedWorkerForTesting } from "./connectSharedWorker.js";
 import { startSharedWorkerAppForTesting, type SharedWorkerScopeLike, type StartSharedWorkerAppForTestingOptions } from "./sharedWorkerHost.js";
 import {
   createRuntimeMessageCodec,
+  RUNTIME_CANCEL_TYPE,
+  RUNTIME_CLOSE_ACK_TYPE,
+  RUNTIME_CLOSE_TYPE,
+  RUNTIME_CREDIT_TYPE,
+  RUNTIME_ERROR_MESSAGE_TYPE,
+  RUNTIME_ERROR_TYPE,
+  RUNTIME_NEXT_TYPE,
   RUNTIME_PROTOCOL_VERSION,
   RUNTIME_RESULT_TYPE,
+  RUNTIME_SNAPSHOT_TYPE,
 } from "./runtimeProtocol.js";
 
 const Echo = defineCapability({
@@ -38,6 +46,8 @@ const Other = defineCapability({
   response: { parse(value: unknown): { result: string } { return value as { result: string }; } },
 });
 
+const workerBinding = { runtimeInstanceId: "worker:one", connectionId: "direct:worker:one" } as const;
+
 interface TestWorker {
   readonly workerApp: ReturnType<typeof startSharedWorkerAppForTesting>;
   readonly factory: (url: string | URL, options: { type: "module" }) => { readonly port: MessagePort };
@@ -66,6 +76,7 @@ describe("v4 Runtime", () => {
     expect(codec.decode({
       type: RUNTIME_RESULT_TYPE,
       protocolVersion: RUNTIME_PROTOCOL_VERSION,
+      binding: workerBinding,
       callId: "call:one",
       serviceInstanceId: "service:one",
       result: { ok: true },
@@ -75,11 +86,41 @@ describe("v4 Runtime", () => {
     expect(() => codec.decode({
       type: RUNTIME_RESULT_TYPE,
       protocolVersion: RUNTIME_PROTOCOL_VERSION,
+      binding: workerBinding,
       callId: "call:one",
       serviceInstanceId: "service:one",
       result: {},
       done: true,
     })).toThrow();
+  });
+
+  it("requires the exact framework binding on every wire message and rejects contradictory close results", () => {
+    const codec = createRuntimeMessageCodec();
+    const base = { protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, callId: "call:one", serviceInstanceId: "service:one" };
+    const messages: readonly Record<string, unknown>[] = [
+      { type: RUNTIME_SNAPSHOT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, runtimeId: "worker", runtimeKind: "shared-worker", runtimeInstanceId: "worker:one", revision: 1, state: "starting", units: [], services: [] },
+      { type: RUNTIME_ERROR_TYPE, ...base, code: "invalid_message", message: "invalid", phase: "receive" },
+      { type: "webloom.runtime.v1.call", ...base, capabilityId: Echo.id, contractVersion: Echo.version, mode: "unary", timeoutMs: 100, request: {} },
+      { type: RUNTIME_RESULT_TYPE, ...base, result: {} },
+      { type: RUNTIME_ERROR_MESSAGE_TYPE, ...base, error: { code: "handler_failed", message: "failed", phase: "execute" } },
+      { type: RUNTIME_CANCEL_TYPE, ...base },
+      { type: RUNTIME_NEXT_TYPE, ...base, sequence: 1, item: {} },
+      { type: RUNTIME_CREDIT_TYPE, ...base, count: 1 },
+      { type: RUNTIME_CLOSE_TYPE, ...base },
+      { type: RUNTIME_CLOSE_ACK_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, acknowledgedBinding: workerBinding, drained: true, timedOut: false, pendingExecutions: 0 },
+    ];
+    for (const [index, message] of messages.entries()) {
+      const withoutBinding = { ...message };
+      delete withoutBinding.binding;
+      expect(() => codec.decode(withoutBinding)).toThrow();
+      const wrongBinding = { ...message, binding: { runtimeInstanceId: "runtime:other", connectionId: "connection:other" } };
+      expect(() => codec.decode(wrongBinding), `wire message index ${index}`).not.toThrow();
+      expect(() => codec.decode({ ...wrongBinding, binding: undefined })).toThrow();
+    }
+    expect(() => codec.decode({ type: RUNTIME_CLOSE_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, reason: "secret-close-reason", timeoutMs: 10 })).toThrow();
+    expect(() => codec.decode({ type: RUNTIME_CLOSE_ACK_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, acknowledgedBinding: workerBinding, drained: true, timedOut: true, pendingExecutions: 0 })).toThrow();
+    expect(() => codec.decode({ type: RUNTIME_CLOSE_ACK_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, acknowledgedBinding: workerBinding, drained: true, timedOut: false, pendingExecutions: 1 })).toThrow();
+    expect(() => codec.decode({ type: RUNTIME_CLOSE_ACK_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: workerBinding, acknowledgedBinding: workerBinding, drained: false, timedOut: true, pendingExecutions: 0 })).toThrow();
   });
 
   it("shares one Worker plugin unit across two Window connections", async () => {
@@ -111,6 +152,92 @@ describe("v4 Runtime", () => {
     expect(firstService).not.toBe(secondService);
     await first.dispose();
     await second.dispose();
+    await worker.workerApp.dispose();
+  });
+
+  it("fences active peers, preserves the endpoint binding, and awaits the close handshake", async () => {
+    let releaseCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    const lifecycle: import("./sharedWorkerHost.js").PeerLifecycleEvent[] = [];
+    let handlerCalls = 0;
+    const workerPlugin = definePlugin({
+      id: "lifecycle-provider",
+      provides: [Echo] as const,
+      startup: "required" as const,
+      setup(ctx) { ctx.handle(Echo, (request) => { handlerCalls += 1; return { result: request.value }; }); },
+    });
+    const worker = createWorker(workerPlugin, [Echo], {
+      configurePeer(peer) {
+        peer.scope.onDispose(() => cleanup, "test-close-cleanup");
+      },
+    });
+    const removeLifecycle = worker.workerApp.subscribePeerLifecycle((event) => lifecycle.push(event));
+    const runtime = connectSharedWorkerForTesting({ id: "runtime-worker", url: "/worker.js" }, worker.factory);
+    await worker.workerApp.ready();
+    await expect(runtime.capability(Echo).call({ value: "ready" })).resolves.toEqual({ result: "ready" });
+    const active = worker.workerApp.activePeers();
+    expect(active).toHaveLength(1);
+    expect(active[0]?.state).toBe("active");
+    expect(active[0]?.binding.runtimeInstanceId).toBe(worker.workerApp.runtimeInstanceId);
+    expect(active[0]?.binding.connectionId).not.toBe(runtime.binding.connectionId);
+    const peerId = active[0]!.peerId;
+    expect(worker.workerApp.notifyPeerHandoff(peerId, 7)).toBe(true);
+    expect(lifecycle.map((event) => event.event)).toContain("handoff");
+
+    let settled = false;
+    const disposePromise = worker.workerApp.dispose("test worker shutdown");
+    void disposePromise.then(() => { settled = true; });
+    // The synchronous fence removes the peer immediately, while the app
+    // promise remains pending until the remote close acknowledgement and the
+    // endpoint's cleanup callback have both completed.
+    expect(worker.workerApp.activePeers()).toEqual([]);
+    expect(lifecycle.at(-1)?.event).toBe("closing");
+    expect(handlerCalls).toBe(1);
+    // A capability client retained before disposal cannot start another
+    // handler invocation once the Worker-side synchronous fence is active.
+    await expect(runtime.capability(Echo).call({ value: "late" }, { timeoutMs: 100 })).rejects.toMatchObject({
+      code: expect.stringMatching(/service_revoked|request_clone_failed|transport_unavailable/),
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseCleanup();
+    await disposePromise;
+    expect(settled).toBe(true);
+    expect(lifecycle.at(-1)).toMatchObject({ event: "closed", peerId, binding: active[0]!.binding, state: "closed" });
+    expect(lifecycle.at(-1)?.drain).toMatchObject({ drained: true, timedOut: false, pendingExecutions: 0 });
+    expect(runtime.endpointState).toBe("closed");
+    removeLifecycle();
+    await runtime.dispose("test window shutdown");
+  });
+
+  it("allows the Window RuntimeHandle to close independently and idempotently", async () => {
+    const lifecycle: import("./sharedWorkerHost.js").PeerLifecycleEvent[] = [];
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+    const workerPlugin = definePlugin({
+      id: "window-close-provider",
+      provides: [Echo] as const,
+      startup: "required" as const,
+      setup(ctx) { ctx.handle(Echo, (request) => ({ result: `worker:${request.value}` })); },
+    });
+    const worker = createWorker(workerPlugin);
+    const removeLifecycle = worker.workerApp.subscribePeerLifecycle((event) => {
+      lifecycle.push(event);
+      if (event.event === "closed") resolveClosed();
+    });
+    const runtime = connectSharedWorkerForTesting({ id: "runtime-worker", url: "/worker.js" }, worker.factory);
+    await worker.workerApp.ready();
+    await expect(runtime.capability(Echo).call({ value: "before-window-close" })).resolves.toEqual({ result: "worker:before-window-close" });
+    const first = runtime.dispose("window initiated close");
+    const second = runtime.dispose("duplicate window close");
+    expect(second).toBe(first);
+    await first;
+    await closed;
+    expect(runtime.endpointState).toBe("closed");
+    expect(worker.workerApp.activePeers()).toEqual([]);
+    expect(lifecycle.map((event) => event.event)).toEqual(["active", "closing", "closed"]);
+    expect(lifecycle.at(-1)?.drain).toMatchObject({ drained: true, timedOut: false, pendingExecutions: 0 });
+    removeLifecycle();
     await worker.workerApp.dispose();
   });
 

@@ -1,5 +1,5 @@
 import { capabilityKey, type CapabilityDescriptor, type CapabilityPeer, type CapabilityClient, type RemoteCapability, type CapabilityBridge, type PeerScopeView } from "../contracts/capability.js";
-import type { LifecycleScope } from "../contracts/lifecycle.js";
+import type { LifecycleScope, RuntimeEndpointBinding } from "../contracts/lifecycle.js";
 import { WebLoomError } from "../contracts/lifecycle.js";
 
 /** 将可信 peer controller 收窄为真正独立的普通 handler 作用域视图。 */
@@ -19,6 +19,8 @@ export function freezePeerView(peer: CapabilityPeer): CapabilityPeer {
 export interface CreatePeerViewOptions {
   /** 当前物理连接的 opaque peer id。 */
   readonly peerId: string;
+  /** 当前物理 endpoint 的框架 binding。 */
+  readonly binding?: RuntimeEndpointBinding;
   /** 独立的只读 scope facade。 */
   readonly scope: PeerScopeView;
   /** 当前连接 bridge；其目录身份由 bridge 管理。 */
@@ -36,6 +38,7 @@ export function createCapabilityPeerView(options: CreatePeerViewOptions): Capabi
     : new Set(options.allowed.map((descriptor) => capabilityKey(descriptor)));
   return Object.freeze({
     peerId: options.peerId,
+    binding: Object.freeze({ ...(options.binding ?? options.bridge.binding) }),
     get runtime() { return options.bridge.runtimeKind; },
     get runtimeInstanceId() { return options.bridge.runtimeInstanceId; },
     scope: options.scope,

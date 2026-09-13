@@ -15,7 +15,7 @@ import type {
   StreamSubscribeOptions,
   StreamSubscription,
 } from "../contracts/capability.js";
-import { WebLoomError, type LifecycleScope, type RuntimeKind, type RuntimeSnapshot, type SnapshotApplyResult } from "../contracts/lifecycle.js";
+import { WebLoomError, type LifecycleScope, type RuntimeEndpointBinding, type RuntimeKind, type SnapshotApplyResult, type RuntimeDrainResult } from "../contracts/lifecycle.js";
 import {
   assertReceivedPortSet,
   cloneFrozenAttributes,
@@ -35,6 +35,8 @@ import {
   createRuntimeMessageCodec,
   RUNTIME_CALL_TYPE,
   RUNTIME_CANCEL_TYPE,
+  RUNTIME_CLOSE_ACK_TYPE,
+  RUNTIME_CLOSE_TYPE,
   RUNTIME_CREDIT_TYPE,
   RUNTIME_ERROR_MESSAGE_TYPE,
   RUNTIME_ERROR_TYPE,
@@ -43,8 +45,16 @@ import {
   RUNTIME_RESULT_TYPE,
   RUNTIME_SNAPSHOT_TYPE,
   type RuntimeErrorResponseMessage,
+  type RuntimeSnapshotMessage,
   type RuntimeWireMessage,
 } from "../runtime/runtimeProtocol.js";
+import {
+  createRuntimeEndpointBinding,
+  createRuntimeEndpointSession,
+  sameRuntimeEndpointBinding,
+  DEFAULT_RUNTIME_DRAIN_TIMEOUT_MS,
+  type RuntimeEndpointSession,
+} from "../runtime/runtimeSession.js";
 
 export interface RuntimeReceiveMetadata {
   /** 本次 MessageEvent 实际携带的业务 MessagePort；仅 transport 本地使用。 */
@@ -79,6 +89,12 @@ export interface CreateCapabilityBridgeOptions {
   readonly limits?: RuntimeLimitsInput;
   /** 可选的 Runtime 方向共享计数器。 */
   readonly budget?: RuntimeBudget;
+  /** 当前物理 endpoint 的框架 binding；省略时由 bridge 生成。 */
+  readonly binding?: RuntimeEndpointBinding;
+  /** 与反向 provider 共用的 endpoint session。 */
+  readonly session?: RuntimeEndpointSession;
+  /** 关闭握手默认 drain deadline。 */
+  readonly drainTimeoutMs?: number;
 }
 
 interface ProxyRecord {
@@ -247,11 +263,15 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   const codec = createRuntimeMessageCodec();
   const limits = normalizeRuntimeLimits(options.limits);
   const budget = options.budget ?? createRuntimeBudget(limits);
+  const session = options.session ?? createRuntimeEndpointSession(options.binding ?? createRuntimeEndpointBinding(`bridge:${id("runtime")}`), { defaultDrainTimeoutMs: options.drainTimeoutMs });
+  if (options.binding && !sameRuntimeEndpointBinding(options.binding, session.binding)) throw new TypeError("Capability bridge binding disagrees with endpoint session");
+  const localBinding = session.binding;
   const listeners = new Set<() => void>();
   const pending = new Map<string, Pending>();
   const streams = new Map<string, PendingStream>();
   const waitingCalls = new Set<WaitingCallRecord>();
   const callbackExecutions = new Set<CallbackExecutionRecord>();
+  const executionDrainWaiters = new Set<() => void>();
   const proxies = new Map<string, ProxyRecord>();
   const clients = new Map<string, CapabilityClient<RemoteCapability>>();
   let pendingCount = 0;
@@ -265,6 +285,11 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   let appliedSnapshotFingerprint: string | undefined;
   let currentServices: readonly ServiceReference[] = [];
   let disposed = false;
+  let closeMessageSent = false;
+  let closeAckWaiter: { resolve: (result: RuntimeDrainResult) => void } | undefined;
+  let receivedCloseAck: RuntimeDrainResult | undefined;
+  let closeAckSent = false;
+  let drainPromise: Promise<RuntimeDrainResult> | undefined;
   let reservedStreamCount = 0;
   const defaultTimeout = timeoutMs(options.defaultCallTimeoutMs, 30_000);
 
@@ -321,6 +346,10 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     peerRetainedPayloadBytes = Math.max(0, peerRetainedPayloadBytes - record.item.budgetBytes);
     budget.retainedPayloadBytes = Math.max(0, budget.retainedPayloadBytes - record.item.budgetBytes);
     budget.releaseExecutionSlot();
+    if (callbackExecutions.size === 0) {
+      for (const resolve of [...executionDrainWaiters]) resolve();
+      executionDrainWaiters.clear();
+    }
     emit();
   };
 
@@ -345,7 +374,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     if (entry.cancelSent) return;
     entry.cancelSent = true;
     try {
-      options.transport.send({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: entry.callId, serviceInstanceId: entry.reference.serviceInstanceId });
+      options.transport.send({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: entry.callId, serviceInstanceId: entry.reference.serviceInstanceId });
     } catch { /* connection is already unavailable */ }
     try { entry.controller.abort(); } catch { /* noop */ }
   };
@@ -435,6 +464,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
 
   const terminalError = (proxy: ProxyRecord, capability: RemoteCapability): WebLoomError | undefined => {
     if (terminalFailure && !disposed) return frameworkError(terminalFailure.code, terminalFailure.phase, contextFor(capability, proxy.bound));
+    if (session.state !== "active") return frameworkError("service_revoked", "dispose", contextFor(capability, proxy.bound));
     if (disposed || proxy.revoked) return frameworkError("service_revoked", "dispatch", contextFor(capability, proxy.bound));
     if (currentState === "stale" || currentState === "disposed") return frameworkError("service_revoked", "dispatch", contextFor(capability, proxy.bound));
     if (proxy.bound && !currentServices.some((service) => serviceKey(service) === serviceKey(proxy.bound as ServiceReference) && service.serviceInstanceId === proxy.bound?.serviceInstanceId)) {
@@ -512,7 +542,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       }, timeout);
       if (merged.signal.aborted) { onAbort(); return; }
       try {
-        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared.transfer);
+        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared.transfer);
       } catch {
         settleUnary(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)));
       }
@@ -637,7 +667,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     }, timeout);
     if (merged.signal.aborted) { cancel(); return { ready, closed, cancel }; }
     try {
-      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared.transfer);
+      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared.transfer);
     } catch {
       terminateStream(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)), false);
     }
@@ -751,7 +781,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
             await stream.onNext(item.value);
             if (stream.state === "active" && !stream.doneReceived) {
               stream.credit += 1;
-              try { sendWire({ type: RUNTIME_CREDIT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: stream.callId, serviceInstanceId: stream.reference.serviceInstanceId, count: 1 }); }
+              try { sendWire({ type: RUNTIME_CREDIT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: stream.callId, serviceInstanceId: stream.reference.serviceInstanceId, count: 1 }); }
               catch { terminateStream(stream, frameworkError("transport_unavailable", "dispatch", contextFor(stream.capability, stream.reference)), true); break; }
             }
           } catch {
@@ -782,6 +812,15 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     });
   };
 
+  const drainCallbackExecutions = (): Promise<void> => {
+    if (callbackExecutions.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => executionDrainWaiters.add(resolve));
+  };
+  session.registerDrainParticipant({
+    drain: drainCallbackExecutions,
+    pending: () => callbackExecutions.size,
+  });
+
   const invalidate = (reason = "remote service directory replaced", terminalCause?: WebLoomError): void => {
     // A terminal protocol/transport failure is the cause observed by every
     // affected request. Settle it before revoking proxies, otherwise the proxy
@@ -809,8 +848,91 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   const failClose = (reason: string, code: "protocol_mismatch" | "invalid_snapshot" | "invalid_message" | "transfer_invalid" = "invalid_message"): void => {
     if (disposed) return;
     terminalFailure = frameworkError(code, "receive");
+    // Settle requests with the terminal wire failure before notifying the
+    // generic session fence.  `onBeginClose` revokes ordinary proxies and
+    // would otherwise turn a useful protocol/transfer error into the less
+    // informative `service_revoked` error.
     invalidate(reason, terminalFailure);
+    session.beginClose(reason);
     try { options.transport.close?.(); } catch { /* best effort */ }
+    session.close();
+  };
+
+  const removeSessionBeginClose = session.onBeginClose((reason) => {
+    // This callback is the synchronous admission fence. The bounded drain and
+    // physical transport close happen only after all local proxies/handlers
+    // have been revoked here.
+    if (!disposed) invalidate(reason);
+  });
+
+  const bounded = async <T>(promise: Promise<T>, fallback: T, deadline: number): Promise<T> => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return fallback;
+    return Promise.race([promise, new Promise<T>((resolve) => setTimeout(() => resolve(fallback), remaining))]);
+  };
+
+  const beginClose = (reason = "Runtime bridge closing"): void => { session.beginClose(reason); };
+  const drain = (requestedTimeoutMs = DEFAULT_RUNTIME_DRAIN_TIMEOUT_MS): Promise<RuntimeDrainResult> => {
+    if (drainPromise) return drainPromise;
+    if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs < 1 || requestedTimeoutMs > 300_000) {
+      return Promise.reject(new TypeError("drain timeoutMs must be a finite number from 1 to 300000"));
+    }
+    const alreadyClosed = session.state === "closed";
+    beginClose("Runtime bridge drain requested");
+    const effectiveTimeout = Math.min(requestedTimeoutMs, session.maxDrainTimeoutMs);
+    const deadline = Date.now() + effectiveTimeout;
+    const localDrain = session.drain(effectiveTimeout);
+    if (alreadyClosed) {
+      // A peer-initiated close may have completed before the owner calls its
+      // own dispose(). The session result is already the terminal evidence;
+      // do not send a new close into a transport that the peer has torn down
+      // and do not wait for an acknowledgement that cannot arrive.
+      drainPromise = (async () => {
+        const localFallback: RuntimeDrainResult = {
+          state: session.state,
+          drained: false,
+          timedOut: true,
+          pendingExecutions: callbackExecutions.size,
+        };
+        return bounded(localDrain, localFallback, deadline);
+      })();
+      return drainPromise;
+    }
+    const ackPromise = receivedCloseAck
+      ? Promise.resolve(receivedCloseAck)
+      : new Promise<RuntimeDrainResult>((resolve) => { closeAckWaiter = { resolve }; });
+    if (!closeMessageSent) {
+      try {
+        sendWire({
+          type: RUNTIME_CLOSE_TYPE,
+          protocolVersion: RUNTIME_PROTOCOL_VERSION,
+          binding: localBinding,
+          timeoutMs: effectiveTimeout,
+        });
+        closeMessageSent = true;
+      } catch {
+        closeAckWaiter = undefined;
+      }
+    }
+    drainPromise = (async () => {
+      const localFallback: RuntimeDrainResult = {
+        state: session.state,
+        drained: false,
+        timedOut: true,
+        pendingExecutions: callbackExecutions.size,
+      };
+      const local = await bounded(localDrain, localFallback, deadline);
+      const ack = await bounded(ackPromise, undefined, deadline);
+      if (ack === undefined) closeAckWaiter = undefined;
+      const timedOut = local.timedOut || !ack || ack.timedOut;
+      return {
+        state: session.state,
+        drained: local.drained && !!ack && ack.drained,
+        timedOut,
+        pendingExecutions: local.pendingExecutions + (ack?.pendingExecutions ?? 0),
+      };
+    })();
+    return drainPromise;
   };
 
   const onMessage = (message: RuntimeWireMessage, metadata?: RuntimeReceiveMetadata): void => {
@@ -820,9 +942,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       return;
     }
     try {
-      if (!metadata?.decoded) {
-        message = codec.decode(message);
-      }
+      if (!metadata?.decoded) message = codec.decode(message);
     } catch (error) {
         ledger.closeUndelivered();
         if (error instanceof WebLoomError && error.code === "protocol_mismatch") {
@@ -833,6 +953,73 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
         return;
     }
     try {
+      // The codec validates the shape; the endpoint session validates identity.
+      // A different binding on the same physical port is always stale, even if
+      // its callId/serviceInstanceId happens to match a live request.
+      const bindingAccepted = session.acceptRemoteBinding(message.binding);
+      // A simultaneous close can physically close this session while the
+      // peer's close-ack is still queued on the port.  It is safe to consume
+      // that one ACK only when it carries the already-locked remote binding;
+      // every other post-close identity mismatch remains terminal.
+      const closedKnownCloseAck = !bindingAccepted
+        && session.state === "closed"
+        && message.type === RUNTIME_CLOSE_ACK_TYPE
+        && sameRuntimeEndpointBinding(session.remoteBinding, message.binding);
+      if (!bindingAccepted && !closedKnownCloseAck) {
+        ledger.closeUndelivered();
+        failClose("Runtime endpoint binding mismatch", "invalid_message");
+        return;
+      }
+      if (message.type === RUNTIME_CLOSE_TYPE) {
+        ledger.closeUndelivered();
+        session.beginClose("Remote Runtime endpoint closing");
+        // A remote request can tighten this endpoint's deadline, never extend
+        // the locally trusted bounded limit.
+        const timeout = Math.min(message.timeoutMs ?? session.maxDrainTimeoutMs, session.maxDrainTimeoutMs);
+        void session.drain(timeout).then((result) => {
+          // Both endpoints may initiate close in the same turn.  The local
+          // session can already be physically closed by the peer's ACK before
+          // this remote-close continuation runs; it must still acknowledge the
+          // remote binding once, while the transport remains available.
+          if (closeAckSent) return;
+          closeAckSent = true;
+          try {
+            sendWire({
+              type: RUNTIME_CLOSE_ACK_TYPE,
+              protocolVersion: RUNTIME_PROTOCOL_VERSION,
+              binding: localBinding,
+              acknowledgedBinding: message.binding,
+              drained: result.drained,
+              timedOut: result.timedOut,
+              pendingExecutions: result.pendingExecutions,
+            });
+          } catch { /* physical close still fences the endpoint */ }
+          session.close();
+          // Let the close-ack leave a real MessagePort before tearing down the
+          // transport. MessagePort.close() may discard a just-posted message,
+          // which otherwise makes simultaneous two-end close time out.
+          setTimeout(() => { try { options.transport.close?.(); } catch { /* best effort */ } }, 10);
+        });
+        return;
+      }
+      if (message.type === RUNTIME_CLOSE_ACK_TYPE) {
+        ledger.closeUndelivered();
+        if (!sameRuntimeEndpointBinding(message.acknowledgedBinding, localBinding)) {
+          failClose("Runtime close acknowledgement binding mismatch", "invalid_message");
+          return;
+        }
+        const result: RuntimeDrainResult = {
+          state: session.state,
+          drained: message.drained,
+          timedOut: message.timedOut,
+          pendingExecutions: message.pendingExecutions,
+        };
+        receivedCloseAck = result;
+        const waiter = closeAckWaiter;
+        closeAckWaiter = undefined;
+        waiter?.resolve(result);
+        return;
+      }
       // A Runtime connection has one physical bidirectional port. Incoming
       // call/cancel/credit messages belong to the peer-side Provider listener;
       // this bridge must leave its event.ports ledger untouched so that the
@@ -937,14 +1124,17 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     else failClose("Invalid WebLoom runtime message", "invalid_message");
   });
 
-  function applySnapshot(snapshot: RuntimeSnapshot): SnapshotApplyResult {
+  function applySnapshot(snapshot: RuntimeSnapshotMessage): SnapshotApplyResult {
     if (disposed) return { accepted: false, reason: "disposed" };
     if (!snapshot || typeof snapshot !== "object") return { accepted: false, reason: "invalid-snapshot" };
     if (snapshot.protocolVersion !== RUNTIME_PROTOCOL_VERSION) return { accepted: false, reason: "protocol-mismatch" };
+    const binding = snapshot.binding;
+    if (!session.acceptRemoteBinding(binding)) return { accepted: false, reason: "invalid-snapshot" };
     try {
       if (snapshot.units.length > limits.maxSnapshotUnits || snapshot.services.length > limits.maxSnapshotServices) return { accepted: false, reason: "invalid-snapshot" };
-      codec.encode({ ...snapshot, type: RUNTIME_SNAPSHOT_TYPE });
-      validateDto(snapshot, { limits: { maxDepth: limits.maxDtoDepth, maxNodes: limits.maxDtoNodes, maxEdges: limits.maxDtoEdges, maxBudgetBytes: limits.maxMessageBudgetBytes }, phase: "receive" });
+      const wireSnapshot = { ...snapshot, type: RUNTIME_SNAPSHOT_TYPE } as RuntimeSnapshotMessage;
+      codec.encode(wireSnapshot);
+      validateDto(wireSnapshot, { limits: { maxDepth: limits.maxDtoDepth, maxNodes: limits.maxDtoNodes, maxEdges: limits.maxDtoEdges, maxBudgetBytes: limits.maxMessageBudgetBytes }, phase: "receive" });
     } catch { return { accepted: false, reason: "invalid-snapshot" }; }
     if (options.remoteRuntimeId !== undefined && snapshot.runtimeId !== options.remoteRuntimeId) return { accepted: false, reason: "invalid-snapshot" };
     if (options.remoteRuntimeKind !== undefined && snapshot.runtimeKind !== options.remoteRuntimeKind) return { accepted: false, reason: "invalid-snapshot" };
@@ -1003,6 +1193,8 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     get state() { return currentState; },
     get runtimeInstanceId() { return remoteRuntimeInstanceId; },
     get runtimeKind() { return remoteRuntimeKind; },
+    get binding() { return localBinding; },
+    get endpointState() { return session.state; },
     getClient<C extends RemoteCapability>(capability: C, scope?: LifecycleScope): CapabilityClient<C> {
       const key = `${capability.kind}\u0000${capability.id}\u0000${capability.version}\u0000${scope?.identity.scopeId ?? "root"}`;
       let proxy = proxies.get(key);
@@ -1022,7 +1214,26 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     applySnapshot,
     invalidate,
     disconnect(reason = "Runtime disconnected") { invalidate(reason); currentState = "stale"; },
-    dispose(reason = "Runtime bridge disposed") { if (disposed) return; disposed = true; invalidate(reason); removeTransport(); removeTransportError?.(); options.transport.close?.(); currentState = "disposed"; emit(); },
+    beginClose,
+    drain,
+    dispose(reason = "Runtime bridge disposed") {
+      if (disposed) return;
+      // Synchronously fence admission and revoke all proxies before touching
+      // the physical transport. dispose() itself is intentionally non-blocking;
+      // callers that need the bounded close acknowledgement use drain().
+      session.beginClose(reason);
+      disposed = true;
+      invalidate(reason);
+      removeTransport();
+      removeTransportError?.();
+      options.transport.close?.();
+      session.close();
+      // Keep the execution participant registered after physical close so a
+      // non-cooperative callback remains visible to a later drain query.
+      removeSessionBeginClose();
+      currentState = "disposed";
+      emit();
+    },
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     services() { return currentServices; },
     get pendingCallCount() { return pendingCount; },

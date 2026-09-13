@@ -2,7 +2,7 @@
 
 import type { CapabilityPeer, RemoteCapability, ServiceReference } from "../contracts/capability.js";
 import { capabilityKey } from "../contracts/capability.js";
-import { WebLoomError, type LifecycleDisposeResult, type LifecycleScope, type RuntimeSnapshot } from "../contracts/lifecycle.js";
+import { WebLoomError, type LifecycleDisposeResult, type LifecycleScope, type RuntimeEndpointBinding, type RuntimeEndpointState, type RuntimeSnapshot } from "../contracts/lifecycle.js";
 import { createRuntimeBudget, normalizeRuntimeLimits, validateDto, type RuntimeBudget, type RuntimeLimitsInput } from "../transport/dto.js";
 import type { PluginManifest } from "../contracts/plugin.js";
 import { createPluginHost, type CreatePluginHostOptions, type HostInspection, type PluginHost } from "../host/createPluginHost.js";
@@ -16,6 +16,7 @@ import { cloneFrozenAttributes } from "../transport/dto.js";
 import { createRuntimeMessageCodec, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE } from "./runtimeProtocol.js";
 import { RuntimeInitializationError, type RuntimeStatusListener, type RuntimeStatusSnapshot } from "./runtimeTypes.js";
 import { createCapabilityPeerView, createPeerScopeView } from "./peerView.js";
+import { createRuntimeEndpointBinding, createRuntimeEndpointSession, type RuntimeEndpointSession } from "./runtimeSession.js";
 
 export interface SharedWorkerScopeLike {
   /** SharedWorker 连接事件。 */
@@ -38,6 +39,10 @@ export interface PeerExposureOptions {
 export interface PeerController {
   /** peer 标识。 */
   readonly peerId: string;
+  /** 当前物理 endpoint 的不可复用框架 binding。 */
+  readonly binding: RuntimeEndpointBinding;
+  /** 当前物理 endpoint 的关闭阶段。 */
+  readonly endpointState: RuntimeEndpointState;
   /** 已观察到的页面 Runtime 实例；首个页面快照前为空。 */
   readonly runtimeInstanceId?: string;
   /** 对端 Window Runtime 类型。 */
@@ -54,9 +59,32 @@ export interface PeerController {
   exposeGroup(entries: readonly { readonly capability: RemoteCapability; readonly options?: PeerExposureOptions }[]): { revoke(): void };
   /** 断开此 peer，不影响其它页面。 */
   disconnect(reason?: string): void;
+  /** 同步停止新调用与暴露；后续由 drain/close 完成异步收尾。 */
+  beginClose(reason?: string): void;
+  /** 等待该 peer endpoint 的 bounded drain。 */
+  drain(timeoutMs?: number): Promise<import("../contracts/lifecycle.js").RuntimeDrainResult>;
   /** peer 诊断。 */
   inspect(): Readonly<Record<string, unknown>>;
 }
+
+/** 可信 Host 可观察的 peer 生命周期事件；不包含 owner/lease 等领域字段。 */
+export interface PeerLifecycleEvent {
+  /** active 建立、handoff 通知或关闭阶段。 */
+  readonly event: "active" | "handoff" | "closing" | "closed";
+  /** peer 物理连接的 opaque 标识。 */
+  readonly peerId: string;
+  /** 当前物理 endpoint 的框架 binding。 */
+  readonly binding: RuntimeEndpointBinding;
+  /** endpoint 的框架生命周期。 */
+  readonly state: RuntimeEndpointState;
+  /** closed 事件的真实 bounded drain 结果。 */
+  readonly drain?: import("../contracts/lifecycle.js").RuntimeDrainResult;
+  /** 可信 Host 提供的 handoff 修订；WebLoom 不解释或选择 owner。 */
+  readonly handoffRevision?: number;
+}
+
+/** 可信 Host 查询到的 active peer 只读投影。 */
+export type ActivePeerSnapshot = Omit<PeerLifecycleEvent, "event" | "drain" | "handoffRevision"> & { readonly event: "active" };
 
 export interface StartSharedWorkerAppOptions extends Omit<CreatePluginHostOptions, "runtime" | "runtimeUnitImplementationRegistry" | "runtimeId" | "runtimeInstanceId"> {
   /** Worker Runtime 逻辑标识。 */
@@ -89,12 +117,20 @@ export interface SharedWorkerApp {
   state(): RuntimeStatusSnapshot;
   subscribe(listener: RuntimeStatusListener): () => void;
   inspect(): HostInspection;
+  /** 只读查询当前仍处于 active 的物理 peer。 */
+  activePeers(): readonly ActivePeerSnapshot[];
+  /** 订阅 Host 可见的 peer active/closing/closed/handoff 事件。 */
+  subscribePeerLifecycle(listener: (event: PeerLifecycleEvent) => void): () => void;
+  /** 可信领域在完成自己的 owner/session 交接后报告 handoff；框架不选择 owner。 */
+  notifyPeerHandoff(peerId: string, handoffRevision?: number): boolean;
   dispose(reason?: string): Promise<LifecycleDisposeResult>;
 }
 
 interface Endpoint {
   readonly port: MessagePort;
   readonly scope: LifecycleScope;
+  readonly binding: RuntimeEndpointBinding;
+  readonly session: RuntimeEndpointSession;
   readonly transport: ReturnType<typeof createMessagePortRuntimeTransport>;
   readonly bridge: ReturnType<typeof createCapabilityBridge>;
   readonly provider: ReturnType<typeof createMessagePortServiceProvider>;
@@ -102,6 +138,8 @@ interface Endpoint {
   readonly installTopLevelExposures: () => void;
   closed: boolean;
   revision: number;
+  /** 已启动的 endpoint 收尾 Promise；保证 close 调用幂等且可等待。 */
+  closePromise?: Promise<void>;
 }
 
 function makeId(prefix: string): string {
@@ -127,6 +165,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     ? undefined
     : new Set(options.peerExposureAllowlist.map((capability) => capabilityKey(capability)));
   const listeners = new Set<RuntimeStatusListener>();
+  const peerLifecycleListeners = new Set<(event: PeerLifecycleEvent) => void>();
   const endpoints = new Set<Endpoint>();
   let manifests: readonly PluginManifest[] = [];
   let runtimeState: RuntimeSnapshot["state"] = "starting";
@@ -135,6 +174,17 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
   let accepting = true;
   let host: PluginHost | undefined;
   let disposePromise: Promise<LifecycleDisposeResult> | undefined;
+
+  const emitPeerLifecycle = (event: PeerLifecycleEvent): void => {
+    const frozen = Object.freeze({
+      ...event,
+      binding: Object.freeze({ ...event.binding }),
+      ...(event.drain !== undefined ? { drain: Object.freeze({ ...event.drain }) } : {}),
+    });
+    for (const listener of [...peerLifecycleListeners]) {
+      try { listener(frozen); } catch { /* observer isolation */ }
+    }
+  };
 
   const localSnapshot = (): RuntimeStatusSnapshot => {
     const currentHost = host;
@@ -159,10 +209,10 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
       .filter((unit) => unit.instanceId !== undefined && owners.has(unit.instanceId))
       .map((unit) => ({ pluginId: unit.pluginId, unitId: unit.unitId, runtime: unit.runtime, ...(unit.instanceId !== undefined ? { instanceId: unit.instanceId } : {}), state: unit.kind }))));
   };
-  const wireSnapshot = (endpoint: Endpoint, nextRevision = endpoint.revision, exposures: ReadonlyMap<string, ServiceReference> = endpoint.exposures, base = localSnapshot()): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } => {
+  const wireSnapshot = (endpoint: Endpoint, nextRevision = endpoint.revision, exposures: ReadonlyMap<string, ServiceReference> = endpoint.exposures, base = localSnapshot()): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE; readonly binding: RuntimeEndpointBinding } => {
     const services = [...exposures.values()].map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) }));
     const state: RuntimeSnapshot["state"] = base.state === "disconnected" ? "failed" : base.state;
-    return { type: RUNTIME_SNAPSHOT_TYPE, protocolVersion: base.protocolVersion, runtimeId: base.runtimeId, runtimeKind: base.runtimeKind, runtimeInstanceId: base.runtimeInstanceId, revision: nextRevision, state, units: projectedUnits(exposures), services: state === "ready" ? services : [] };
+    return { type: RUNTIME_SNAPSHOT_TYPE, protocolVersion: base.protocolVersion, runtimeId: base.runtimeId, runtimeKind: base.runtimeKind, runtimeInstanceId: base.runtimeInstanceId, revision: nextRevision, state, units: projectedUnits(exposures), services: state === "ready" ? services : [], binding: endpoint.binding };
   };
   const validateProjectedSnapshot = (endpoint: Endpoint, exposures: ReadonlyMap<string, ServiceReference>): void => {
     if (exposures.size > limits.maxSnapshotServices) throw new WebLoomError("resource_limit_exceeded", "Runtime service exposure limit exceeded", "dispatch");
@@ -170,8 +220,8 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     runtimeCodec.encode(snapshot);
     validateDto(snapshot, { limits: { maxDepth: limits.maxDtoDepth, maxNodes: limits.maxDtoNodes, maxEdges: limits.maxDtoEdges, maxBudgetBytes: limits.maxMessageBudgetBytes }, phase: "dispatch" });
   };
-  const publish = (endpoint: Endpoint, exposures = endpoint.exposures, base?: RuntimeStatusSnapshot): void => {
-    if (endpoint.closed) return;
+  const publish = (endpoint: Endpoint, exposures = endpoint.exposures, base?: RuntimeStatusSnapshot, allowClosed = false): void => {
+    if (endpoint.closed && !allowClosed) return;
     const nextRevision = endpoint.revision + 1;
     const snapshot = wireSnapshot(endpoint, nextRevision, exposures, base);
     endpoint.transport.send(snapshot);
@@ -192,12 +242,14 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     if (!host) throw new Error("SharedWorker Host is unavailable");
     const peerScope = host.rootScope.child("peer", { attributes: { peerId: makeId("peer") } });
     const transport = createMessagePortRuntimeTransport(port, { limits });
-    const bridge = createCapabilityBridge({ transport, remoteRuntimeKind: "window-main", limits, budget: outboundBudget });
+    const binding = createRuntimeEndpointBinding(runtimeInstanceId);
+    const session = createRuntimeEndpointSession(binding);
+    const bridge = createCapabilityBridge({ transport, remoteRuntimeKind: "window-main", limits, budget: outboundBudget, binding, session });
     const exposures = new Map<string, ServiceReference>();
     const exposurePolicies = new Map<string, PeerExposureOptions>();
     const peerId = peerScope.identity.attributes.peerId as string | undefined ?? makeId("peer");
     const peerScopeView = createPeerScopeView(peerScope);
-    const peerView: CapabilityPeer = createCapabilityPeerView({ peerId, scope: peerScopeView, bridge, capabilityScope: peerScope });
+    const peerView: CapabilityPeer = createCapabilityPeerView({ peerId, binding, scope: peerScopeView, bridge, capabilityScope: peerScope });
     let endpointForDisconnect: Endpoint | undefined;
     const exposeGroup = (entries: readonly { readonly capability: RemoteCapability; readonly options?: PeerExposureOptions }[], source: "dynamic" | "top-level" = "dynamic"): { revoke(): void } => {
       if (peerScope.state !== "active") throw new WebLoomError("service_revoked", "Peer scope is not active", "dispatch", { capabilityId: entries[0]?.capability.id });
@@ -299,11 +351,15 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     const configuredExposureKeys = new Set<string>();
     const peer: PeerController = {
       peerId,
+      binding,
+      get endpointState() { return session.state; },
       get runtimeInstanceId() { return bridge.runtimeInstanceId; },
       runtime: "window-main",
       scope: peerScope,
       view: peerView,
       capability: (capability) => bridge.getClient(capability, peerScope),
+      beginClose(reason = "Peer endpoint closing") { session.beginClose(reason); },
+      drain(timeoutMs) { return bridge.drain(timeoutMs); },
       expose(capability, exposureOptions = {}) {
         const result = exposeGroup([{ capability, options: exposureOptions }]);
         configuredExposureKeys.add(capabilityKey(capability));
@@ -345,12 +401,14 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
       transport,
       peerScope,
       peer: peerView,
+      binding,
+      session,
       budget: inboundBudget,
       limits,
       services: () => [...exposures.values()],
       peerForCall: (_call, reference) => {
         const registration = host?.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
-        return createCapabilityPeerView({ peerId, scope: peerScopeView, bridge, allowed: registration?.peerDependencies ?? [], capabilityScope: peerScope });
+        return createCapabilityPeerView({ peerId, binding, scope: peerScopeView, bridge, allowed: registration?.peerDependencies ?? [], capabilityScope: peerScope });
       },
       prepareRequest: (call) => {
         if (!host) throw new WebLoomError("service_stale", "SharedWorker Host is unavailable", "dispatch");
@@ -368,7 +426,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
         const policy = exposurePolicies.get(key);
         if (!registration || !exposures.has(key)) throw new Error("Runtime service exposure is stale");
         const handlerReference = reference;
-        const context = { signal, deadlineAt, ...(call.operationId !== undefined ? { operationId: call.operationId } : {}), reference: handlerReference, origin: "remote" as const, peer: callPeer };
+        const context = { signal, deadlineAt, ...(call.operationId !== undefined ? { operationId: call.operationId } : {}), reference: handlerReference, binding: call.binding, origin: "remote" as const, peer: callPeer };
         if (policy?.authorize && !(await policy.authorize(context, request))) throw new WebLoomError("permission_denied", "Peer capability authorization denied", "dispatch", { capabilityId: reference.capabilityId, serviceInstanceId: reference.serviceInstanceId });
         if (exposures.get(key)?.serviceInstanceId !== handlerReference.serviceInstanceId) throw new WebLoomError("service_stale", "Runtime service exposure was replaced while authorization was pending", "dispatch", { serviceInstanceId: handlerReference.serviceInstanceId });
         if (peerScope.state !== "active" || signal.aborted) throw new WebLoomError("service_revoked", "Peer scope was revoked", "dispose", { serviceInstanceId: reference.serviceInstanceId });
@@ -394,9 +452,17 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
         return { value: parsed, transfer };
       },
     });
-    const endpoint: Endpoint = { port, scope: peerScope, transport, bridge, provider, exposures, installTopLevelExposures, closed: false, revision: 0 };
+    const endpoint: Endpoint = { port, scope: peerScope, binding, session, transport, bridge, provider, exposures, installTopLevelExposures, closed: false, revision: 0 };
     endpointForDisconnect = endpoint;
     endpoints.add(endpoint);
+    emitPeerLifecycle({ event: "active", peerId, binding, state: "active" });
+    // A remote RuntimeHandle may close the physical endpoint directly.  The
+    // bridge/provider session can acknowledge that close, but the Worker
+    // still owns the peer controller and its domain exposure until the
+    // endpoint registry is revoked.  Route every terminal session transition
+    // through the same local endpoint teardown so configurePeer owners
+    // observe the physical peer as closed as well.
+    session.onClosed(() => closeEndpoint(endpoint, "Runtime endpoint closed"));
     try {
       if (disconnectRequested !== undefined) closeEndpoint(endpoint, disconnectRequested);
       installTopLevelExposures();
@@ -410,11 +476,51 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     return endpoint;
   };
 
-  const closeEndpoint = (endpoint: Endpoint, reason: string): void => { if (endpoint.closed) return; endpoint.closed = true; endpoint.scope.revoke(reason); void endpoint.scope.dispose({ reason }); endpoint.provider.dispose(); endpoint.bridge.dispose(reason); endpoint.transport.close?.(); endpoints.delete(endpoint); };
+  const beginCloseEndpoint = (endpoint: Endpoint, reason: string): void => {
+    if (endpoint.closed) return;
+    // The peer is removed from admission and all exposures are revoked before
+    // any asynchronous drain or physical MessagePort close begins.
+    endpoint.closed = true;
+    endpoints.delete(endpoint);
+    endpoint.scope.revoke(reason);
+    endpoint.provider.beginClose(reason);
+    endpoint.bridge.beginClose(reason);
+    emitPeerLifecycle({ event: "closing", peerId: endpoint.scope.identity.attributes.peerId as string, binding: endpoint.binding, state: "closing" });
+  };
+
+  const closeEndpoint = (endpoint: Endpoint, reason: string): Promise<void> => {
+    if (endpoint.closePromise) return endpoint.closePromise;
+    beginCloseEndpoint(endpoint, reason);
+    endpoint.closePromise = (async () => {
+      let providerDrain;
+      let bridgeDrain;
+      try {
+        // Both drains are started only after the synchronous admission fence
+        // above.  The public app.dispose() promise includes this handshake.
+        [providerDrain, bridgeDrain] = await Promise.all([endpoint.provider.drain(), endpoint.bridge.drain()]);
+      } catch {
+        providerDrain = { state: endpoint.session.state, drained: false, timedOut: true, pendingExecutions: endpoint.provider.executionCount() };
+        bridgeDrain = { state: endpoint.session.state, drained: false, timedOut: true, pendingExecutions: endpoint.bridge.pendingCallCount + endpoint.bridge.activeStreamCount };
+      }
+      try {
+        await endpoint.scope.dispose({ reason });
+      } catch {
+        // The endpoint's transport must still be closed when a domain cleanup
+        // callback fails; the close event reports the bounded drain result.
+      }
+      endpoint.provider.dispose();
+      endpoint.bridge.dispose(reason);
+      endpoint.transport.close?.();
+      endpoint.session.close();
+      emitPeerLifecycle({ event: "closed", peerId: endpoint.scope.identity.attributes.peerId as string, binding: endpoint.binding, state: "closed", drain: bridgeDrain.drained && providerDrain.drained ? bridgeDrain : { ...bridgeDrain, drained: false, timedOut: bridgeDrain.timedOut || providerDrain.timedOut, pendingExecutions: Math.max(bridgeDrain.pendingExecutions, providerDrain.pendingExecutions) } });
+    })();
+    return endpoint.closePromise;
+  };
   const sendTerminalSnapshot = (port: MessagePort): void => {
     try {
       port.start();
-      port.postMessage({ ...localSnapshot(), type: RUNTIME_SNAPSHOT_TYPE });
+      const binding = createRuntimeEndpointBinding(runtimeInstanceId);
+      port.postMessage({ ...localSnapshot(), type: RUNTIME_SNAPSHOT_TYPE, binding });
       // Give the posted terminal snapshot a turn to cross the port before
       // closing a connection made after the Worker Runtime has stopped.
       setTimeout(() => { try { port.close(); } catch { /* noop */ } }, 0);
@@ -440,7 +546,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     const failedReady = Promise.reject(failure);
     void failedReady.catch(() => undefined);
     const failedInspection = (): HostInspection => ({ runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId, version: 0, pluginCount: 0, peerCount: endpoints.size, pendingCallCount: 0, activeStreamCount: 0, plugins: [] });
-    return { runtimeKind: "shared-worker", runtimeId: options.id, runtimeInstanceId, ready: () => failedReady, reconcile: async () => failedReady, state: localSnapshot, subscribe(listener) { listeners.add(listener); listener(localSnapshot()); return () => listeners.delete(listener); }, inspect: failedInspection, dispose: async () => ({ scopeId: `runtime:${runtimeInstanceId}`, state: "stopped", attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }) };
+    return { runtimeKind: "shared-worker", runtimeId: options.id, runtimeInstanceId, ready: () => failedReady, reconcile: async () => failedReady, state: localSnapshot, subscribe(listener) { listeners.add(listener); listener(localSnapshot()); return () => listeners.delete(listener); }, inspect: failedInspection, activePeers: () => Object.freeze([]), subscribePeerLifecycle(listener) { peerLifecycleListeners.add(listener); return () => peerLifecycleListeners.delete(listener); }, notifyPeerHandoff: () => false, dispose: async () => ({ scopeId: `runtime:${runtimeInstanceId}`, state: "stopped", attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }) };
   }
 
   const ready = host.registerAll(manifests).then(() => {
@@ -458,7 +564,45 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     state: localSnapshot,
     subscribe(listener) { listeners.add(listener); listener(localSnapshot()); return () => listeners.delete(listener); },
     inspect: () => host ? { ...host.inspect(), peerCount: endpoints.size } : { runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId, version: 0, pluginCount: 0, peerCount: endpoints.size, pendingCallCount: 0, activeStreamCount: 0, plugins: [] },
-    dispose(reason = "shared worker runtime disposed") { if (disposePromise) return disposePromise; accepting = false; disposed = true; runtimeState = "stopping"; publishAll(); disposePromise = (async () => { const result = host ? await host.dispose(reason) : { scopeId: `runtime:${runtimeInstanceId}`, state: "stopped" as const, attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }; runtimeState = "disposed"; publishAll(); for (const endpoint of [...endpoints]) closeEndpoint(endpoint, reason); return result; })(); return disposePromise; },
+    activePeers: () => Object.freeze([...endpoints].filter((endpoint) => !endpoint.closed && endpoint.session.state === "active").map((endpoint) => Object.freeze({ event: "active" as const, peerId: endpoint.scope.identity.attributes.peerId as string, binding: Object.freeze({ ...endpoint.binding }), state: "active" as const }))),
+    subscribePeerLifecycle(listener) { peerLifecycleListeners.add(listener); for (const endpoint of endpoints) if (!endpoint.closed && endpoint.session.state === "active") listener(Object.freeze({ event: "active" as const, peerId: endpoint.scope.identity.attributes.peerId as string, binding: Object.freeze({ ...endpoint.binding }), state: "active" as const })); return () => peerLifecycleListeners.delete(listener); },
+    notifyPeerHandoff(peerId, handoffRevision) {
+      const endpoint = [...endpoints].find((candidate) => !candidate.closed && candidate.scope.identity.attributes.peerId === peerId);
+      if (!endpoint || endpoint.session.state !== "active") return false;
+      emitPeerLifecycle({ event: "handoff", peerId, binding: endpoint.binding, state: "active", ...(handoffRevision !== undefined ? { handoffRevision } : {}) });
+      return true;
+    },
+    dispose(reason = "shared worker runtime disposed") {
+      if (disposePromise) return disposePromise;
+      accepting = false;
+      disposed = true;
+      runtimeState = "stopping";
+      // Capture before publishing the terminal snapshot: a synchronous
+      // postMessage failure during publishAll may itself close an endpoint.
+      const endpointsToClose = [...endpoints];
+      publishAll();
+      // Fence every currently connected endpoint synchronously before the
+      // first await. This closes admission and revokes peer capabilities while
+      // the Host is still alive, then waits for each bounded close handshake.
+      for (const endpoint of endpointsToClose) beginCloseEndpoint(endpoint, reason);
+      disposePromise = (async () => {
+        const result = await (host ? host.dispose(reason) : Promise.resolve({ scopeId: `runtime:${runtimeInstanceId}`, state: "stopped" as const, attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }));
+        runtimeState = "disposed";
+        const terminal = localSnapshot();
+        options.snapshotObserver?.(terminal);
+        // Endpoint admission is already fenced, but its transport stays alive
+        // long enough for every Window to observe the terminal disposed
+        // snapshot before the bounded close handshake tears it down.
+        for (const endpoint of endpointsToClose) {
+          try { publish(endpoint, endpoint.exposures, terminal, true); } catch { /* close path still proceeds */ }
+        }
+        emit(terminal);
+        const endpointClosures = endpointsToClose.map((endpoint) => closeEndpoint(endpoint, reason));
+        await Promise.all(endpointClosures);
+        return result;
+      })();
+      return disposePromise;
+    },
   };
   return app;
 }

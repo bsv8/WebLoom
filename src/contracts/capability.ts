@@ -4,7 +4,7 @@
 // capabilityDescriptor() 产生的静态 DTO。这样 parser、transfer extractor
 // 和 handler 永远不会进入 manifest 或 wire。
 
-import type { LifecycleScope, RuntimeKind } from "./lifecycle.js";
+import type { LifecycleScope, RuntimeDrainResult, RuntimeEndpointBinding, RuntimeEndpointState, RuntimeKind } from "./lifecycle.js";
 
 /** 验证 unknown 并返回领域类型的生产 parser。 */
 export interface ValueParser<T> {
@@ -202,6 +202,8 @@ export interface ServiceReference {
 export interface CapabilityPeer {
   /** 对端连接的不可复用身份。 */
   readonly peerId: string;
+  /** 当前物理 endpoint 的框架 binding；不包含产品领域授权。 */
+  readonly binding: RuntimeEndpointBinding;
   /** 已观察到的对端 Runtime 类型；首个快照前为空。 */
   readonly runtime?: RuntimeKind;
   /** 已观察到的对端 Runtime 一次启动身份；首个快照前为空。 */
@@ -253,16 +255,25 @@ export interface CapabilityBridge {
   readonly runtimeInstanceId?: string;
   /** 当前已观察到的对端 Runtime 类型；快照到达前为空。 */
   readonly runtimeKind?: RuntimeKind;
+  /** 本端物理 endpoint 的框架 binding。 */
+  readonly binding: RuntimeEndpointBinding;
+  /** 当前 endpoint 生命周期；与远端 Runtime state 独立。 */
+  readonly endpointState: RuntimeEndpointState;
   /** 取惰性 typed client；没有服务时不在此处同步失败。 */
   getClient<C extends RemoteCapability>(capability: C, scope?: LifecycleScope): CapabilityClient<C>;
   /** 应用一个完整对端目录。 */
-  applySnapshot(snapshot: import("./lifecycle.js").RuntimeSnapshot): import("./lifecycle.js").SnapshotApplyResult;
+  /** 应用带框架 binding 的远端完整目录；缺失 binding 必须拒绝。 */
+  applySnapshot(snapshot: import("../runtime/runtimeProtocol.js").RuntimeSnapshotMessage): import("./lifecycle.js").SnapshotApplyResult;
   /** 同步撤销全部旧代理。 */
   invalidate(reason?: string): void;
   /** 连接断开；旧代理永久失效。 */
   disconnect(reason?: string): void;
   /** 永久销毁 bridge。 */
   dispose(reason?: string): void;
+  /** 同步停止新调用、撤销代理并 abort 已进入调用；幂等。 */
+  beginClose(reason?: string): void;
+  /** 等待本端与对端框架执行槽 bounded drain；超时不伪装成功。 */
+  drain(timeoutMs?: number): Promise<RuntimeDrainResult>;
   /** 订阅目录/连接状态变化。 */
   subscribe(listener: () => void): () => void;
   /** 当前已发布的完整服务引用。 */
@@ -279,6 +290,8 @@ export interface HandlerCallContext {
   readonly operationId?: string;
   /** 当前服务 exposure 身份。 */
   readonly reference: ServiceReference;
+  /** 远程调用对应的框架 endpoint binding；同 realm 调用没有物理 endpoint。 */
+  readonly binding?: RuntimeEndpointBinding;
   /** 调用来源。 */
   readonly origin: HandlerOrigin;
   /** 远程调用的框架绑定对端；local 调用必为 undefined。 */

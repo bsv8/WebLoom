@@ -4,6 +4,7 @@ import verification from "../../docs/proposals/webloom-v4/verification.md?raw";
 import requirements from "../../docs/proposals/webloom-v4/requirements.md?raw";
 import {
   defineCapability,
+  type CapabilityPeer,
   type PeerScopeView,
   type RemoteCapability,
   type RuntimeSnapshot,
@@ -26,6 +27,7 @@ import {
   RUNTIME_PROTOCOL_VERSION,
   RUNTIME_RESULT_TYPE,
   RUNTIME_SNAPSHOT_TYPE,
+  type RuntimeSnapshotMessage,
   type RuntimeCallMessage,
 } from "./runtimeProtocol.js";
 
@@ -106,6 +108,8 @@ const TransferEvents = defineCapability<TransferRequest, number>({
   },
 });
 
+const acceptanceBinding = { runtimeInstanceId: "worker:acceptance", connectionId: "direct:worker:acceptance" } as const;
+
 function serviceReference(capability: RemoteCapability, serviceInstanceId = "service:" + capability.id): ServiceReference {
   return {
     kind: capability.kind,
@@ -118,8 +122,9 @@ function serviceReference(capability: RemoteCapability, serviceInstanceId = "ser
   };
 }
 
-function snapshotFor(capability: RemoteCapability, serviceInstanceId = "service:" + capability.id, revision = 1): RuntimeSnapshot {
+function snapshotFor(capability: RemoteCapability, serviceInstanceId = "service:" + capability.id, revision = 1): RuntimeSnapshotMessage {
   return {
+    type: RUNTIME_SNAPSHOT_TYPE,
     protocolVersion: RUNTIME_PROTOCOL_VERSION,
     runtimeId: "worker",
     runtimeKind: "shared-worker",
@@ -134,6 +139,7 @@ function snapshotFor(capability: RemoteCapability, serviceInstanceId = "service:
       serviceInstanceId,
       attributes: {},
     }],
+    binding: acceptanceBinding,
   };
 }
 
@@ -228,6 +234,7 @@ function streamCall(
   return {
     type: RUNTIME_CALL_TYPE,
     protocolVersion: RUNTIME_PROTOCOL_VERSION,
+    binding: acceptanceBinding,
     callId,
     capabilityId: capability.id,
     contractVersion: capability.version,
@@ -271,7 +278,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     };
     const bridge = createCapabilityBridge({ transport: createFakeRuntimeTransport() });
     const view = createCapabilityPeerView({ peerId: "peer:one", scope, bridge, allowed: [Echo] });
-    for (const managementField of ["expose", "exposeGroup", "disconnect", "inspect", "revoke", "dispose", "child", "track", "acquire"]) {
+    for (const managementField of ["expose", "exposeGroup", "disconnect", "beginClose", "drain", "inspect", "revoke", "dispose", "child", "track", "acquire"]) {
       expect(managementField in view).toBe(false);
     }
     expect(() => view.capability(Hidden)).toThrowError(/unavailable/i);
@@ -302,6 +309,35 @@ describe("WebLoom v4 acceptance boundaries", () => {
     expect(groupError).toBeDefined();
     expect(runtime.state().services).toEqual([]);
     await expect(runtime.capability(Echo).call({ value: "not-exposed" }, { timeoutMs: 20 })).rejects.toMatchObject({ code: "capability_unavailable" });
+
+    // 通过真实 SharedWorker → MessagePort → provider handler 调用一次，
+    // 确认普通 handler 实际拿到的 call.peer 仍是最小 CapabilityPeer，
+    // 而不是带有 endpoint 管理权的 PeerController。
+    let handlerPeer: CapabilityPeer | undefined;
+    const exposedWorker = createTestWorker([
+      definePlugin({
+        id: "handler-peer-provider",
+        provides: [Echo] as const,
+        startup: "required" as const,
+        setup(ctx) {
+          ctx.handle(Echo, (request, call) => {
+            handlerPeer = call.peer;
+            return { result: request.value };
+          });
+        },
+      }),
+    ], [Echo]);
+    const exposedRuntime = connectSharedWorkerForTesting({ id: "worker", url: "/worker.js" }, exposedWorker.factory);
+    await exposedWorker.app.ready();
+    await expect(exposedRuntime.capability(Echo).call({ value: "handler-peer" })).resolves.toEqual({ result: "handler-peer" });
+    const actualHandlerPeer = handlerPeer;
+    expect(actualHandlerPeer).toBeDefined();
+    if (!actualHandlerPeer) throw new Error("AT-23 handler did not receive a peer view");
+    for (const managementField of ["disconnect", "beginClose", "drain", "expose", "exposeGroup", "inspect", "revoke", "dispose", "child", "track", "acquire"]) {
+      expect(managementField in actualHandlerPeer).toBe(false);
+    }
+    await exposedRuntime.dispose();
+    await exposedWorker.app.dispose();
     await runtime.dispose();
     await worker.app.dispose();
   });
@@ -315,6 +351,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     const receivedPromise = new Promise<TransferRequest>((resolve) => { resolveReceived = resolve; });
     const provider = createMessagePortServiceProvider({
       port: channel.port2,
+      binding: acceptanceBinding,
       services: () => [serviceReference(TransferEvents)],
       prepareRequest(call) {
         const value = TransferEvents.request.parse(call.request);
@@ -358,6 +395,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     const startedPromise = new Promise<void>((resolve) => { started = resolve; });
     const cancelProvider = createMessagePortServiceProvider({
       port: cancelChannel.port2,
+      binding: acceptanceBinding,
       services: () => [serviceReference(TransferEvents, "service:cancel")],
       prepareRequest(call) {
         const value = TransferEvents.request.parse(call.request);
@@ -433,9 +471,9 @@ describe("WebLoom v4 acceptance boundaries", () => {
     const subscription = bridge.getClient(Events).subscribe({ topic: "late" }, { initialCredit: 1, onNext() {} });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
     await subscription.ready;
-    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 }, [latePort.port]);
+    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 }, [latePort.port]);
     await expect(subscription.closed).rejects.toMatchObject({ code: "transfer_invalid" });
     expect(latePort.closed()).toBe(true);
     bridge.dispose();
@@ -528,13 +566,13 @@ describe("WebLoom v4 acceptance boundaries", () => {
     });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
     await subscription.ready;
-    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 });
+    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 });
     await firstEntered;
-    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 2, item: 2 });
+    transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 2, item: 2 });
     await tick();
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: call.callId, serviceInstanceId: call.serviceInstanceId, done: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, done: true });
     releaseFirst();
     await secondEntered;
     expect(values).toEqual([1, 2]);
@@ -556,9 +594,9 @@ describe("WebLoom v4 acceptance boundaries", () => {
     });
     const cancelCall = cancelTransport.sent.at(-1)?.message;
     if (!cancelCall || cancelCall.type !== RUNTIME_CALL_TYPE) throw new Error("cancel stream call was not sent");
-    cancelTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, streamReady: true });
+    cancelTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, streamReady: true });
     await drainingCancel.ready;
-    cancelTransport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, sequence: 1, item: 1 });
+    cancelTransport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, sequence: 1, item: 1 });
     await cancelEnteredPromise;
     drainingCancel.cancel("secret-draining-reason");
     await expect(drainingCancel.closed).rejects.toMatchObject({ code: "request_cancelled" });
@@ -581,7 +619,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     const neverCall = streamCall(Events, providerReference, "stream:never");
     providerPort.emit(neverCall);
     await waitUntil(() => providerPort.sent.some((message) => (message as { type?: unknown }).type === RUNTIME_NEXT_TYPE));
-    providerPort.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: neverCall.callId, serviceInstanceId: neverCall.serviceInstanceId });
+    providerPort.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: neverCall.callId, serviceInstanceId: neverCall.serviceInstanceId });
     await tick();
     expect(provider.pendingCount()).toBe(0);
     expect(provider.executionCount()).toBe(1);
@@ -640,7 +678,9 @@ describe("WebLoom v4 acceptance boundaries", () => {
             expect(snapshot?.services).toHaveLength(serviceCount);
             expect(new Set(snapshot?.services.map((service) => `${service.kind}\u0000${service.capabilityId}\u0000${service.contractVersion}`)).size).toBe(serviceCount);
             expect(snapshot?.services.every((service) => !Object.hasOwn(service, "runtime") && !Object.hasOwn(service, "runtimeInstanceId"))).toBe(true);
-            expect((JSON.stringify(snapshot).match(/"runtimeInstanceId"/g) ?? []).length).toBe(1);
+            // The endpoint binding repeats the Runtime instance identity; the
+            // service entries still remain compact and do not duplicate it.
+            expect((JSON.stringify(snapshot).match(/"runtimeInstanceId"/g) ?? []).length).toBe(2);
             return [...new Set(snapshot?.services.map((service) => service.grantId))];
           });
           expect(grants).toHaveLength(peerCount);
@@ -675,10 +715,11 @@ describe("WebLoom v4 acceptance boundaries", () => {
 
     const providerPort = new MemoryPort();
     const visible = serviceReference(Echo, "service:visible");
-    const provider = createMessagePortServiceProvider({ port: providerPort, services: () => [visible], handleCall: () => ({ result: "ok" }) });
+    const provider = createMessagePortServiceProvider({ port: providerPort, binding: acceptanceBinding, services: () => [visible], handleCall: () => ({ result: "ok" }) });
     const hiddenCall: RuntimeCallMessage = {
       type: RUNTIME_CALL_TYPE,
       protocolVersion: RUNTIME_PROTOCOL_VERSION,
+      binding: acceptanceBinding,
       callId: "call:hidden",
       capabilityId: Hidden.id,
       contractVersion: Hidden.version,

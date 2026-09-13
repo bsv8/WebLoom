@@ -62,9 +62,12 @@ const Echo = defineCapability({
   response: { parse(value) { if (!value || typeof value !== "object" || typeof value.result !== "string") throw new Error("invalid response"); return value; } },
 });
 
+const binding = { runtimeInstanceId: "ablation-runtime", connectionId: "connection:ablation" };
+
 function snapshot(serviceInstanceId, revision = 1) {
   return {
     protocolVersion: RUNTIME_PROTOCOL_VERSION,
+    type: RUNTIME_SNAPSHOT_TYPE,
     runtimeId: "ablation-worker",
     runtimeKind: "shared-worker",
     runtimeInstanceId: "ablation-runtime",
@@ -72,6 +75,7 @@ function snapshot(serviceInstanceId, revision = 1) {
     state: "ready",
     units: [],
     services: [{ kind: "rpc", capabilityId: Echo.id, contractVersion: Echo.version, serviceInstanceId, attributes: {} }],
+    binding,
   };
 }
 
@@ -120,7 +124,7 @@ describe("AT-22 ablation probes", () => {
       const call = bridge.getClient(Echo).call({ value: "instance" }, { timeoutMs: 35 });
       while (transport.sent.length === 0) await pause(0);
       const wire = transport.sent[0].message;
-      transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: wire.callId, serviceInstanceId: "service:wrong", result: { result: "wrong" } });
+      transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding, callId: wire.callId, serviceInstanceId: "service:wrong", result: { result: "wrong" } });
       const result = await outcome(call);
       expect(result.kind).toBe("rejected");
       expect(result.error).toMatchObject({ code: "call_timeout" });
@@ -132,6 +136,7 @@ describe("AT-22 ablation probes", () => {
     expect(() => codec.decode({
       type: RUNTIME_SNAPSHOT_TYPE,
       protocolVersion: RUNTIME_PROTOCOL_VERSION,
+      binding,
       runtimeId: "ablation-worker",
       runtimeKind: "shared-worker",
       runtimeInstanceId: "ablation-runtime",
@@ -159,7 +164,7 @@ describe("AT-22 ablation probes", () => {
       const replacementCall = replacement.call({ value: "new" }, { timeoutMs: 100 });
       const wire = transport.sent.at(-1).message;
       expect(wire.serviceInstanceId).toBe("service:second");
-      transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, callId: wire.callId, serviceInstanceId: wire.serviceInstanceId, result: { result: "new" } });
+      transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding, callId: wire.callId, serviceInstanceId: wire.serviceInstanceId, result: { result: "new" } });
       await expect(replacementCall).resolves.toEqual({ result: "new" });
     } finally { bridge.dispose(); }
   });

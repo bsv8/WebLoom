@@ -9,6 +9,35 @@ export type RuntimeKind = "window-main" | "shared-worker";
 /** 权限动作名称。 */
 export type PluginPermission = string;
 
+/**
+ * WebLoom 为每条物理 Runtime endpoint 生成的连接绑定。
+ *
+ * `runtimeInstanceId` 标识一次 Runtime 启动，`connectionId` 标识该启动内
+ * 的一条物理连接。两者只能由框架创建并且不得复用；它不是产品领域的
+ * lease、owner 或领域 generation，也不能由请求载荷覆盖。
+ */
+export interface RuntimeEndpointBinding {
+  /** 产生此 endpoint 的 Runtime 启动身份。 */
+  readonly runtimeInstanceId: string;
+  /** 此 Runtime 启动内不可复用的物理连接身份。 */
+  readonly connectionId: string;
+}
+
+/** Runtime endpoint 的通用关闭阶段。 */
+export type RuntimeEndpointState = "active" | "closing" | "closed";
+
+/** 一次 bounded drain 的结果；超时不伪装成已经排空。 */
+export interface RuntimeDrainResult {
+  /** 关闭阶段结束时的状态。 */
+  readonly state: RuntimeEndpointState;
+  /** 是否在 deadline 前等待到所有框架执行槽结束。 */
+  readonly drained: boolean;
+  /** 是否达到 bounded deadline。 */
+  readonly timedOut: boolean;
+  /** deadline 到达时仍未完成的真实执行槽数量。 */
+  readonly pendingExecutions: number;
+}
+
 /** 一个作用域的不可替换身份绑定。 */
 export interface LifecycleScopeIdentity<
   TAttributes extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>,
@@ -315,6 +344,7 @@ export type FrameworkErrorCode =
   | "stream_overflow"
   | "resource_limit_exceeded"
   | "permission_denied"
+  | "session_binding_mismatch"
   | (string & {});
 /** 框架错误阶段。 */
 export type FrameworkErrorPhase = "validate" | "wait" | "dispatch" | "execute" | "receive" | "dispose";

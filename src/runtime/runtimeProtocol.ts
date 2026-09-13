@@ -1,6 +1,6 @@
 // WebLoom v4 唯一 Runtime wire：webloom.runtime.v1。
 
-import type { RuntimeServiceSnapshot, RuntimeSnapshot, RuntimeKind } from "../contracts/lifecycle.js";
+import type { RuntimeServiceSnapshot, RuntimeSnapshot, RuntimeKind, RuntimeEndpointBinding } from "../contracts/lifecycle.js";
 import { WebLoomError } from "../contracts/lifecycle.js";
 import { ATTRIBUTES_DTO_LIMITS, validateDto } from "../transport/dto.js";
 
@@ -13,6 +13,11 @@ export const RUNTIME_ERROR_MESSAGE_TYPE = `${RUNTIME_PROTOCOL_VERSION}.error` as
 export const RUNTIME_CANCEL_TYPE = `${RUNTIME_PROTOCOL_VERSION}.cancel` as const;
 export const RUNTIME_NEXT_TYPE = `${RUNTIME_PROTOCOL_VERSION}.next` as const;
 export const RUNTIME_CREDIT_TYPE = `${RUNTIME_PROTOCOL_VERSION}.credit` as const;
+export const RUNTIME_CLOSE_TYPE = `${RUNTIME_PROTOCOL_VERSION}.close` as const;
+export const RUNTIME_CLOSE_ACK_TYPE = `${RUNTIME_PROTOCOL_VERSION}.close-ack` as const;
+
+/** 每条 Runtime wire 消息所属的框架 endpoint 身份。 */
+export type RuntimeSessionBinding = RuntimeEndpointBinding;
 
 export interface RuntimeSnapshotUnit {
   /** 插件标识。 */
@@ -27,13 +32,15 @@ export interface RuntimeSnapshotUnit {
   readonly state: import("../contracts/plugin.js").PluginStateKind;
 }
 
-export type RuntimeSnapshotMessage = RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE };
+export type RuntimeSnapshotMessage = RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE; readonly binding: RuntimeSessionBinding };
 
 export interface RuntimeErrorMessage {
   /** 消息类型。 */
   readonly type: typeof RUNTIME_ERROR_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送此错误的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** 结构化错误码。 */
   readonly code: string;
   /** 脱敏消息。 */
@@ -51,6 +58,8 @@ export interface RuntimeCallMessage {
   readonly type: typeof RUNTIME_CALL_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发起调用的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** 方向内唯一 call id。 */
   readonly callId: string;
   /** capability 标识。 */
@@ -78,6 +87,8 @@ export interface RuntimeUnaryResultMessage {
   readonly type: typeof RUNTIME_RESULT_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送结果的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -91,6 +102,8 @@ export interface RuntimeStreamReadyMessage {
   readonly type: typeof RUNTIME_RESULT_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送结果的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -104,6 +117,8 @@ export interface RuntimeStreamDoneMessage {
   readonly type: typeof RUNTIME_RESULT_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送结果的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -119,6 +134,8 @@ export interface RuntimeErrorResponseMessage {
   readonly type: typeof RUNTIME_ERROR_MESSAGE_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送错误响应的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -132,6 +149,8 @@ export interface RuntimeCancelMessage {
   readonly type: typeof RUNTIME_CANCEL_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送取消的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -143,6 +162,8 @@ export interface RuntimeNextMessage {
   readonly type: typeof RUNTIME_NEXT_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送 stream item 的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -158,6 +179,8 @@ export interface RuntimeCreditMessage {
   readonly type: typeof RUNTIME_CREDIT_TYPE;
   /** 协议版本。 */
   readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送 credit 的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
   /** call id。 */
   readonly callId: string;
   /** exposure 身份。 */
@@ -166,7 +189,37 @@ export interface RuntimeCreditMessage {
   readonly count: number;
 }
 
-export type RuntimeWireMessage = RuntimeSnapshotMessage | RuntimeErrorMessage | RuntimeCallMessage | RuntimeResultMessage | RuntimeErrorResponseMessage | RuntimeCancelMessage | RuntimeNextMessage | RuntimeCreditMessage;
+/** 请求对端先同步 fence、再等待真实执行排空。 */
+export interface RuntimeCloseMessage {
+  /** 消息类型。 */
+  readonly type: typeof RUNTIME_CLOSE_TYPE;
+  /** 协议版本。 */
+  readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发起关闭的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
+  /** 对端 drain 的最大等待时间。 */
+  readonly timeoutMs?: number;
+}
+
+/** 对端完成或超时 drain 后返回的关闭确认。 */
+export interface RuntimeCloseAckMessage {
+  /** 消息类型。 */
+  readonly type: typeof RUNTIME_CLOSE_ACK_TYPE;
+  /** 协议版本。 */
+  readonly protocolVersion: typeof RUNTIME_PROTOCOL_VERSION;
+  /** 发送确认的物理 endpoint 绑定。 */
+  readonly binding: RuntimeSessionBinding;
+  /** 确认对应的发起方 binding，防止旧 close-ack 误配新 session。 */
+  readonly acknowledgedBinding: RuntimeSessionBinding;
+  /** 对端本次 drain 的结果。 */
+  readonly drained: boolean;
+  /** 是否达到 bounded deadline。 */
+  readonly timedOut: boolean;
+  /** deadline 到达时仍存活的执行槽数量。 */
+  readonly pendingExecutions: number;
+}
+
+export type RuntimeWireMessage = RuntimeSnapshotMessage | RuntimeErrorMessage | RuntimeCallMessage | RuntimeResultMessage | RuntimeErrorResponseMessage | RuntimeCancelMessage | RuntimeNextMessage | RuntimeCreditMessage | RuntimeCloseMessage | RuntimeCloseAckMessage;
 
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -221,12 +274,29 @@ function validIdentity(message: Record<string, unknown>): boolean {
   return boundedText(message.protocolVersion, MAX_VERSION_LENGTH) && message.protocolVersion === RUNTIME_PROTOCOL_VERSION;
 }
 
+function validBinding(value: unknown): value is RuntimeSessionBinding {
+  if (!record(value)) return false;
+  return boundedText(value.runtimeInstanceId, MAX_ID_LENGTH) && boundedText(value.connectionId, MAX_ID_LENGTH);
+}
+
+/** close-ack 的结果组合必须能被真实 drain 语义解释。 */
+function validDrainResult(value: Record<string, unknown>): boolean {
+  if (typeof value.drained !== "boolean" || typeof value.timedOut !== "boolean"
+    || !Number.isSafeInteger(value.pendingExecutions) || (value.pendingExecutions as number) < 0) return false;
+  // A successful drain cannot also time out or retain execution slots.
+  if (value.drained && (value.timedOut || value.pendingExecutions !== 0)) return false;
+  // A timeout must report the work which prevented completion.  A non-timeout
+  // failure is allowed for a participant that rejected while no slot remains.
+  if (value.timedOut && (!value.pendingExecutions || value.drained)) return false;
+  return true;
+}
+
 function validServiceIdentity(message: Record<string, unknown>): boolean {
   return boundedText(message.callId, MAX_CALL_ID_LENGTH) && boundedText(message.serviceInstanceId, MAX_ID_LENGTH);
 }
 
 function validateSnapshot(value: Record<string, unknown>): boolean {
-  if (value.type !== RUNTIME_SNAPSHOT_TYPE || !validIdentity(value) || !boundedText(value.runtimeId, MAX_ID_LENGTH) || !boundedText(value.runtimeInstanceId, MAX_ID_LENGTH) || (value.runtimeKind !== "window-main" && value.runtimeKind !== "shared-worker") || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !["starting", "ready", "stopping", "failed", "disposed"].includes(String(value.state)) || !Array.isArray(value.units) || !Array.isArray(value.services) || value.units.length > MAX_SNAPSHOT_UNITS || value.services.length > MAX_SNAPSHOT_SERVICES) return false;
+  if (value.type !== RUNTIME_SNAPSHOT_TYPE || !validIdentity(value) || !validBinding(value.binding) || !boundedText(value.runtimeId, MAX_ID_LENGTH) || !boundedText(value.runtimeInstanceId, MAX_ID_LENGTH) || (value.runtimeKind !== "window-main" && value.runtimeKind !== "shared-worker") || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !["starting", "ready", "stopping", "failed", "disposed"].includes(String(value.state)) || !Array.isArray(value.units) || !Array.isArray(value.services) || value.units.length > MAX_SNAPSHOT_UNITS || value.services.length > MAX_SNAPSHOT_SERVICES) return false;
   if (value.state !== "ready" && value.services.length !== 0) return false;
   const unitKeys = new Set<string>();
   for (const unit of value.units) {
@@ -255,6 +325,7 @@ function validateSnapshot(value: Record<string, unknown>): boolean {
 function validateMessage(value: unknown): value is RuntimeWireMessage {
   if (!record(value) || !text(value.type) || !validIdentity(value)) return false;
   if (value.type === RUNTIME_SNAPSHOT_TYPE) return validateSnapshot(value);
+  if (!validBinding(value.binding) && value.type !== RUNTIME_SNAPSHOT_TYPE) return false;
   if (value.type === RUNTIME_ERROR_TYPE) return boundedText(value.code, MAX_ID_LENGTH) && boundedText(value.message, MAX_ERROR_MESSAGE_LENGTH) && phase(value.phase) && (value.pluginId === undefined || boundedText(value.pluginId, MAX_ID_LENGTH)) && (value.unitId === undefined || boundedText(value.unitId, MAX_ID_LENGTH));
   if (value.type === RUNTIME_CALL_TYPE) return validServiceIdentity(value) && boundedText(value.capabilityId, MAX_ID_LENGTH) && boundedText(value.contractVersion, MAX_VERSION_LENGTH) && Object.hasOwn(value, "request") && validPayload(value.request) && (value.mode === "unary" || value.mode === "stream") && typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= 300_000 && (value.operationId === undefined || boundedText(value.operationId, MAX_ID_LENGTH)) && (value.grantId === undefined || boundedText(value.grantId, MAX_ID_LENGTH)) && (value.mode !== "stream" ? !Object.hasOwn(value, "initialCredit") : (Number.isSafeInteger(value.initialCredit) && (value.initialCredit as number) >= 1 && (value.initialCredit as number) <= 256));
   if (value.type === RUNTIME_RESULT_TYPE) return validServiceIdentity(value) && ((!Object.hasOwn(value, "result") || validPayload(value.result)) && ((value.streamReady === true && !Object.hasOwn(value, "result") && !Object.hasOwn(value, "done")) || (value.done === true && !Object.hasOwn(value, "result") && !Object.hasOwn(value, "streamReady")) || (Object.hasOwn(value, "result") && !Object.hasOwn(value, "done") && !Object.hasOwn(value, "streamReady"))));
@@ -262,6 +333,8 @@ function validateMessage(value: unknown): value is RuntimeWireMessage {
   if (value.type === RUNTIME_CANCEL_TYPE) return validServiceIdentity(value);
   if (value.type === RUNTIME_NEXT_TYPE) return validServiceIdentity(value) && Object.hasOwn(value, "item") && validPayload(value.item) && Number.isSafeInteger(value.sequence) && (value.sequence as number) >= 1;
   if (value.type === RUNTIME_CREDIT_TYPE) return validServiceIdentity(value) && Number.isSafeInteger(value.count) && (value.count as number) >= 1 && (value.count as number) <= 256;
+  if (value.type === RUNTIME_CLOSE_TYPE) return !Object.hasOwn(value, "reason") && (value.timeoutMs === undefined || (Number.isFinite(value.timeoutMs) && (value.timeoutMs as number) >= 1 && (value.timeoutMs as number) <= 300_000));
+  if (value.type === RUNTIME_CLOSE_ACK_TYPE) return validBinding(value.acknowledgedBinding) && validDrainResult(value);
   return false;
 }
 

@@ -20,8 +20,9 @@ export * from "./transport/messagePortServiceTransport.js";
 export * from "./transport/messagePortServiceProvider.js";
 export { createWindowAppFromHost, hostForWindowApp } from "./runtime/windowRuntime.js";
 export { bridgeForRuntimeHandle } from "./runtime/connectSharedWorker.js";
-export type { PeerController, PeerExposureOptions, StartSharedWorkerAppOptions, StartSharedWorkerAppForTestingOptions, SharedWorkerApp } from "./runtime/sharedWorkerHost.js";
+export type { ActivePeerSnapshot, PeerController, PeerExposureOptions, PeerLifecycleEvent, StartSharedWorkerAppOptions, StartSharedWorkerAppForTestingOptions, SharedWorkerApp } from "./runtime/sharedWorkerHost.js";
 export * from "./runtime/runtimeProtocol.js";
+export * from "./runtime/runtimeSession.js";
 
 import type { RuntimeHandle, WindowApp } from "./runtime/runtimeTypes.js";
 import type { RuntimePluginDefinition } from "./runtime/pluginDefinitions.js";

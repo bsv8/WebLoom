@@ -2,7 +2,7 @@
 
 import type { CapabilityBridge, CapabilityClient, CapabilityPeer, RemoteCapability, ServiceReference } from "../contracts/capability.js";
 import { capabilityKey } from "../contracts/capability.js";
-import type { LifecycleDisposeResult, RuntimeSnapshot } from "../contracts/lifecycle.js";
+import type { LifecycleDisposeResult, RuntimeEndpointBinding, RuntimeSnapshot } from "../contracts/lifecycle.js";
 import { WebLoomError } from "../contracts/lifecycle.js";
 import { createCapabilityPeerView, createPeerScopeView } from "./peerView.js";
 import { cloneFrozenAttributes, createRuntimeBudget, normalizeRuntimeLimits, type RuntimeBudget, type RuntimeLimitsInput } from "../transport/dto.js";
@@ -14,6 +14,7 @@ import { createMessagePortServiceProvider } from "../transport/messagePortServic
 import { invokeCapabilityHandler } from "../host/capabilityRegistry.js";
 import { hostForWindowApp } from "./windowRuntime.js";
 import { RUNTIME_ERROR_TYPE, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE } from "./runtimeProtocol.js";
+import { createRuntimeEndpointBinding, createRuntimeEndpointSession } from "./runtimeSession.js";
 
 export interface SharedWorkerLike {
   /** SharedWorker 主端口。 */
@@ -63,7 +64,7 @@ function makeWorker(options: InternalOptions): SharedWorkerLike {
 
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
-function snapshotForClient(app: WindowApp, runtimeId: string, runtimeInstanceId: string, exposed: readonly RemoteCapability[], revision: number): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE } {
+function snapshotForClient(app: WindowApp, runtimeId: string, runtimeInstanceId: string, binding: RuntimeEndpointBinding, exposed: readonly RemoteCapability[], revision: number): RuntimeSnapshot & { readonly type: typeof RUNTIME_SNAPSHOT_TYPE; readonly binding: RuntimeEndpointBinding } {
   const allowed = new Set(exposed.map((capability) => capabilityKey(capability)));
   const state = app.state();
   const runtimeState: RuntimeSnapshot["state"] = state.state === "disconnected" ? "failed" : state.state;
@@ -77,6 +78,7 @@ function snapshotForClient(app: WindowApp, runtimeId: string, runtimeInstanceId:
     state: runtimeState,
     units: state.units,
     services: runtimeState === "ready" ? state.services.filter((service) => allowed.has(capabilityKey({ kind: service.kind, id: service.capabilityId, version: service.contractVersion }))).map((service) => ({ kind: service.kind, capabilityId: service.capabilityId, contractVersion: service.contractVersion, serviceInstanceId: service.serviceInstanceId, attributes: cloneFrozenAttributes(service.attributes), ...(service.grantId !== undefined ? { grantId: service.grantId } : {}), ...(service.authorizationRevision !== undefined ? { authorizationRevision: service.authorizationRevision } : {}) })) : [],
+    binding,
   };
 }
 
@@ -101,12 +103,15 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
   }, { limits });
   const outboundBudget: RuntimeBudget = createRuntimeBudget(limits);
   const inboundBudget: RuntimeBudget = createRuntimeBudget(limits);
-  const bridge = createCapabilityBridge({ transport, remoteRuntimeKind: "shared-worker", remoteRuntimeId: options.id, defaultCallTimeoutMs: options.defaultCallTimeoutMs, limits, budget: outboundBudget });
+  const localRuntimeInstanceId = options.client?.app.runtimeInstanceId ?? `window:${Date.now().toString(36)}`;
+  const binding = createRuntimeEndpointBinding(localRuntimeInstanceId);
+  const session = createRuntimeEndpointSession(binding);
+  const bridge = createCapabilityBridge({ transport, remoteRuntimeKind: "shared-worker", remoteRuntimeId: options.id, defaultCallTimeoutMs: options.defaultCallTimeoutMs, limits, budget: outboundBudget, binding, session });
   const listeners = new Set<RuntimeStatusListener>();
   const workerInstanceId = { value: "" };
-  const localRuntimeInstanceId = options.client?.app.runtimeInstanceId ?? `window:${Date.now().toString(36)}`;
   let revision = 0;
   let disposed = false;
+  let disposePromise: Promise<void> | undefined;
   let current: RuntimeStatusSnapshot = Object.freeze({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId: "", state: "starting", revision: 0, units: [], services: [] });
   const clientHost = requestedClientHost;
   const clientPeerScope = options.client && clientHost
@@ -115,6 +120,7 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
   const clientPeerScopeView = clientPeerScope ? createPeerScopeView(clientPeerScope) : undefined;
   const clientPeer: CapabilityPeer | undefined = clientPeerScope && clientPeerScopeView ? createCapabilityPeerView({
     peerId: clientPeerScope.identity.attributes.peerId as string,
+    binding,
     scope: clientPeerScopeView,
     bridge,
     capabilityScope: clientPeerScope,
@@ -123,6 +129,8 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
     transport,
     peerScope: clientPeerScope,
     peer: clientPeer,
+    binding,
+    session,
     budget: inboundBudget,
     limits,
     services: () => clientHost.serviceReferences().filter((service) => exposed.some((capability) => capabilityKey(capability) === capabilityKey({ kind: service.kind, id: service.capabilityId, version: service.contractVersion }))),
@@ -130,6 +138,7 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
       const registration = clientHost.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
       return clientPeerScope && clientPeerScopeView ? createCapabilityPeerView({
         peerId: clientPeerScope.identity.attributes.peerId as string,
+        binding,
         scope: clientPeerScopeView,
         bridge,
         allowed: registration?.peerDependencies ?? [],
@@ -144,12 +153,12 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
       try { value = capability.request.parse(call.request); } catch { throw new WebLoomError("request_validation_failed", "Capability request failed validation", "receive"); }
       return { value, transfer: capability.transfer?.request?.(value) };
     },
-    handleCall: async ({ request, reference, signal, deadlineAt, peer }) => {
+    handleCall: async ({ request, reference, signal, deadlineAt, binding: callBinding, peer }) => {
       const registration = clientHost.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
       if (!registration) throw new WebLoomError("service_stale", "Window exposure is no longer available", "dispatch");
       const handler = registration.handler as ((value: unknown, context: import("../contracts/capability.js").HandlerCallContext) => unknown | Promise<unknown>) | undefined;
       if (!handler) throw new WebLoomError("service_stale", "Window service handler is unavailable", "dispatch");
-      return handler(request, { signal, deadlineAt, reference, origin: "remote", peer });
+      return handler(request, { signal, deadlineAt, reference, binding: callBinding, origin: "remote", peer });
     },
     prepareResult: (value, call) => {
       const registration = clientHost.capabilities.registration({ kind: "rpc", id: call.capabilityId, version: call.contractVersion });
@@ -168,20 +177,31 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
   }) : undefined;
 
   const emit = (next: RuntimeStatusSnapshot): void => { current = Object.freeze({ ...next, units: Object.freeze([...next.units]), services: Object.freeze([...next.services]) }); for (const listener of [...listeners]) { try { listener(current); } catch { /* observer isolation */ } } };
-  const sendClientSnapshot = (): void => { if (!options.client || disposed) return; revision += 1; try { transport.send(snapshotForClient(options.client.app, `${options.client.app.runtimeId}`, localRuntimeInstanceId, exposed, revision)); } catch { /* bridge deadline handles disconnect */ } };
+  const sendClientSnapshot = (): void => { if (!options.client || disposed) return; revision += 1; try { transport.send(snapshotForClient(options.client.app, `${options.client.app.runtimeId}`, localRuntimeInstanceId, binding, exposed, revision)); } catch { /* bridge deadline handles disconnect */ } };
   const removeRaw = transport.subscribe((messageValue) => {
     if (messageValue.type === RUNTIME_SNAPSHOT_TYPE && messageValue.runtimeKind === "shared-worker") {
       const applied = bridge.applySnapshot(messageValue);
       if (applied.accepted) {
         workerInstanceId.value = messageValue.runtimeInstanceId;
-        emit({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: messageValue.runtimeId, runtimeKind: messageValue.runtimeKind, runtimeInstanceId: messageValue.runtimeInstanceId, state: messageValue.state, revision: messageValue.revision, units: messageValue.units, services: messageValue.services });
+        emit({ protocolVersion: RUNTIME_PROTOCOL_VERSION, runtimeId: messageValue.runtimeId, runtimeKind: messageValue.runtimeKind, runtimeInstanceId: messageValue.runtimeInstanceId, state: messageValue.state, revision: messageValue.revision, units: messageValue.units, services: messageValue.services, binding: messageValue.binding });
       }
     } else if (messageValue.type === RUNTIME_ERROR_TYPE) {
       bridge.invalidate(messageValue.message);
       emit({ ...current, state: "failed", error: messageValue.message, units: [], services: [] });
     }
   });
-  const onError = (): void => { if (!disposed) { clientPeerScope?.revoke("SharedWorker disconnected"); provider?.dispose(); bridge.disconnect("SharedWorker disconnected"); emit({ ...current, state: "disconnected", runtimeInstanceId: "", revision: 0, units: [], services: [], error: "SharedWorker disconnected" }); } };
+  const onError = (): void => {
+    if (disposed) return;
+    // A physical port failure is itself a lifecycle fence.  Close the shared
+    // endpoint session before clearing the local projection so reverse
+    // handlers and pending calls cannot be admitted during recovery.
+    session.beginClose("SharedWorker disconnected");
+    clientPeerScope?.revoke("SharedWorker disconnected");
+    provider?.dispose();
+    bridge.disconnect("SharedWorker disconnected");
+    session.close();
+    emit({ ...current, state: "disconnected", runtimeInstanceId: "", revision: 0, units: [], services: [], binding: undefined, error: "SharedWorker disconnected" });
+  };
   port.addEventListener("messageerror", onError);
   if (worker.addEventListener) worker.addEventListener("error", onError);
   else worker.onerror = onError;
@@ -190,13 +210,52 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
 
   const handle: RuntimeHandle = {
     runtimeKind: "shared-worker", runtimeId: options.id,
+    binding,
+    get endpointState() { return session.state; },
     get runtimeInstanceId() { return workerInstanceId.value; },
     state: () => current,
     capability<C extends RemoteCapability>(capability: C): CapabilityClient<C> { return bridge.getClient(capability); },
     optionalCapability<C extends RemoteCapability>(capability: C): CapabilityClient<C> | undefined { return bridge.services().some((service) => service.kind === capability.kind && service.capabilityId === capability.id && service.contractVersion === capability.version) ? bridge.getClient(capability) : undefined; },
     inspect: () => Object.freeze({ ...current, pendingCallCount: bridge.pendingCallCount, activeStreamCount: bridge.activeStreamCount, peerCount: current.state === "ready" ? 1 : 0 }),
     subscribe(listener) { listeners.add(listener); listener(current); return () => listeners.delete(listener); },
-    dispose(reason = "SharedWorker connection disposed"): Promise<void> { if (disposed) return Promise.resolve(); disposed = true; emit({ ...current, state: "stopping" }); removeClient?.(); removeRaw(); clientPeerScope?.revoke(reason); provider?.dispose(); bridge.dispose(reason); port.removeEventListener("messageerror", onError); worker.removeEventListener?.("error", onError); transport.close?.(); emit({ ...current, state: "disposed", runtimeInstanceId: "", revision: 0, units: [], services: [] }); return clientPeerScope ? clientPeerScope.dispose({ reason }).then(() => undefined) : Promise.resolve(); },
+    beginClose(reason = "SharedWorker connection closing"): void {
+      if (disposed) return;
+      session.beginClose(reason);
+      clientPeerScope?.revoke(reason);
+    },
+    drain(timeoutMs): Promise<import("../contracts/lifecycle.js").RuntimeDrainResult> {
+      session.beginClose("SharedWorker connection drain requested");
+      clientPeerScope?.revoke("SharedWorker connection drain requested");
+      return bridge.drain(timeoutMs);
+    },
+    dispose(reason = "SharedWorker connection disposed"): Promise<void> {
+      if (disposed) return Promise.resolve();
+      if (disposePromise) return disposePromise;
+      disposePromise = (async () => {
+        emit({ ...current, state: "stopping" });
+        removeClient?.();
+        removeRaw();
+        clientPeerScope?.revoke(reason);
+        // Keep `disposed` false until the shared session has synchronously
+        // notified the bridge/provider.  Their onBeginClose listeners are the
+        // admission fence for local pending calls and reverse handlers.
+        session.beginClose(reason);
+        // Keep the bridge listener alive for the close acknowledgement. The
+        // provider is fenced synchronously by the shared session callback.
+        const drainResult = bridge.drain();
+        await drainResult.catch(() => undefined);
+        disposed = true;
+        provider?.dispose();
+        bridge.dispose(reason);
+        port.removeEventListener("messageerror", onError);
+        worker.removeEventListener?.("error", onError);
+        transport.close?.();
+        session.close();
+        emit({ ...current, state: "disposed", runtimeInstanceId: "", revision: 0, units: [], services: [], binding: undefined });
+        if (clientPeerScope) await clientPeerScope.dispose({ reason });
+      })();
+      return disposePromise;
+    },
   };
   handleBridges.set(handle as object, bridge);
   return handle;
