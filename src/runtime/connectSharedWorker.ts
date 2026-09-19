@@ -5,7 +5,8 @@ import { capabilityKey } from "../contracts/capability.js";
 import type { LifecycleDisposeResult, RuntimeEndpointBinding, RuntimeSnapshot } from "../contracts/lifecycle.js";
 import { WebLoomError } from "../contracts/lifecycle.js";
 import { createCapabilityPeerView, createPeerScopeView } from "./peerView.js";
-import { cloneFrozenAttributes, createRuntimeBudget, normalizeRuntimeLimits, type RuntimeBudget, type RuntimeLimitsInput } from "../transport/dto.js";
+import { cloneFrozenAttributes, createRuntimeBudget, mergeRuntimeLimits, normalizeRuntimeLimits, type RuntimeBudget, type RuntimeLimitsInput } from "../transport/dto.js";
+import type { RuntimeTrafficBudget } from "./trafficBudget.js";
 import type { WindowApp, RuntimeHandle, RuntimeStatusListener, RuntimeStatusSnapshot } from "./runtimeTypes.js";
 import { RuntimeUnavailableError } from "./runtimeTypes.js";
 import { createCapabilityBridge } from "../transport/serviceBridge.js";
@@ -13,7 +14,7 @@ import { createMessagePortRuntimeTransport, type MessagePortLike } from "../tran
 import { createMessagePortServiceProvider } from "../transport/messagePortServiceProvider.js";
 import { invokeCapabilityHandler } from "../host/capabilityRegistry.js";
 import { hostForWindowApp } from "./windowRuntime.js";
-import { RUNTIME_ERROR_TYPE, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE } from "./runtimeProtocol.js";
+import { RUNTIME_ERROR_TYPE, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE, type RuntimeWireMessage } from "./runtimeProtocol.js";
 import { createRuntimeEndpointBinding, createRuntimeEndpointSession } from "./runtimeSession.js";
 
 export interface SharedWorkerLike {
@@ -47,6 +48,8 @@ export interface ConnectSharedWorkerOptions {
   readonly defaultCallTimeoutMs?: number;
   /** 可信 transport 配额；只能使用默认值或收紧。 */
   readonly limits?: RuntimeLimitsInput;
+  /** 可选的 Window 级共享双向预算；多个 RuntimeHandle 可复用同一对象。 */
+  readonly trafficBudget?: RuntimeTrafficBudget;
   /** 可选的页面反向能力。 */
   readonly client?: SharedWorkerClientExposure;
 }
@@ -93,7 +96,12 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
   const worker = makeWorker(options);
   const port = worker.port;
   if (!port) throw new RuntimeUnavailableError("SharedWorker did not expose a MessagePort");
-  const limits = normalizeRuntimeLimits(options.limits);
+  const requestedLimits = normalizeRuntimeLimits(options.limits);
+  const outboundBudget: RuntimeBudget = options.trafficBudget?.outbound ?? createRuntimeBudget(requestedLimits);
+  const inboundBudget: RuntimeBudget = options.trafficBudget?.inbound ?? createRuntimeBudget(requestedLimits);
+  // A shared budget is a runtime-global fence. Every handle uses the stricter
+  // intersection, so a handle omitting limits cannot widen the shared quota.
+  const limits = mergeRuntimeLimits(requestedLimits, outboundBudget, inboundBudget);
   const transport = createMessagePortRuntimeTransport({
     addEventListener(type, listener) { port.addEventListener(type, listener); },
     removeEventListener(type, listener) { port.removeEventListener(type, listener); },
@@ -101,8 +109,6 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
     start() { port.start(); },
     close() { try { port.close(); } catch { /* noop */ } },
   }, { limits });
-  const outboundBudget: RuntimeBudget = createRuntimeBudget(limits);
-  const inboundBudget: RuntimeBudget = createRuntimeBudget(limits);
   const localRuntimeInstanceId = options.client?.app.runtimeInstanceId ?? `window:${Date.now().toString(36)}`;
   const binding = createRuntimeEndpointBinding(localRuntimeInstanceId);
   const session = createRuntimeEndpointSession(binding);
@@ -178,7 +184,7 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
 
   const emit = (next: RuntimeStatusSnapshot): void => { current = Object.freeze({ ...next, units: Object.freeze([...next.units]), services: Object.freeze([...next.services]) }); for (const listener of [...listeners]) { try { listener(current); } catch { /* observer isolation */ } } };
   const sendClientSnapshot = (): void => { if (!options.client || disposed) return; revision += 1; try { transport.send(snapshotForClient(options.client.app, `${options.client.app.runtimeId}`, localRuntimeInstanceId, binding, exposed, revision)); } catch { /* bridge deadline handles disconnect */ } };
-  const removeRaw = transport.subscribe((messageValue) => {
+  const handleRaw = (messageValue: RuntimeWireMessage): void => {
     if (messageValue.type === RUNTIME_SNAPSHOT_TYPE && messageValue.runtimeKind === "shared-worker") {
       const applied = bridge.applySnapshot(messageValue);
       if (applied.accepted) {
@@ -189,7 +195,10 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
       bridge.invalidate(messageValue.message);
       emit({ ...current, state: "failed", error: messageValue.message, units: [], services: [] });
     }
-  });
+  };
+  const removeRaw = transport.subscribeByType
+    ? transport.subscribeByType([RUNTIME_SNAPSHOT_TYPE, RUNTIME_ERROR_TYPE], handleRaw)
+    : transport.subscribe(handleRaw);
   const onError = (): void => {
     if (disposed) return;
     // A physical port failure is itself a lifecycle fence.  Close the shared

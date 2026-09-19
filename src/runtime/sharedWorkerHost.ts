@@ -160,7 +160,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
   // per-peer limits remain enforced inside each bridge/provider.
   const outboundBudget: RuntimeBudget = createRuntimeBudget(limits);
   const inboundBudget: RuntimeBudget = createRuntimeBudget(limits);
-  const runtimeCodec = createRuntimeMessageCodec();
+  const runtimeCodec = createRuntimeMessageCodec({ limits });
   const peerExposureAllowlist = options.peerExposureAllowlist === undefined
     ? undefined
     : new Set(options.peerExposureAllowlist.map((capability) => capabilityKey(capability)));

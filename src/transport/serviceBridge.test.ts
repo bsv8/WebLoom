@@ -15,6 +15,7 @@ import {
   type RuntimeSnapshotMessage,
 } from "../runtime/runtimeProtocol.js";
 import { createRuntimeBudget } from "./dto.js";
+import { createRuntimeTrafficBudget } from "../runtime/trafficBudget.js";
 import { createCapabilityBridge } from "./serviceBridge.js";
 import { createMessagePortRuntimeTransport } from "./messagePortServiceTransport.js";
 import { createRuntimeEndpointSession } from "../runtime/runtimeSession.js";
@@ -186,7 +187,7 @@ describe("v4 capability bridge", () => {
     const subscription = bridge.getClient(Events).subscribe({ topic: "binding-fence" }, { initialCredit: 1, onNext: (value) => { values.push(value); } });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
     await subscription.ready;
     transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: wrongBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 7 });
     await expect(subscription.closed).rejects.toMatchObject({ code: "invalid_message" });
@@ -216,7 +217,7 @@ describe("v4 capability bridge", () => {
     const subscription = bridge.getClient(Events).subscribe({ topic: "binding-credit" }, { initialCredit: 1, onNext: () => undefined });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
     await subscription.ready;
     transport.emit({ type: RUNTIME_CREDIT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: wrongBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, count: 1 });
     await expect(subscription.closed).rejects.toMatchObject({ code: "invalid_message" });
@@ -285,7 +286,7 @@ describe("v4 capability bridge", () => {
     bridge.applySnapshot(streamSnapshot());
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== "webloom.runtime.v1.call") throw new Error("stream call was not sent");
-    transport.emit({ type: "webloom.runtime.v1.result", protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: "webloom.runtime.v1.result", protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
     await subscription.ready;
     transport.emit({ type: "webloom.runtime.v1.next", protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 7 });
     await Promise.resolve();
@@ -297,6 +298,182 @@ describe("v4 capability bridge", () => {
     transport.emit({ type: "webloom.runtime.v1.result", protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, done: true });
     await subscription.closed;
     expect(bridge.activeStreamCount).toBe(0);
+  });
+
+  it("rebuilds a waiting payload before dispatch after the caller mutates it", async () => {
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({
+      transport,
+      limits: { maxDtoDepth: 8 },
+      defaultCallTimeoutMs: 500,
+    });
+    const request = { value: "before" } as { value: string; extra?: string };
+    const pending = bridge.getClient(Echo).call(request);
+    let nested: unknown = "deep";
+    for (let depth = 0; depth < 12; depth += 1) nested = { next: nested };
+    request.extra = nested as string;
+    bridge.applySnapshot(snapshot());
+    await expect(pending).rejects.toMatchObject({ code: "resource_limit_exceeded" });
+    expect(transport.sent.some((entry) => entry.message.type === RUNTIME_CALL_TYPE)).toBe(false);
+    bridge.dispose();
+  });
+
+  it("enforces one shared pending-call budget across two bridge handles", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxPendingCallsPerRuntime: 1 });
+    const firstTransport = createFakeRuntimeTransport();
+    const secondTransport = createFakeRuntimeTransport();
+    const firstBridge = createCapabilityBridge({ transport: firstTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    const secondBridge = createCapabilityBridge({ transport: secondTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    firstBridge.applySnapshot(snapshot());
+    secondBridge.applySnapshot(snapshot("service:two"));
+    const first = firstBridge.getClient(Echo).call({ value: "first" });
+    expect(traffic.outbound.pendingCalls).toBe(1);
+    await expect(secondBridge.getClient(Echo).call({ value: "second" })).rejects.toMatchObject({ code: "resource_limit_exceeded" });
+    const call = firstTransport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("first call was not sent");
+    firstTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, result: { result: "ok" } });
+    await expect(first).resolves.toEqual({ result: "ok" });
+    expect(traffic.outbound.pendingCalls).toBe(0);
+    firstBridge.dispose();
+    secondBridge.dispose();
+  });
+
+  it("allocates stream byte windows from the shared runtime quota and returns them on cancel", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxRetainedPayloadBytesPerRuntime: 256 });
+    const firstTransport = createFakeRuntimeTransport();
+    const secondTransport = createFakeRuntimeTransport();
+    const firstBridge = createCapabilityBridge({ transport: firstTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    const secondBridge = createCapabilityBridge({ transport: secondTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    firstBridge.applySnapshot(streamSnapshot());
+    secondBridge.applySnapshot(streamSnapshot());
+    const first = firstBridge.getClient(Events).subscribe({ topic: "first" }, { initialCredit: 1, initialByteCredit: 128, onNext: () => undefined });
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(128);
+    const second = secondBridge.getClient(Events).subscribe({ topic: "second" }, { initialCredit: 1, initialByteCredit: 128, onNext: () => undefined });
+    await expect(second.ready).rejects.toMatchObject({ code: "resource_limit_exceeded" });
+    first.cancel();
+    await first.closed.catch(() => undefined);
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(0);
+    firstBridge.dispose();
+    secondBridge.dispose();
+  });
+
+  it("allows two default streams across handles to share the RuntimeTrafficBudget", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxRetainedPayloadBytesPerRuntime: 1_024 });
+    const firstTransport = createFakeRuntimeTransport();
+    const secondTransport = createFakeRuntimeTransport();
+    const firstBridge = createCapabilityBridge({ transport: firstTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    const secondBridge = createCapabilityBridge({ transport: secondTransport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    firstBridge.applySnapshot(streamSnapshot());
+    secondBridge.applySnapshot(streamSnapshot());
+    const first = firstBridge.getClient(Events).subscribe({ topic: "default-first" }, { initialCredit: 1, onNext: () => undefined });
+    const second = secondBridge.getClient(Events).subscribe({ topic: "default-second" }, { initialCredit: 1, onNext: () => undefined });
+    const firstCall = firstTransport.sent.at(-1)?.message;
+    const secondCall = secondTransport.sent.at(-1)?.message;
+    if (!firstCall || firstCall.type !== RUNTIME_CALL_TYPE || firstCall.mode !== "stream" || !secondCall || secondCall.type !== RUNTIME_CALL_TYPE || secondCall.mode !== "stream") throw new Error("default stream calls were not sent");
+    expect(firstCall.initialByteCredit).toBe(8);
+    expect(secondCall.initialByteCredit).toBe(8);
+    expect(traffic.outbound.activeStreams).toBe(2);
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(16);
+    firstTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: firstCall.callId, serviceInstanceId: firstCall.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: firstCall.initialByteCredit });
+    secondTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: secondCall.callId, serviceInstanceId: secondCall.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: secondCall.initialByteCredit });
+    await Promise.all([first.ready, second.ready]);
+    first.cancel();
+    second.cancel();
+    await Promise.all([first.closed.catch(() => undefined), second.closed.catch(() => undefined)]);
+    expect(traffic.outbound.activeStreams).toBe(0);
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(0);
+    firstBridge.dispose();
+    secondBridge.dispose();
+  });
+
+  it("chooses an available default byte window when the runtime retained limit is smaller", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxRetainedPayloadBytesPerRuntime: 1_024 });
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({ transport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    bridge.applySnapshot(streamSnapshot());
+    const subscription = bridge.getClient(Events).subscribe({ topic: "small-runtime-budget" }, { initialCredit: 1, onNext: () => undefined });
+    const call = transport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
+    expect(call.initialByteCredit).toBeGreaterThan(0);
+    expect(traffic.outbound.reservedStreamByteCredit).toBeGreaterThan(0);
+    expect(traffic.outbound.reservedStreamByteCredit).toBeLessThanOrEqual(1_024);
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
+    await subscription.ready;
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, done: true });
+    await subscription.closed;
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(0);
+    bridge.dispose();
+  });
+
+  it("shrinks the local stream reservation to the provider's accepted window", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxRetainedPayloadBytesPerRuntime: 1_024 });
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({ transport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    bridge.applySnapshot(streamSnapshot());
+    const subscription = bridge.getClient(Events).subscribe({ topic: "negotiated-window" }, { initialCredit: 1, onNext: () => undefined });
+    const call = transport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
+    expect(call.initialByteCredit).toBe(8);
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: 8 });
+    await subscription.ready;
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(8);
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, done: true });
+    await subscription.closed;
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(0);
+    bridge.dispose();
+  });
+
+  it("rejects a provider that narrows an explicitly requested byte window", async () => {
+    const traffic = createRuntimeTrafficBudget({ maxRetainedPayloadBytesPerRuntime: 1_024 });
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({ transport, budget: traffic.outbound, defaultCallTimeoutMs: 500 });
+    bridge.applySnapshot(streamSnapshot());
+    const subscription = bridge.getClient(Events).subscribe({ topic: "explicit-window" }, { initialCredit: 1, initialByteCredit: 128, onNext: () => undefined });
+    const call = transport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: 64 });
+    await expect(subscription.ready).rejects.toMatchObject({ code: "stream_overflow" });
+    await expect(subscription.closed).rejects.toMatchObject({ code: "stream_overflow" });
+    expect(traffic.outbound.reservedStreamByteCredit).toBe(0);
+    bridge.dispose();
+  });
+
+  it("snapshots stream options before waiting for a service", async () => {
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({ transport, defaultCallTimeoutMs: 500 });
+    const mutableOptions = { initialCredit: 1, initialByteCredit: 128, onNext: () => undefined };
+    const subscription = bridge.getClient(Events).subscribe({ topic: "options-snapshot" }, mutableOptions);
+    mutableOptions.initialByteCredit = 64;
+    bridge.applySnapshot(streamSnapshot());
+    const call = transport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
+    expect(call.initialByteCredit).toBe(128);
+    expect(bridge.pendingCallCount).toBe(1);
+    subscription.cancel();
+    await subscription.closed.catch(() => undefined);
+    bridge.dispose();
+  });
+
+  it("batches small stream credit returns into fewer control messages", async () => {
+    const transport = createFakeRuntimeTransport();
+    const bridge = createCapabilityBridge({ transport, defaultCallTimeoutMs: 500 });
+    bridge.applySnapshot(streamSnapshot());
+    const values: number[] = [];
+    const subscription = bridge.getClient(Events).subscribe({ topic: "batch" }, { initialCredit: 16, onNext: (value) => { values.push(value); } });
+    const call = transport.sent.at(-1)?.message;
+    if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
+    await subscription.ready;
+    for (let sequence = 1; sequence <= 16; sequence += 1) {
+      transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence, item: sequence });
+    }
+    for (let attempt = 0; attempt < 20 && values.length < 16; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(values).toHaveLength(16);
+    const credits = transport.sent.filter((entry) => entry.message.type === RUNTIME_CREDIT_TYPE);
+    expect(credits.length).toBeLessThan(16);
+    subscription.cancel();
+    await subscription.closed.catch(() => undefined);
+    bridge.dispose();
   });
 
   it("releases a callback execution slot and wakes a second peer sharing the runtime budget", async () => {
@@ -319,8 +496,8 @@ describe("v4 capability bridge", () => {
     const firstStreamCall = firstTransport.sent.at(-1)?.message;
     const secondStreamCall = secondTransport.sent.at(-1)?.message;
     if (!firstStreamCall || firstStreamCall.type !== RUNTIME_CALL_TYPE || !secondStreamCall || secondStreamCall.type !== RUNTIME_CALL_TYPE) throw new Error("stream subscriptions were not sent");
-    firstTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: firstStreamCall.callId, serviceInstanceId: firstStreamCall.serviceInstanceId, streamReady: true });
-    secondTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: secondStreamCall.callId, serviceInstanceId: secondStreamCall.serviceInstanceId, streamReady: true });
+    firstTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: firstStreamCall.callId, serviceInstanceId: firstStreamCall.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: firstStreamCall.initialByteCredit ?? 1 });
+    secondTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: secondStreamCall.callId, serviceInstanceId: secondStreamCall.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: secondStreamCall.initialByteCredit ?? 1 });
     await Promise.all([first.ready, second.ready]);
     firstTransport.emit({ type: "webloom.runtime.v1.next", protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: remoteBinding, callId: firstStreamCall.callId, serviceInstanceId: firstStreamCall.serviceInstanceId, sequence: 1, item: 1 });
     await Promise.resolve();

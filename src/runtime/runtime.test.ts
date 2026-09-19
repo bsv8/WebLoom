@@ -3,6 +3,7 @@ import { defineCapability, type RemoteCapability } from "../contracts/capability
 import { definePlugin } from "../authoring/definePlugin.js";
 import { createWindowApp } from "./windowRuntime.js";
 import { connectSharedWorkerForTesting } from "./connectSharedWorker.js";
+import { createRuntimeTrafficBudget } from "./trafficBudget.js";
 import { startSharedWorkerAppForTesting, type SharedWorkerScopeLike, type StartSharedWorkerAppForTestingOptions } from "./sharedWorkerHost.js";
 import {
   createRuntimeMessageCodec,
@@ -150,6 +151,36 @@ describe("v4 Runtime", () => {
     expect(firstService).toBeTruthy();
     expect(secondService).toBeTruthy();
     expect(firstService).not.toBe(secondService);
+    await first.dispose();
+    await second.dispose();
+    await worker.workerApp.dispose();
+  });
+
+  it("enforces a shared traffic budget across two real RuntimeHandles", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const workerPlugin = definePlugin({
+      id: "shared-budget-provider",
+      provides: [Echo] as const,
+      startup: "required" as const,
+      setup(ctx) {
+        ctx.handle(Echo, async (request) => {
+          await gate;
+          return { result: request.value };
+        });
+      },
+    });
+    const worker = createWorker(workerPlugin);
+    const traffic = createRuntimeTrafficBudget({ maxPendingCallsPerRuntime: 1 });
+    const first = connectSharedWorkerForTesting({ id: "runtime-worker", url: "/worker.js", trafficBudget: traffic }, worker.factory);
+    const second = connectSharedWorkerForTesting({ id: "runtime-worker", url: "/worker.js", trafficBudget: traffic }, worker.factory);
+    await worker.workerApp.ready();
+    const firstCall = first.capability(Echo).call({ value: "first" });
+    expect(traffic.outbound.pendingCalls).toBe(1);
+    await expect(second.capability(Echo).call({ value: "second" })).rejects.toMatchObject({ code: "resource_limit_exceeded" });
+    release();
+    await expect(firstCall).resolves.toEqual({ result: "first" });
+    expect(traffic.outbound.pendingCalls).toBe(0);
     await first.dispose();
     await second.dispose();
     await worker.workerApp.dispose();

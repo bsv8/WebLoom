@@ -15,6 +15,8 @@ export { createWindowApp } from "./runtime/windowRuntime.js";
 export type { CreateWindowAppOptions } from "./runtime/windowRuntime.js";
 export { connectSharedWorker } from "./runtime/connectSharedWorker.js";
 export type { ConnectSharedWorkerOptions, SharedWorkerLike } from "./runtime/connectSharedWorker.js";
+export { createRuntimeTrafficBudget } from "./runtime/trafficBudget.js";
+export type { RuntimeTrafficBudget } from "./runtime/trafficBudget.js";
 export { startSharedWorkerApp } from "./runtime/sharedWorkerHost.js";
 export type { ActivePeerSnapshot, StartSharedWorkerAppOptions, SharedWorkerApp, PeerController, PeerExposureOptions, PeerLifecycleEvent } from "./runtime/sharedWorkerHost.js";
 export type { AppLike, WindowApp, RuntimeHandle, RuntimeStatusSnapshot, RuntimeStatusListener } from "./runtime/runtimeTypes.js";

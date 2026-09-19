@@ -2,7 +2,7 @@
 
 import type { RuntimeServiceSnapshot, RuntimeSnapshot, RuntimeKind, RuntimeEndpointBinding } from "../contracts/lifecycle.js";
 import { WebLoomError } from "../contracts/lifecycle.js";
-import { ATTRIBUTES_DTO_LIMITS, validateDto } from "../transport/dto.js";
+import { ATTRIBUTES_DTO_LIMITS, isPreparedPayload, normalizeRuntimeLimits, validateDto, type DtoStats, type PreparedPayload, type RuntimeLimitsInput } from "../transport/dto.js";
 
 export const RUNTIME_PROTOCOL_VERSION = "webloom.runtime.v1" as const;
 export const RUNTIME_SNAPSHOT_TYPE = `${RUNTIME_PROTOCOL_VERSION}.snapshot` as const;
@@ -53,7 +53,7 @@ export interface RuntimeErrorMessage {
   readonly unitId?: string;
 }
 
-export interface RuntimeCallMessage {
+interface RuntimeCallMessageBase {
   /** 消息类型。 */
   readonly type: typeof RUNTIME_CALL_TYPE;
   /** 协议版本。 */
@@ -78,9 +78,31 @@ export interface RuntimeCallMessage {
   readonly operationId?: string;
   /** 领域授权标识。 */
   readonly grantId?: string;
-  /** stream 初始 credit。 */
-  readonly initialCredit?: number;
 }
+
+export interface RuntimeUnaryCallMessage extends RuntimeCallMessageBase {
+  /** 调用模式。 */
+  readonly mode: "unary";
+  /** unary 请求不携带 stream credit。 */
+  readonly initialCredit?: never;
+  /** unary 请求不携带 stream 字节 credit。 */
+  readonly initialByteCredit?: never;
+  /** unary 请求不携带默认窗口协商标记。 */
+  readonly initialByteCreditAuto?: never;
+}
+
+export interface RuntimeStreamCallMessage extends RuntimeCallMessageBase {
+  /** 调用模式。 */
+  readonly mode: "stream";
+  /** stream 初始 credit。 */
+  readonly initialCredit: number;
+  /** stream 初始字节 credit；按 DTO budgetBytes 计费，必须由调用端确定并发送。 */
+  readonly initialByteCredit: number;
+  /** 未显式配置时允许 Provider 按自身剩余容量缩小窗口。 */
+  readonly initialByteCreditAuto?: true;
+}
+
+export type RuntimeCallMessage = RuntimeUnaryCallMessage | RuntimeStreamCallMessage;
 
 export interface RuntimeUnaryResultMessage {
   /** 消息类型。 */
@@ -110,6 +132,8 @@ export interface RuntimeStreamReadyMessage {
   readonly serviceInstanceId: string;
   /** stream 建立确认。 */
   readonly streamReady: true;
+  /** Provider 实际接受并预留的初始字节窗口。 */
+  readonly acceptedInitialByteCredit: number;
 }
 
 export interface RuntimeStreamDoneMessage {
@@ -187,6 +211,8 @@ export interface RuntimeCreditMessage {
   readonly serviceInstanceId: string;
   /** 新增 credit。 */
   readonly count: number;
+  /** 新增字节 credit；旧 v1 消息可省略，接收端会按已发送 item 兼容推导。 */
+  readonly bytes?: number;
 }
 
 /** 请求对端先同步 fence、再等待真实执行排空。 */
@@ -221,6 +247,27 @@ export interface RuntimeCloseAckMessage {
 
 export type RuntimeWireMessage = RuntimeSnapshotMessage | RuntimeErrorMessage | RuntimeCallMessage | RuntimeResultMessage | RuntimeErrorResponseMessage | RuntimeCancelMessage | RuntimeNextMessage | RuntimeCreditMessage | RuntimeCloseMessage | RuntimeCloseAckMessage;
 
+/** wire payload 在一次 transport decode 中对应的字段。 */
+export type RuntimePayloadField = "request" | "result" | "item";
+
+/** transport 已完成一次 payload walker 后交给本地 listener 的元数据。 */
+export interface RuntimeDecodedPayload {
+  /** payload 所在 wire 字段。 */
+  readonly field: RuntimePayloadField;
+  /** 与 stats 对应的原始 payload。 */
+  readonly value: unknown;
+  /** 唯一一次接收端 walker 的结果。 */
+  readonly stats: DtoStats;
+}
+
+/** 一次 decode 的 message 和热 payload 统计。 */
+export interface RuntimeDecodedMessage {
+  /** 已通过 envelope 与 payload 边界检查的 message。 */
+  readonly message: RuntimeWireMessage;
+  /** call/result/next 才有 payload；控制消息没有。 */
+  readonly payload?: RuntimeDecodedPayload;
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -235,7 +282,8 @@ const MAX_VERSION_LENGTH = 64;
 const MAX_ERROR_MESSAGE_LENGTH = 1_024;
 const MAX_SNAPSHOT_UNITS = 512;
 const MAX_SNAPSHOT_SERVICES = 1_024;
-
+const MAX_STREAM_CREDIT = 256;
+const MAX_STREAM_BYTE_CREDIT = 64 * 1024 * 1024;
 function boundedText(value: unknown, maximum: number): value is string {
   return text(value) && value.length <= maximum;
 }
@@ -295,8 +343,12 @@ function validServiceIdentity(message: Record<string, unknown>): boolean {
   return boundedText(message.callId, MAX_CALL_ID_LENGTH) && boundedText(message.serviceInstanceId, MAX_ID_LENGTH);
 }
 
-function validateSnapshot(value: Record<string, unknown>): boolean {
-  if (value.type !== RUNTIME_SNAPSHOT_TYPE || !validIdentity(value) || !validBinding(value.binding) || !boundedText(value.runtimeId, MAX_ID_LENGTH) || !boundedText(value.runtimeInstanceId, MAX_ID_LENGTH) || (value.runtimeKind !== "window-main" && value.runtimeKind !== "shared-worker") || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !["starting", "ready", "stopping", "failed", "disposed"].includes(String(value.state)) || !Array.isArray(value.units) || !Array.isArray(value.services) || value.units.length > MAX_SNAPSHOT_UNITS || value.services.length > MAX_SNAPSHOT_SERVICES) return false;
+function dtoLimits(limits: ReturnType<typeof normalizeRuntimeLimits>): { readonly maxDepth: number; readonly maxNodes: number; readonly maxEdges: number; readonly maxBudgetBytes: number } {
+  return { maxDepth: limits.maxDtoDepth, maxNodes: limits.maxDtoNodes, maxEdges: limits.maxDtoEdges, maxBudgetBytes: limits.maxMessageBudgetBytes };
+}
+
+function validateSnapshot(value: Record<string, unknown>, limits: ReturnType<typeof normalizeRuntimeLimits>): boolean {
+  if (value.type !== RUNTIME_SNAPSHOT_TYPE || !validIdentity(value) || !validBinding(value.binding) || !boundedText(value.runtimeId, MAX_ID_LENGTH) || !boundedText(value.runtimeInstanceId, MAX_ID_LENGTH) || (value.runtimeKind !== "window-main" && value.runtimeKind !== "shared-worker") || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !["starting", "ready", "stopping", "failed", "disposed"].includes(String(value.state)) || !Array.isArray(value.units) || !Array.isArray(value.services) || value.units.length > Math.min(MAX_SNAPSHOT_UNITS, limits.maxSnapshotUnits) || value.services.length > Math.min(MAX_SNAPSHOT_SERVICES, limits.maxSnapshotServices)) return false;
   if (value.state !== "ready" && value.services.length !== 0) return false;
   const unitKeys = new Set<string>();
   for (const unit of value.units) {
@@ -319,51 +371,91 @@ function validateSnapshot(value: Record<string, unknown>): boolean {
     if (serviceKeys.has(key)) return false;
     serviceKeys.add(key);
   }
-  return true;
-}
-
-function validateMessage(value: unknown): value is RuntimeWireMessage {
-  if (!record(value) || !text(value.type) || !validIdentity(value)) return false;
-  if (value.type === RUNTIME_SNAPSHOT_TYPE) return validateSnapshot(value);
-  if (!validBinding(value.binding) && value.type !== RUNTIME_SNAPSHOT_TYPE) return false;
-  if (value.type === RUNTIME_ERROR_TYPE) return boundedText(value.code, MAX_ID_LENGTH) && boundedText(value.message, MAX_ERROR_MESSAGE_LENGTH) && phase(value.phase) && (value.pluginId === undefined || boundedText(value.pluginId, MAX_ID_LENGTH)) && (value.unitId === undefined || boundedText(value.unitId, MAX_ID_LENGTH));
-  if (value.type === RUNTIME_CALL_TYPE) return validServiceIdentity(value) && boundedText(value.capabilityId, MAX_ID_LENGTH) && boundedText(value.contractVersion, MAX_VERSION_LENGTH) && Object.hasOwn(value, "request") && validPayload(value.request) && (value.mode === "unary" || value.mode === "stream") && typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= 300_000 && (value.operationId === undefined || boundedText(value.operationId, MAX_ID_LENGTH)) && (value.grantId === undefined || boundedText(value.grantId, MAX_ID_LENGTH)) && (value.mode !== "stream" ? !Object.hasOwn(value, "initialCredit") : (Number.isSafeInteger(value.initialCredit) && (value.initialCredit as number) >= 1 && (value.initialCredit as number) <= 256));
-  if (value.type === RUNTIME_RESULT_TYPE) return validServiceIdentity(value) && ((!Object.hasOwn(value, "result") || validPayload(value.result)) && ((value.streamReady === true && !Object.hasOwn(value, "result") && !Object.hasOwn(value, "done")) || (value.done === true && !Object.hasOwn(value, "result") && !Object.hasOwn(value, "streamReady")) || (Object.hasOwn(value, "result") && !Object.hasOwn(value, "done") && !Object.hasOwn(value, "streamReady"))));
-  if (value.type === RUNTIME_ERROR_MESSAGE_TYPE) return validServiceIdentity(value) && record(value.error) && boundedText(value.error.code, MAX_ID_LENGTH) && boundedText(value.error.message, MAX_ERROR_MESSAGE_LENGTH) && phase(value.error.phase) && validDetails(value.error.details);
-  if (value.type === RUNTIME_CANCEL_TYPE) return validServiceIdentity(value);
-  if (value.type === RUNTIME_NEXT_TYPE) return validServiceIdentity(value) && Object.hasOwn(value, "item") && validPayload(value.item) && Number.isSafeInteger(value.sequence) && (value.sequence as number) >= 1;
-  if (value.type === RUNTIME_CREDIT_TYPE) return validServiceIdentity(value) && Number.isSafeInteger(value.count) && (value.count as number) >= 1 && (value.count as number) <= 256;
-  if (value.type === RUNTIME_CLOSE_TYPE) return !Object.hasOwn(value, "reason") && (value.timeoutMs === undefined || (Number.isFinite(value.timeoutMs) && (value.timeoutMs as number) >= 1 && (value.timeoutMs as number) <= 300_000));
-  if (value.type === RUNTIME_CLOSE_ACK_TYPE) return validBinding(value.acknowledgedBinding) && validDrainResult(value);
-  return false;
-}
-
-function validPayload(value: unknown): boolean {
   try {
-    validateDto(value, { allowUnlistedMessagePorts: true, phase: "validate" });
+    validateDto(value, { limits: dtoLimits(limits), phase: "validate" });
     return true;
   } catch {
     return false;
   }
 }
 
-export interface RuntimeMessageCodec {
-  /** 严格验证并冻结 v4 message。 */
-  encode(message: RuntimeWireMessage): RuntimeWireMessage;
-  /** 严格解析 v4 message；旧协议直接拒绝。 */
-  decode(value: unknown): RuntimeWireMessage;
+function validPayload(value: unknown, prepared: PreparedPayload | undefined, limits: ReturnType<typeof normalizeRuntimeLimits>): DtoStats | undefined {
+  if (prepared && isPreparedPayload(prepared) && prepared.value === value) {
+    const stats = prepared.stats;
+    return stats.depth <= limits.maxDtoDepth
+      && stats.nodes <= limits.maxDtoNodes
+      && stats.edges <= limits.maxDtoEdges
+      && stats.budgetBytes <= limits.maxMessageBudgetBytes
+      ? stats
+      : undefined;
+  }
+  try {
+    return validateDto(value, { limits: dtoLimits(limits), allowUnlistedMessagePorts: true, phase: "validate" });
+  } catch {
+    return undefined;
+  }
 }
 
-export function createRuntimeMessageCodec(): RuntimeMessageCodec {
+interface MessageValidationResult {
+  readonly valid: boolean;
+  readonly payload?: RuntimeDecodedPayload;
+}
+
+function validateMessage(value: unknown, prepared: PreparedPayload | undefined, limits: ReturnType<typeof normalizeRuntimeLimits>): MessageValidationResult {
+  if (!record(value) || !text(value.type) || !validIdentity(value)) return { valid: false };
+  if (value.type === RUNTIME_SNAPSHOT_TYPE) return { valid: validateSnapshot(value, limits) };
+  if (!validBinding(value.binding)) return { valid: false };
+  if (value.type === RUNTIME_ERROR_TYPE) return { valid: boundedText(value.code, MAX_ID_LENGTH) && boundedText(value.message, MAX_ERROR_MESSAGE_LENGTH) && phase(value.phase) && (value.pluginId === undefined || boundedText(value.pluginId, MAX_ID_LENGTH)) && (value.unitId === undefined || boundedText(value.unitId, MAX_ID_LENGTH)) };
+  if (value.type === RUNTIME_CALL_TYPE) {
+    const stats = Object.hasOwn(value, "request") ? validPayload(value.request, prepared, limits) : undefined;
+    const valid = validServiceIdentity(value) && boundedText(value.capabilityId, MAX_ID_LENGTH) && boundedText(value.contractVersion, MAX_VERSION_LENGTH) && stats !== undefined && (value.mode === "unary" || value.mode === "stream") && typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= 300_000 && (value.operationId === undefined || boundedText(value.operationId, MAX_ID_LENGTH)) && (value.grantId === undefined || boundedText(value.grantId, MAX_ID_LENGTH)) && (value.mode !== "stream"
+      ? !Object.hasOwn(value, "initialCredit") && !Object.hasOwn(value, "initialByteCredit") && !Object.hasOwn(value, "initialByteCreditAuto")
+      : Number.isSafeInteger(value.initialCredit) && (value.initialCredit as number) >= 1 && (value.initialCredit as number) <= MAX_STREAM_CREDIT && Number.isSafeInteger(value.initialByteCredit) && (value.initialByteCredit as number) >= 1 && (value.initialByteCredit as number) <= MAX_STREAM_BYTE_CREDIT && (value.initialByteCreditAuto === undefined || value.initialByteCreditAuto === true));
+    return { valid, ...(valid && stats ? { payload: { field: "request", value: value.request, stats } } : {}) };
+  }
+  if (value.type === RUNTIME_RESULT_TYPE) {
+    const hasResult = Object.hasOwn(value, "result");
+    const stats = hasResult ? validPayload(value.result, prepared, limits) : undefined;
+    const valid = validServiceIdentity(value) && (!hasResult || stats !== undefined) && ((value.streamReady === true && !hasResult && !Object.hasOwn(value, "done") && Number.isSafeInteger(value.acceptedInitialByteCredit) && (value.acceptedInitialByteCredit as number) >= 1 && (value.acceptedInitialByteCredit as number) <= MAX_STREAM_BYTE_CREDIT) || (value.done === true && !hasResult && !Object.hasOwn(value, "streamReady") && !Object.hasOwn(value, "acceptedInitialByteCredit")) || (hasResult && !Object.hasOwn(value, "done") && !Object.hasOwn(value, "streamReady") && !Object.hasOwn(value, "acceptedInitialByteCredit")));
+    return { valid, ...(valid && stats ? { payload: { field: "result", value: value.result, stats } } : {}) };
+  }
+  if (value.type === RUNTIME_ERROR_MESSAGE_TYPE) return { valid: validServiceIdentity(value) && record(value.error) && boundedText(value.error.code, MAX_ID_LENGTH) && boundedText(value.error.message, MAX_ERROR_MESSAGE_LENGTH) && phase(value.error.phase) && validDetails(value.error.details) };
+  if (value.type === RUNTIME_CANCEL_TYPE) return { valid: validServiceIdentity(value) };
+  if (value.type === RUNTIME_NEXT_TYPE) {
+    const stats = Object.hasOwn(value, "item") ? validPayload(value.item, prepared, limits) : undefined;
+    const valid = validServiceIdentity(value) && stats !== undefined && Number.isSafeInteger(value.sequence) && (value.sequence as number) >= 1;
+    return { valid, ...(valid && stats ? { payload: { field: "item", value: value.item, stats } } : {}) };
+  }
+  if (value.type === RUNTIME_CREDIT_TYPE) return { valid: validServiceIdentity(value) && Number.isSafeInteger(value.count) && (value.count as number) >= 1 && (value.count as number) <= MAX_STREAM_CREDIT && (value.bytes === undefined || (Number.isSafeInteger(value.bytes) && (value.bytes as number) >= 0 && (value.bytes as number) <= MAX_STREAM_BYTE_CREDIT)) };
+  if (value.type === RUNTIME_CLOSE_TYPE) return { valid: !Object.hasOwn(value, "reason") && (value.timeoutMs === undefined || (Number.isFinite(value.timeoutMs) && (value.timeoutMs as number) >= 1 && (value.timeoutMs as number) <= 300_000)) };
+  if (value.type === RUNTIME_CLOSE_ACK_TYPE) return { valid: validBinding(value.acknowledgedBinding) && validDrainResult(value) };
+  return { valid: false };
+}
+
+export interface RuntimeMessageCodec {
+  /** 严格验证并冻结 v4 message。 */
+  encode(message: RuntimeWireMessage, prepared?: PreparedPayload): RuntimeWireMessage;
+  /** 严格解析 v4 message；旧协议直接拒绝。 */
+  decode(value: unknown): RuntimeWireMessage;
+  /** 解析一次并返回热 payload 的 walker 统计，供同一 endpoint 的 listener 复用。 */
+  decodeWithStats(value: unknown): RuntimeDecodedMessage;
+}
+
+export function createRuntimeMessageCodec(options: { readonly limits?: RuntimeLimitsInput } = {}): RuntimeMessageCodec {
+  const limits = normalizeRuntimeLimits(options.limits);
   return {
-    encode(message) {
-      if (!validateMessage(message)) throw new WebLoomError("invalid_snapshot", "Invalid WebLoom runtime message", "validate");
+    encode(message, prepared) {
+      if (!validateMessage(message, prepared, limits).valid) throw new WebLoomError("invalid_snapshot", "Invalid WebLoom runtime message", "validate");
       return message;
     },
     decode(value) {
+      return this.decodeWithStats(value).message;
+    },
+    decodeWithStats(value) {
       if (!record(value) || value.protocolVersion !== RUNTIME_PROTOCOL_VERSION) throw new WebLoomError("protocol_mismatch", "Unsupported WebLoom runtime protocol", "validate");
-      if (!validateMessage(value)) throw new WebLoomError("invalid_snapshot", "Invalid WebLoom runtime message", "validate");
-      return value;
+      const result = validateMessage(value, undefined, limits);
+      if (!result.valid) throw new WebLoomError("invalid_snapshot", "Invalid WebLoom runtime message", "validate");
+      return Object.freeze({ message: value as unknown as RuntimeWireMessage, ...(result.payload ? { payload: Object.freeze(result.payload) } : {}) });
     },
   };
 }

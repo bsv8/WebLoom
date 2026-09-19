@@ -20,13 +20,21 @@ import {
   assertReceivedPortSet,
   cloneFrozenAttributes,
   createReceivePortLedger,
+  createPreparedPayload,
   createRuntimeBudget,
+  consumeRuntimeStreamByteCredit,
+  defaultStreamByteCredit,
   DEFAULT_RUNTIME_LIMITS,
+  mergeRuntimeLimits,
   normalizeRuntimeLimits,
+  releaseRuntimeStreamByteCredit,
+  reserveRuntimeStreamByteCredit,
+  returnRuntimeStreamByteCredit,
   validateDto,
   validateRawDto,
   validateTransferList,
   validateTransferListWithStats,
+  type PreparedPayload,
   type ReceivePortLedger,
   type RuntimeBudget,
   type RuntimeLimitsInput,
@@ -44,6 +52,7 @@ import {
   RUNTIME_PROTOCOL_VERSION,
   RUNTIME_RESULT_TYPE,
   RUNTIME_SNAPSHOT_TYPE,
+  type RuntimeDecodedPayload,
   type RuntimeErrorResponseMessage,
   type RuntimeSnapshotMessage,
   type RuntimeWireMessage,
@@ -63,13 +72,20 @@ export interface RuntimeReceiveMetadata {
   readonly ledger?: ReceivePortLedger;
   /** 物理 endpoint 已完成一次 codec decode。 */
   readonly decoded?: boolean;
+  /** transport 对 request/result/item 完成的一次 DTO walker 结果。 */
+  readonly payload?: RuntimeDecodedPayload;
 }
+
+type RuntimeMessageType = RuntimeWireMessage["type"];
+type RuntimeMessageListener = (message: RuntimeWireMessage, metadata?: RuntimeReceiveMetadata) => void;
 
 export interface RuntimeTransport {
   /** 发送已验证 v4 message；transfer 由契约 extractor 提供。 */
   send(message: RuntimeWireMessage, transfer?: readonly Transferable[]): void;
   /** 订阅接收 message 及本次事件的本地 transfer 元数据。 */
   subscribe(listener: (message: RuntimeWireMessage, metadata?: RuntimeReceiveMetadata) => void): () => void;
+  /** 按 wire type 直接订阅控制面/数据面，避免无关 listener 进入热路径。 */
+  subscribeByType?(types: readonly RuntimeMessageType[], listener: RuntimeMessageListener): () => void;
   /** 关闭本端传输。 */
   close?(): void;
   /** 物理 endpoint 对 decode/接收账本错误的统一通知。 */
@@ -112,8 +128,39 @@ interface QueueItem {
   readonly budgetBytes: number;
 }
 
+/** 高频 stream 交付队列；避免 Array.shift()/unshift() 的整体搬移。 */
+class QueueDeque<T> {
+  private values: Array<T | undefined> = [];
+  private head = 0;
+
+  get length(): number { return this.values.length - this.head; }
+
+  push(value: T): void { this.values.push(value); }
+
+  shift(): T | undefined {
+    if (this.head >= this.values.length) return undefined;
+    const value = this.values[this.head];
+    this.values[this.head] = undefined;
+    this.head += 1;
+    if (this.head >= 64 && this.head * 2 >= this.values.length) {
+      this.values = this.values.slice(this.head);
+      this.head = 0;
+    }
+    return value;
+  }
+
+  drain(): T[] {
+    const remaining = this.values.slice(this.head) as T[];
+    this.values = [];
+    this.head = 0;
+    return remaining;
+  }
+}
+
 interface QuotaReservation {
-  readonly payloadBytes: number;
+  payloadBytes: number;
+  streamByteCredit: number;
+  byteCreditReserved: boolean;
   pendingReserved: boolean;
   streamReserved: boolean;
   payloadReserved: boolean;
@@ -121,7 +168,8 @@ interface QuotaReservation {
 
 interface WaitingCallRecord {
   readonly proxy: ProxyRecord;
-  readonly prepared: { readonly value: unknown; readonly transfer: readonly Transferable[]; readonly budgetBytes: number };
+  prepared: PreparedPayload;
+  readonly prepare: () => PreparedPayload;
   readonly reservation: QuotaReservation;
   readonly deadline: number;
   readonly mode: "unary" | "stream";
@@ -136,6 +184,7 @@ interface CallbackExecutionRecord {
   readonly stream: PendingStream;
   readonly item: QueueItem;
   released: boolean;
+  creditReturned: boolean;
 }
 
 interface PendingBase {
@@ -165,11 +214,25 @@ interface PendingStream extends PendingBase {
   readonly onNext: (value: unknown) => void | Promise<void>;
   readonly itemParser: { parse(value: unknown): unknown };
   readonly window: number;
+  /** 是否由调用方省略初始字节窗口，允许 Provider 自动缩小。 */
+  readonly initialByteCreditAuto: boolean;
   readonly resolveReady: () => void;
   readonly rejectReady: (error: unknown) => void;
   readonly resolveClosed: () => void;
   readonly rejectClosed: (error: unknown) => void;
   credit: number;
+  /** 尚未归还给 provider 的 item 数量 credit。 */
+  creditToReturn: number;
+  /** 尚未归还给 provider 的字节 credit。 */
+  bytesToReturn: number;
+  /** 当前可接收 item 的剩余字节窗口。 */
+  byteCredit: number;
+  /** 初始字节窗口上限。 */
+  byteWindow: number;
+  /** 是否已经安排批量 credit flush。 */
+  creditFlushScheduled: boolean;
+  /** 小批量 credit 的短 task；避免每个 await 都单独发消息。 */
+  creditFlushTimer?: ReturnType<typeof setTimeout>;
   sequence: number;
   state: StreamState;
   doneReceived: boolean;
@@ -177,7 +240,7 @@ interface PendingStream extends PendingBase {
   draining: boolean;
   readySettled: boolean;
   closedSettled: boolean;
-  queue: QueueItem[];
+  queue: QueueDeque<QueueItem>;
   executionWaiterRemove?: () => void;
 }
 
@@ -242,12 +305,32 @@ function validCredit(value: number, maximum: number): boolean {
   return Number.isSafeInteger(value) && value >= 1 && value <= maximum;
 }
 
+function validByteCredit(value: number, maximum: number): boolean {
+  return Number.isSafeInteger(value) && value >= 1 && value <= maximum;
+}
+
+/** 在进入 waiting/active 状态前冻结一次 stream 选项，避免调用方后续修改。 */
+function snapshotStreamOptions(options: StreamSubscribeOptions<unknown>): StreamSubscribeOptions<unknown> {
+  return Object.freeze({
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    operationId: options.operationId,
+    onNext: options.onNext,
+    initialCredit: options.initialCredit,
+    initialByteCredit: options.initialByteCredit,
+  });
+}
+
 function serviceMatches(reference: ServiceReference, capability: RemoteCapability): boolean {
   return reference.kind === capability.kind && reference.capabilityId === capability.id && reference.contractVersion === capability.version;
 }
 
 function serviceKey(service: Pick<ServiceReference, "kind" | "capabilityId" | "contractVersion">): string {
   return `${service.kind}\u0000${service.capabilityId}\u0000${service.contractVersion}`;
+}
+
+function subscribeTransportByType(transport: RuntimeTransport, types: readonly RuntimeMessageType[], listener: RuntimeMessageListener): () => void {
+  return transport.subscribeByType ? transport.subscribeByType(types, listener) : transport.subscribe(listener);
 }
 
 function contextFor(capability: RemoteCapability, reference?: ServiceReference): ConstructorParameters<typeof WebLoomError>[3] {
@@ -260,9 +343,10 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   readonly activeStreamCount: number;
   readonly retainedPayloadBytes: number;
 } {
-  const codec = createRuntimeMessageCodec();
-  const limits = normalizeRuntimeLimits(options.limits);
-  const budget = options.budget ?? createRuntimeBudget(limits);
+  const requestedLimits = normalizeRuntimeLimits(options.limits);
+  const budget = options.budget ?? createRuntimeBudget(requestedLimits);
+  const limits = mergeRuntimeLimits(requestedLimits, budget);
+  const codec = createRuntimeMessageCodec({ limits });
   const session = options.session ?? createRuntimeEndpointSession(options.binding ?? createRuntimeEndpointBinding(`bridge:${id("runtime")}`), { defaultDrainTimeoutMs: options.drainTimeoutMs });
   if (options.binding && !sameRuntimeEndpointBinding(options.binding, session.binding)) throw new TypeError("Capability bridge binding disagrees with endpoint session");
   const localBinding = session.binding;
@@ -291,25 +375,53 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   let closeAckSent = false;
   let drainPromise: Promise<RuntimeDrainResult> | undefined;
   let reservedStreamCount = 0;
+  let peerReservedStreamByteCredit = 0;
   const defaultTimeout = timeoutMs(options.defaultCallTimeoutMs, 30_000);
 
   const emit = (): void => {
     for (const listener of [...listeners]) { try { listener(); } catch { /* observer isolation */ } }
   };
 
-  const reserve = (payloadBytes: number, stream: boolean): QuotaReservation | WebLoomError => {
+  const reserve = (payloadBytes: number, stream: boolean, streamByteCredit = 0): QuotaReservation | WebLoomError => {
     if (pendingCount >= limits.maxPendingCallsPerPeer || budget.pendingCalls >= limits.maxPendingCallsPerRuntime) return frameworkError("resource_limit_exceeded", "dispatch");
     if (stream && (reservedStreamCount >= limits.maxActiveStreamsPerPeer || budget.activeStreams >= limits.maxActiveStreamsPerRuntime)) return frameworkError("resource_limit_exceeded", "dispatch");
     if (payloadBytes > limits.maxMessageBudgetBytes
-      || peerRetainedPayloadBytes > limits.maxRetainedPayloadBytesPerPeer - payloadBytes
-      || budget.retainedPayloadBytes > limits.maxRetainedPayloadBytesPerRuntime - payloadBytes) return frameworkError("resource_limit_exceeded", "dispatch");
+      || peerRetainedPayloadBytes > limits.maxRetainedPayloadBytesPerPeer - peerReservedStreamByteCredit - payloadBytes - streamByteCredit
+      || budget.retainedPayloadBytes > limits.maxRetainedPayloadBytesPerRuntime - payloadBytes - budget.reservedStreamByteCredit - streamByteCredit) return frameworkError("resource_limit_exceeded", "dispatch");
+    if (streamByteCredit > 0 && !reserveRuntimeStreamByteCredit(budget, streamByteCredit, limits.maxRetainedPayloadBytesPerRuntime)) return frameworkError("resource_limit_exceeded", "dispatch");
+    peerReservedStreamByteCredit += streamByteCredit;
     budget.pendingCalls += 1;
     if (stream) budget.activeStreams += 1;
     peerRetainedPayloadBytes += payloadBytes;
     budget.retainedPayloadBytes += payloadBytes;
     pendingCount += 1;
     if (stream) reservedStreamCount += 1;
-    return { payloadBytes, pendingReserved: true, streamReserved: stream, payloadReserved: true };
+    return { payloadBytes, streamByteCredit, byteCreditReserved: streamByteCredit > 0, pendingReserved: true, streamReserved: stream, payloadReserved: true };
+  };
+
+  const availableStreamByteCredit = (payloadBytes: number): number => Math.min(
+    defaultStreamByteCredit(limits),
+    limits.maxStreamByteCredit,
+    Math.max(0, limits.maxRetainedPayloadBytesPerPeer - peerRetainedPayloadBytes - peerReservedStreamByteCredit - payloadBytes),
+    Math.max(0, limits.maxRetainedPayloadBytesPerRuntime - budget.retainedPayloadBytes - budget.reservedStreamByteCredit - payloadBytes),
+  );
+
+  const releaseStreamByteReservation = (reservation: QuotaReservation): void => {
+    if (!reservation.byteCreditReserved) return;
+    reservation.byteCreditReserved = false;
+    peerReservedStreamByteCredit = Math.max(0, peerReservedStreamByteCredit - reservation.streamByteCredit);
+    releaseRuntimeStreamByteCredit(budget, reservation.streamByteCredit);
+    reservation.streamByteCredit = 0;
+  };
+
+  const shrinkStreamByteReservation = (reservation: QuotaReservation, acceptedByteCredit: number): boolean => {
+    if (!reservation.byteCreditReserved || !Number.isSafeInteger(acceptedByteCredit) || acceptedByteCredit < 1 || acceptedByteCredit > reservation.streamByteCredit) return false;
+    const released = reservation.streamByteCredit - acceptedByteCredit;
+    if (released === 0) return true;
+    reservation.streamByteCredit = acceptedByteCredit;
+    peerReservedStreamByteCredit = Math.max(0, peerReservedStreamByteCredit - released);
+    releaseRuntimeStreamByteCredit(budget, released);
+    return true;
   };
 
   const releasePendingReservation = (reservation: QuotaReservation): void => {
@@ -337,6 +449,41 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     releasePendingReservation(reservation);
     releaseStreamReservation(reservation);
     releasePayloadReservation(reservation);
+    releaseStreamByteReservation(reservation);
+  };
+
+  const resizePayloadReservation = (reservation: QuotaReservation, payloadBytes: number): boolean => {
+    if (!reservation.payloadReserved || !Number.isSafeInteger(payloadBytes) || payloadBytes < 0 || payloadBytes > limits.maxMessageBudgetBytes) return false;
+    const delta = payloadBytes - reservation.payloadBytes;
+    if (delta > 0) {
+      if (peerRetainedPayloadBytes > limits.maxRetainedPayloadBytesPerPeer - delta - peerReservedStreamByteCredit
+        || budget.retainedPayloadBytes > limits.maxRetainedPayloadBytesPerRuntime - delta - budget.reservedStreamByteCredit) return false;
+      peerRetainedPayloadBytes += delta;
+      budget.retainedPayloadBytes += delta;
+    } else if (delta < 0) {
+      peerRetainedPayloadBytes = Math.max(0, peerRetainedPayloadBytes + delta);
+      budget.retainedPayloadBytes = Math.max(0, budget.retainedPayloadBytes + delta);
+    }
+    reservation.payloadBytes = payloadBytes;
+    return true;
+  };
+
+  const consumeStreamByteCredit = (stream: PendingStream, bytes: number): boolean => {
+    if (!stream.reservation.byteCreditReserved || stream.reservation.streamByteCredit < bytes || peerReservedStreamByteCredit < bytes) return false;
+    if (!consumeRuntimeStreamByteCredit(budget, bytes)) return false;
+    peerReservedStreamByteCredit -= bytes;
+    stream.reservation.streamByteCredit -= bytes;
+    stream.byteCredit -= bytes;
+    return true;
+  };
+
+  const returnStreamByteCredit = (stream: PendingStream, bytes: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes < 1) return;
+    stream.byteCredit = Math.min(stream.byteWindow, stream.byteCredit + bytes);
+    if (!stream.reservation.byteCreditReserved) return;
+    stream.reservation.streamByteCredit += bytes;
+    peerReservedStreamByteCredit += bytes;
+    returnRuntimeStreamByteCredit(budget, bytes);
   };
 
   const releaseCallbackExecution = (record: CallbackExecutionRecord): void => {
@@ -345,6 +492,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     callbackExecutions.delete(record);
     peerRetainedPayloadBytes = Math.max(0, peerRetainedPayloadBytes - record.item.budgetBytes);
     budget.retainedPayloadBytes = Math.max(0, budget.retainedPayloadBytes - record.item.budgetBytes);
+    if (!record.creditReturned) returnStreamByteCredit(record.stream, record.item.budgetBytes);
     budget.releaseExecutionSlot();
     if (callbackExecutions.size === 0) {
       for (const resolve of [...executionDrainWaiters]) resolve();
@@ -353,10 +501,11 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     emit();
   };
 
-  const releaseQueueItem = (item: QueueItem): void => {
+  const releaseQueueItem = (stream: PendingStream, item: QueueItem): void => {
     item.ledger.closeUndelivered();
     peerRetainedPayloadBytes = Math.max(0, peerRetainedPayloadBytes - item.budgetBytes);
     budget.retainedPayloadBytes = Math.max(0, budget.retainedPayloadBytes - item.budgetBytes);
+    returnStreamByteCredit(stream, item.budgetBytes);
   };
 
   const settleUnary = (entry: PendingUnary, error?: unknown, value?: unknown): void => {
@@ -404,6 +553,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
 
   const finishDraining = (stream: PendingStream): void => {
     if (!stream.doneReceived || stream.processing || stream.queue.length > 0 || stream.closedSettled) return;
+    releaseStreamByteReservation(stream.reservation);
     stream.state = "closed";
     settleClosedResolve(stream);
     forgetStream(stream);
@@ -421,7 +571,11 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     // Even when the remote cancel cannot be sent (for example after a
     // transport error), the local handler-facing signal must be fenced.
     try { stream.controller.abort(error); } catch { /* already aborted */ }
-    for (const item of stream.queue.splice(0)) releaseQueueItem(item);
+    for (const item of stream.queue.drain()) releaseQueueItem(stream, item);
+    if (stream.creditFlushTimer !== undefined) clearTimeout(stream.creditFlushTimer);
+    stream.creditToReturn = 0;
+    stream.bytesToReturn = 0;
+    stream.creditFlushScheduled = false;
     if (!stream.readySettled) settleReadyReject(stream, error);
     settleClosedReject(stream, error);
     stream.cleanup?.();
@@ -482,24 +636,54 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     return undefined;
   };
 
-  const prepareRequest = (capability: RemoteCapability, request: unknown): { value: unknown; transfer: readonly Transferable[]; budgetBytes: number } => {
-    validateRawDto(request, limits, "validate");
+  const prepareRequest = (capability: RemoteCapability, request: unknown): PreparedPayload => {
+    // 当前请求来自同一 realm 的 typed caller；parser 是 capability 的可信
+    // 输入边界。先检查原始 DTO，避免 parser 先接触 accessor/超限图；规范化
+    // 后再由 PreparedPayload 工厂独立重走一次 walker。
+    try { validateRawDto(request, limits, "validate"); }
+    catch (error) { throw error instanceof WebLoomError ? error : frameworkError("request_validation_failed", "validate", contextFor(capability)); }
     const parser = capability as RemoteCapability & { request: { parse(value: unknown): unknown } };
     let parsed: unknown;
     try { parsed = parser.request.parse(request); } catch { throw frameworkError("request_validation_failed", "validate", contextFor(capability)); }
-    let validation: ReturnType<typeof validateTransferListWithStats>;
+    let transfer: readonly Transferable[] | undefined;
     try {
       const descriptor = (capability as RemoteCapability & { transfer?: { request?: (value: unknown) => readonly Transferable[] } }).transfer;
-      validation = validateTransferListWithStats(parsed, descriptor?.request?.(parsed), { limits, phase: "validate" });
+      transfer = descriptor?.request?.(parsed);
     } catch (error) {
       if (error instanceof WebLoomError) throw error;
       throw frameworkError("transfer_invalid", "validate", contextFor(capability));
     }
-    return { value: parsed, transfer: validation.transfer, budgetBytes: validation.stats.budgetBytes };
+    // The factory performs the authoritative walker itself. Do not pass the
+    // caller/parser's stats into a later fast path.
+    try { return createPreparedPayload(parsed, transfer, { limits, phase: "validate" }); }
+    catch (error) {
+      if (error instanceof WebLoomError) throw error;
+      throw frameworkError("transfer_invalid", "validate", contextFor(capability));
+    }
   };
 
-  const prepareIncoming = (capability: RemoteCapability, value: unknown, direction: "response" | "item", ledger: ReceivePortLedger): { value: unknown; transfer: readonly Transferable[]; stats: ReturnType<typeof validateDto> } => {
-    try { validateRawDto(value, limits, "receive"); } catch (error) { ledger.closeUndelivered(); throw error; }
+  const prepareIncoming = (capability: RemoteCapability, value: unknown, direction: "response" | "item", ledger: ReceivePortLedger, decodedPayload?: RuntimeDecodedPayload): { value: unknown; transfer: readonly Transferable[]; stats: ReturnType<typeof validateDto> } => {
+    // The production MessagePort transport already walked the raw wire graph
+    // with this endpoint's limits. Reuse only that proof, never its stats for
+    // the parser output: parsers can mutate and return the same object.
+    if (decodedPayload) {
+      const expectedField = direction === "response" ? "result" : "item";
+      const stats = decodedPayload.stats;
+      const withinLimits = decodedPayload.field === expectedField
+        && decodedPayload.value === value
+        && stats.depth <= limits.maxDtoDepth
+        && stats.nodes <= limits.maxDtoNodes
+        && stats.edges <= limits.maxDtoEdges
+        && stats.budgetBytes <= limits.maxMessageBudgetBytes;
+      if (!withinLimits) {
+        ledger.closeUndelivered();
+        throw frameworkError("invalid_message", "receive", contextFor(capability));
+      }
+    } else {
+      // Testing/advanced transports may not provide decode metadata; retain
+      // the bounded fallback for those transports.
+      try { validateRawDto(value, limits, "receive"); } catch (error) { ledger.closeUndelivered(); throw error; }
+    }
     const parser = capability as RemoteCapability & { response?: { parse(value: unknown): unknown }; item?: { parse(value: unknown): unknown }; transfer?: { response?: (value: unknown) => readonly Transferable[]; item?: (value: unknown) => readonly Transferable[] } };
     let parsed: unknown;
     try {
@@ -507,21 +691,24 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       if (!selected) throw new Error("parser unavailable");
       parsed = selected.parse(value);
     } catch { ledger.closeUndelivered(); throw frameworkError("response_validation_failed", "receive", contextFor(capability)); }
-    let validation: ReturnType<typeof validateTransferListWithStats>;
-    try { validation = validateTransferListWithStats(parsed, parser.transfer?.[direction]?.(parsed), { limits, phase: "receive" }); }
+    let transfer: readonly Transferable[] | undefined;
+    try { transfer = parser.transfer?.[direction]?.(parsed); }
     catch (error) { ledger.closeUndelivered(); throw error instanceof WebLoomError ? error : frameworkError("transfer_invalid", "receive", contextFor(capability)); }
-    try { assertReceivedPortSet(ledger, validation.transfer, { limits, phase: "receive" }); }
+    let prepared: PreparedPayload;
+    try { prepared = createPreparedPayload(parsed, transfer, { limits, phase: "receive" }); }
+    catch (error) { ledger.closeUndelivered(); throw error instanceof WebLoomError ? error : frameworkError("transfer_invalid", "receive", contextFor(capability)); }
+    try { assertReceivedPortSet(ledger, prepared.transfer, { limits, phase: "receive" }); }
     catch (error) { ledger.closeUndelivered(); throw error; }
-    return { value: parsed, transfer: validation.transfer, stats: validation.stats };
+    return { value: prepared.value, transfer: prepared.transfer, stats: prepared.stats };
   };
 
-  const sendWire = (message: RuntimeWireMessage, transfer: readonly Transferable[] = []): void => {
-    const encoded = codec.encode(message);
-    options.transport.send(encoded, transfer);
+  const sendWire = (message: RuntimeWireMessage, prepared?: PreparedPayload, transfer: readonly Transferable[] = []): void => {
+    const encoded = codec.encode(message, prepared);
+    options.transport.send(encoded, prepared?.transfer ?? transfer);
   };
 
-  const startUnary = (proxy: ProxyRecord, prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number }, reference: ServiceReference, callOptions: RpcCallOptions, timeout: number, existingReservation?: QuotaReservation): Promise<unknown> => {
-    const reservation = existingReservation ?? reserve(prepared.budgetBytes, false);
+  const startUnary = (proxy: ProxyRecord, prepared: PreparedPayload, reference: ServiceReference, callOptions: RpcCallOptions, timeout: number, existingReservation?: QuotaReservation): Promise<unknown> => {
+    const reservation = existingReservation ?? reserve(prepared.stats.budgetBytes, false);
     if (reservation instanceof WebLoomError) return Promise.reject(reservation);
     const controller = new AbortController();
     const merged = mergeSignals(controller.signal, proxy.scope?.signal, callOptions.signal);
@@ -542,22 +729,23 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       }, timeout);
       if (merged.signal.aborted) { onAbort(); return; }
       try {
-        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared.transfer);
+        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared);
       } catch {
         settleUnary(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)));
       }
     });
   };
 
-  const waitForService = (proxy: ProxyRecord, prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number }, callOptions: RpcCallOptions): Promise<unknown> => {
+  const waitForService = (proxy: ProxyRecord, request: unknown, prepared: PreparedPayload, callOptions: RpcCallOptions): Promise<unknown> => {
     const timeout = timeoutMs(callOptions.timeoutMs, defaultTimeout);
     const deadline = Date.now() + timeout;
-    const reserved = reserve(prepared.budgetBytes, false);
+    const reserved = reserve(prepared.stats.budgetBytes, false);
     if (reserved instanceof WebLoomError) return Promise.reject(reserved);
     return new Promise<unknown>((resolve, reject) => {
       const record: WaitingCallRecord = {
         proxy,
         prepared,
+        prepare: () => prepareRequest(proxy.capability, request),
         reservation: reserved,
         deadline,
         mode: "unary",
@@ -575,10 +763,21 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       };
       record.start = (reference: ServiceReference, remaining: number): void => {
         if (record.finished) return;
+        let current: PreparedPayload;
+        try { current = record.prepare(); }
+        catch (error) {
+          record.fail(error instanceof WebLoomError ? error : frameworkError("request_validation_failed", "validate", contextFor(proxy.capability)));
+          return;
+        }
+        if (!resizePayloadReservation(record.reservation, current.stats.budgetBytes)) {
+          record.fail(frameworkError("resource_limit_exceeded", "dispatch", contextFor(proxy.capability)));
+          return;
+        }
+        record.prepared = current;
         record.finished = true;
         cleanup();
         if (!proxy.bound) proxy.bound = reference;
-        void startUnary(proxy, prepared, reference, callOptions, remaining, record.reservation).then(resolve, reject);
+        void startUnary(proxy, current, reference, callOptions, remaining, record.reservation).then(resolve, reject);
       };
       const check = (): void => {
         if (record.finished) return;
@@ -607,11 +806,11 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     const unavailable = terminalError(proxy, proxy.capability);
     if (unavailable) return Promise.reject(unavailable);
     const timeout = timeoutMs(callOptions.timeoutMs, defaultTimeout);
-    let prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number };
+    let prepared: PreparedPayload;
     try { prepared = prepareRequest(proxy.capability, request); }
     catch (error) { return Promise.reject(error instanceof WebLoomError ? error : frameworkError("request_validation_failed", "validate", contextFor(proxy.capability))); }
     const reference = proxy.bound ?? findService(proxy.capability);
-    if (!reference) return waitForService(proxy, prepared, callOptions);
+    if (!reference) return waitForService(proxy, request, prepared, callOptions);
     if (!proxy.bound) proxy.bound = reference;
     return startUnary(proxy, prepared, reference, callOptions, timeout);
   };
@@ -628,14 +827,26 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     return { ready, closed, cancel() { /* terminal */ } };
   };
 
-  const startStream = (proxy: ProxyRecord, prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number }, reference: ServiceReference, optionsForSubscribe: StreamSubscribeOptions<unknown>, timeout: number, existingReservation?: QuotaReservation): StreamSubscription<unknown> => {
+  const startStream = (proxy: ProxyRecord, prepared: PreparedPayload, reference: ServiceReference, optionsForSubscribe: StreamSubscribeOptions<unknown>, timeout: number, existingReservation?: QuotaReservation): StreamSubscription<unknown> => {
     const maximumCredit = Math.min(256, limits.maxStreamCredit);
     const window = optionsForSubscribe.initialCredit ?? 16;
+    const initialByteCreditAuto = optionsForSubscribe.initialByteCredit === undefined;
+    const byteWindow = existingReservation?.streamByteCredit
+      ?? optionsForSubscribe.initialByteCredit
+      ?? availableStreamByteCredit(prepared.stats.budgetBytes);
     if (!validCredit(window, maximumCredit)) {
       if (existingReservation) releaseReservation(existingReservation);
       return createRejectedSubscription(frameworkError("stream_overflow", "validate", contextFor(proxy.capability, reference)));
     }
-    const reservation = existingReservation ?? reserve(prepared.budgetBytes, true);
+    if (!validByteCredit(byteWindow, limits.maxStreamByteCredit)) {
+      if (existingReservation) releaseReservation(existingReservation);
+      return createRejectedSubscription(frameworkError(
+        optionsForSubscribe.initialByteCredit === undefined && existingReservation === undefined ? "resource_limit_exceeded" : "stream_overflow",
+        "validate",
+        contextFor(proxy.capability, reference),
+      ));
+    }
+    const reservation = existingReservation ?? reserve(prepared.stats.budgetBytes, true, byteWindow);
     if (reservation instanceof WebLoomError) return createRejectedSubscription(reservation);
     let resolveReady!: () => void;
     let rejectReady!: (error: unknown) => void;
@@ -651,7 +862,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     const entry: PendingStream = {
       callId, capability: proxy.capability, reference, proxy, controller, cleanup: merged.dispose, reservation, timer: undefined, settled: false, cancelSent: false,
       mode: "stream", onNext: optionsForSubscribe.onNext, itemParser: (proxy.capability as StreamCapabilityBase & { item: { parse(value: unknown): unknown } }).item,
-      window, credit: window, sequence: 1, state: "opening", doneReceived: false, processing: false, draining: false, readySettled: false, closedSettled: false, queue: [],
+      window, initialByteCreditAuto, credit: window, creditToReturn: 0, bytesToReturn: 0, byteCredit: byteWindow, byteWindow, creditFlushScheduled: false, sequence: 1, state: "opening", doneReceived: false, processing: false, draining: false, readySettled: false, closedSettled: false, queue: new QueueDeque<QueueItem>(),
       resolveReady, rejectReady, resolveClosed, rejectClosed,
     };
     streams.set(callId, entry);
@@ -667,17 +878,31 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     }, timeout);
     if (merged.signal.aborted) { cancel(); return { ready, closed, cancel }; }
     try {
-      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared.transfer);
+      // The locally reserved byte window is the stream protocol state. It is
+      // always sent so the provider starts from the same requested value.
+      // An auto-sized request may still be narrowed by the provider's current
+      // retained-byte state; streamReady returns that accepted value.
+      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, initialByteCredit: byteWindow, ...(optionsForSubscribe.initialByteCredit === undefined ? { initialByteCreditAuto: true as const } : {}), ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared);
     } catch {
       terminateStream(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)), false);
     }
     return { ready, closed, cancel };
   };
 
-  const waitForStream = (proxy: ProxyRecord, prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number }, optionsForSubscribe: StreamSubscribeOptions<unknown>): StreamSubscription<unknown> => {
+  const waitForStream = (proxy: ProxyRecord, request: unknown, prepared: PreparedPayload, optionsForSubscribe: StreamSubscribeOptions<unknown>): StreamSubscription<unknown> => {
     const timeout = timeoutMs(optionsForSubscribe.timeoutMs, defaultTimeout);
     const deadline = Date.now() + timeout;
-    const reserved = reserve(prepared.budgetBytes, true);
+    const maximumCredit = Math.min(256, limits.maxStreamCredit);
+    const window = optionsForSubscribe.initialCredit ?? 16;
+    const byteWindow = optionsForSubscribe.initialByteCredit ?? availableStreamByteCredit(prepared.stats.budgetBytes);
+    if (!validCredit(window, maximumCredit) || !validByteCredit(byteWindow, limits.maxStreamByteCredit)) {
+      return createRejectedSubscription(frameworkError(
+        optionsForSubscribe.initialByteCredit === undefined && !validByteCredit(byteWindow, limits.maxStreamByteCredit) ? "resource_limit_exceeded" : "stream_overflow",
+        "validate",
+        contextFor(proxy.capability),
+      ));
+    }
+    const reserved = reserve(prepared.stats.budgetBytes, true, byteWindow);
     if (reserved instanceof WebLoomError) return createRejectedSubscription(reserved);
     let resolveReady!: () => void;
     let rejectReady!: (error: unknown) => void;
@@ -691,6 +916,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     const record: WaitingCallRecord = {
       proxy,
       prepared,
+      prepare: () => prepareRequest(proxy.capability, request),
       reservation: reserved,
       deadline,
       mode: "stream",
@@ -700,12 +926,23 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     };
     const cleanup = (): void => { if (record.timer !== undefined) clearTimeout(record.timer); record.removeListener?.(); optionsForSubscribe.signal?.removeEventListener("abort", onAbort); waitingCalls.delete(record); };
     record.fail = (error: unknown): void => { if (record.finished) return; record.finished = true; cleanup(); releaseReservation(record.reservation); rejectReady(error); rejectClosed(error); };
-    record.start = (reference: ServiceReference, remaining: number): void => {
-      if (record.finished) return;
-      record.finished = true;
-      cleanup();
-      if (!proxy.bound) proxy.bound = reference;
-      active = startStream(proxy, prepared, reference, optionsForSubscribe, remaining, record.reservation);
+      record.start = (reference: ServiceReference, remaining: number): void => {
+        if (record.finished) return;
+        let current: PreparedPayload;
+        try { current = record.prepare(); }
+        catch (error) {
+          record.fail(error instanceof WebLoomError ? error : frameworkError("request_validation_failed", "validate", contextFor(proxy.capability)));
+          return;
+        }
+        if (!resizePayloadReservation(record.reservation, current.stats.budgetBytes)) {
+          record.fail(frameworkError("resource_limit_exceeded", "dispatch", contextFor(proxy.capability)));
+          return;
+        }
+        record.prepared = current;
+        record.finished = true;
+        cleanup();
+        if (!proxy.bound) proxy.bound = reference;
+        active = startStream(proxy, current, reference, optionsForSubscribe, remaining, record.reservation);
       active.ready.then(resolveReady, rejectReady);
       active.closed.then(resolveClosed, rejectClosed);
     };
@@ -735,14 +972,49 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   const subscribe = (proxy: ProxyRecord, request: unknown, optionsForSubscribe: StreamSubscribeOptions<unknown>): StreamSubscription<unknown> => {
     const unavailable = terminalError(proxy, proxy.capability);
     if (unavailable) return createRejectedSubscription(unavailable);
-    if (typeof optionsForSubscribe.onNext !== "function") return createRejectedSubscription(frameworkError("request_validation_failed", "validate", contextFor(proxy.capability)));
-    let prepared: { value: unknown; transfer: readonly Transferable[]; budgetBytes: number };
+    const streamOptions = snapshotStreamOptions(optionsForSubscribe);
+    if (typeof streamOptions.onNext !== "function") return createRejectedSubscription(frameworkError("request_validation_failed", "validate", contextFor(proxy.capability)));
+    let prepared: PreparedPayload;
     try { prepared = prepareRequest(proxy.capability, request); }
     catch (error) { return createRejectedSubscription(error instanceof WebLoomError ? error : frameworkError("request_validation_failed", "validate", contextFor(proxy.capability))); }
     const reference = proxy.bound ?? findService(proxy.capability);
-    if (!reference) return waitForStream(proxy, prepared, optionsForSubscribe);
+    if (!reference) return waitForStream(proxy, request, prepared, streamOptions);
     if (!proxy.bound) proxy.bound = reference;
-    return startStream(proxy, prepared, reference, optionsForSubscribe, timeoutMs(optionsForSubscribe.timeoutMs, defaultTimeout));
+    return startStream(proxy, prepared, reference, streamOptions, timeoutMs(streamOptions.timeoutMs, defaultTimeout));
+  };
+
+  const flushStreamCredit = (stream: PendingStream): void => {
+    stream.creditFlushTimer = undefined;
+    stream.creditFlushScheduled = false;
+    const count = stream.creditToReturn;
+    const bytes = stream.bytesToReturn;
+    if (count < 1 || stream.state !== "active" || stream.doneReceived) {
+      stream.creditToReturn = 0;
+      stream.bytesToReturn = 0;
+      return;
+    }
+    stream.creditToReturn = 0;
+    stream.bytesToReturn = 0;
+    try {
+      sendWire({ type: RUNTIME_CREDIT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: stream.callId, serviceInstanceId: stream.reference.serviceInstanceId, count, bytes });
+    } catch {
+      terminateStream(stream, frameworkError("transport_unavailable", "dispatch", contextFor(stream.capability, stream.reference)), true);
+    }
+  };
+
+  const scheduleStreamCredit = (stream: PendingStream): void => {
+    if (stream.creditFlushScheduled || stream.state !== "active" || stream.doneReceived) return;
+    // Half-window, byte low-water and an almost exhausted item window flush
+    // immediately. A short task (rather than a microtask) combines the small
+    // credits produced by consecutive resolved onNext() promises.
+    if (stream.creditToReturn >= Math.max(1, Math.ceil(stream.window / 2))
+      || stream.bytesToReturn >= Math.max(1, Math.ceil(stream.byteWindow / 2))
+      || stream.credit <= Math.max(1, Math.floor(stream.window / 4))) {
+      flushStreamCredit(stream);
+      return;
+    }
+    stream.creditFlushScheduled = true;
+    stream.creditFlushTimer = setTimeout(() => flushStreamCredit(stream), 0);
   };
 
   let drainStream: (stream: PendingStream) => void;
@@ -760,16 +1032,15 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       try {
         while (stream.queue.length > 0) {
           if (stream.state === "failed" || stream.state === "closed") break;
-          const item = stream.queue.shift();
-          if (!item) break;
           if (callbackExecutions.size >= limits.maxExecutionSlotsPerPeer || budget.executionSlots >= limits.maxExecutionSlotsPerRuntime) {
-            stream.queue.unshift(item);
             waitForExecutionSlot(stream);
             break;
           }
+          const item = stream.queue.shift();
+          if (!item) break;
           stream.executionWaiterRemove?.();
           stream.executionWaiterRemove = undefined;
-          const execution: CallbackExecutionRecord = { stream, item, released: false };
+          const execution: CallbackExecutionRecord = { stream, item, released: false, creditReturned: false };
           callbackExecutions.add(execution);
           budget.executionSlots += 1;
           stream.processing = true;
@@ -781,8 +1052,11 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
             await stream.onNext(item.value);
             if (stream.state === "active" && !stream.doneReceived) {
               stream.credit += 1;
-              try { sendWire({ type: RUNTIME_CREDIT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: stream.callId, serviceInstanceId: stream.reference.serviceInstanceId, count: 1 }); }
-              catch { terminateStream(stream, frameworkError("transport_unavailable", "dispatch", contextFor(stream.capability, stream.reference)), true); break; }
+              returnStreamByteCredit(stream, item.budgetBytes);
+              execution.creditReturned = true;
+              stream.creditToReturn += 1;
+              stream.bytesToReturn += item.budgetBytes;
+              scheduleStreamCredit(stream);
             }
           } catch {
             terminateStream(stream, frameworkError("handler_failed", "execute", contextFor(stream.capability, stream.reference)), true);
@@ -1039,7 +1313,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
         if (entry.mode === "unary") {
           if (!("result" in message)) { ledger.closeUndelivered(); settleUnary(entry, frameworkError("invalid_message", "receive", contextFor(entry.capability, entry.reference))); return; }
           try {
-            const incoming = prepareIncoming(entry.capability, message.result, "response", ledger);
+            const incoming = prepareIncoming(entry.capability, message.result, "response", ledger, metadata?.payload);
             ledger.handoff();
             settleUnary(entry, undefined, incoming.value);
           } catch (error) { settleUnary(entry, error instanceof WebLoomError ? error : frameworkError("response_validation_failed", "receive", contextFor(entry.capability, entry.reference))); }
@@ -1049,6 +1323,17 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
         if ("streamReady" in message && message.streamReady) {
           if (stream.state !== "opening") { ledger.closeUndelivered(); terminateStream(stream, frameworkError("invalid_message", "receive", contextFor(stream.capability, stream.reference)), true); return; }
           if (ledger.ports.length > 0) { ledger.closeUndelivered(); terminateStream(stream, frameworkError("transfer_invalid", "receive", contextFor(stream.capability, stream.reference)), true); return; }
+          // Provider may narrow only an auto-sized request. An explicit caller
+          // window is a contract value, not a negotiable upper bound.
+          if ((!stream.initialByteCreditAuto && message.acceptedInitialByteCredit !== stream.byteWindow)
+            || !validByteCredit(message.acceptedInitialByteCredit, stream.byteWindow)
+            || !shrinkStreamByteReservation(stream.reservation, message.acceptedInitialByteCredit)) {
+            ledger.closeUndelivered();
+            terminateStream(stream, frameworkError("stream_overflow", "receive", contextFor(stream.capability, stream.reference)), true);
+            return;
+          }
+          stream.byteWindow = message.acceptedInitialByteCredit;
+          stream.byteCredit = message.acceptedInitialByteCredit;
           stream.state = "active";
           stream.readySettled = true;
           if (stream.timer !== undefined) clearTimeout(stream.timer);
@@ -1092,12 +1377,14 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
         if (stream.credit < 1) { ledger.closeUndelivered(); terminateStream(stream, frameworkError("stream_overflow", "receive", contextFor(stream.capability, stream.reference)), true); return; }
         if (message.sequence !== stream.sequence) { ledger.closeUndelivered(); terminateStream(stream, frameworkError("stream_overflow", "receive", contextFor(stream.capability, stream.reference)), true); return; }
         let incoming: ReturnType<typeof prepareIncoming>;
-        try { incoming = prepareIncoming(stream.capability, message.item, "item", ledger); }
+        try { incoming = prepareIncoming(stream.capability, message.item, "item", ledger, metadata?.payload); }
         catch (error) { terminateStream(stream, error instanceof WebLoomError ? error : frameworkError("response_validation_failed", "receive", contextFor(stream.capability, stream.reference)), true); return; }
         const { value, stats } = incoming;
-        if (peerRetainedPayloadBytes > limits.maxRetainedPayloadBytesPerPeer - stats.budgetBytes
+        if (stats.budgetBytes > stream.byteWindow
+          || peerRetainedPayloadBytes > limits.maxRetainedPayloadBytesPerPeer - stats.budgetBytes
           || budget.retainedPayloadBytes > limits.maxRetainedPayloadBytesPerRuntime - stats.budgetBytes
           || stream.queue.length >= stream.window) { ledger.closeUndelivered(); terminateStream(stream, frameworkError("resource_limit_exceeded", "receive", contextFor(stream.capability, stream.reference)), true); return; }
+        if (!consumeStreamByteCredit(stream, stats.budgetBytes)) { ledger.closeUndelivered(); terminateStream(stream, frameworkError("stream_overflow", "receive", contextFor(stream.capability, stream.reference)), true); return; }
         stream.credit -= 1;
         stream.sequence += 1;
         stream.queue.push({ value, ledger, budgetBytes: stats.budgetBytes });
@@ -1116,7 +1403,15 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     }
   };
 
-  const removeTransport = options.transport.subscribe((message, metadata) => onMessage(message, metadata));
+  const removeTransport = subscribeTransportByType(options.transport, [
+    RUNTIME_CLOSE_TYPE,
+    RUNTIME_CLOSE_ACK_TYPE,
+    RUNTIME_SNAPSHOT_TYPE,
+    RUNTIME_ERROR_TYPE,
+    RUNTIME_RESULT_TYPE,
+    RUNTIME_ERROR_MESSAGE_TYPE,
+    RUNTIME_NEXT_TYPE,
+  ], (message, metadata) => onMessage(message, metadata));
   const removeTransportError = options.transport.subscribeError?.((error, metadata) => {
     metadata?.ledger?.closeUndelivered();
     if (error instanceof WebLoomError && error.code === "protocol_mismatch") failClose("Remote Runtime protocol mismatch", "protocol_mismatch");

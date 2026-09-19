@@ -316,6 +316,8 @@ export interface RuntimeLimits {
   readonly maxMessagePorts: number;
   /** stream credit/push 队列窗口上限。 */
   readonly maxStreamCredit: number;
+  /** stream 可保留的最大字节 credit 窗口。 */
+  readonly maxStreamByteCredit: number;
 }
 
 /** 快照应用结果。 */

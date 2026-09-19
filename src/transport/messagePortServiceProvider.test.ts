@@ -13,6 +13,7 @@ import {
 import { createMessagePortServiceProvider, type MessagePortServiceCallInput } from "./messagePortServiceProvider.js";
 import type { MessagePortLike } from "./messagePortServiceTransport.js";
 import { createRuntimeEndpointSession } from "../runtime/runtimeSession.js";
+import { createRuntimeBudget } from "./dto.js";
 
 const Echo = defineCapability({
   kind: "rpc",
@@ -47,8 +48,8 @@ function callMessage(callId = "call:one", grantId?: string, serviceInstanceId = 
   return { type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId, capabilityId: Echo.id, contractVersion: Echo.version, serviceInstanceId, mode: "unary" as const, timeoutMs: 500, request: { value: "ok" }, ...(grantId !== undefined ? { grantId } : {}) };
 }
 
-function streamCallMessage(callId = "stream:one", initialCredit = 1) {
-  return { type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId, capabilityId: Events.id, contractVersion: Events.version, serviceInstanceId: streamReference.serviceInstanceId, mode: "stream" as const, timeoutMs: 500, request: { topic: "updates" }, initialCredit };
+function streamCallMessage(callId = "stream:one", initialCredit = 1, initialByteCredit = 128) {
+  return { type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId, capabilityId: Events.id, contractVersion: Events.version, serviceInstanceId: streamReference.serviceInstanceId, mode: "stream" as const, timeoutMs: 500, request: { topic: "updates" }, initialCredit, initialByteCredit };
 }
 
 describe("v4 MessagePort provider", () => {
@@ -366,6 +367,204 @@ describe("v4 MessagePort provider", () => {
     expect(entered).toBe(0);
     expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "stream_overflow" } });
     expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("uses a safe default byte window when only retained runtime capacity is tightened", async () => {
+    const port = new FakePort();
+    const budget = createRuntimeBudget({ maxRetainedPayloadBytesPerRuntime: 1_024 });
+    const provider = createMessagePortServiceProvider({
+      port,
+      budget,
+      services: () => [streamReference],
+      handleCall: () => (async function* () { yield 1; })(),
+    });
+    const call = streamCallMessage("stream:small-runtime-budget");
+    port.emit(call);
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => (message as { type?: unknown }).type === RUNTIME_RESULT_TYPE); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent).toEqual(expect.arrayContaining([expect.objectContaining({ type: RUNTIME_RESULT_TYPE, streamReady: true })]));
+    expect(port.sent).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "resource_limit_exceeded" } })]));
+    expect(budget.reservedStreamByteCredit).toBeGreaterThan(0);
+    expect(budget.reservedStreamByteCredit).toBeLessThanOrEqual(1_024);
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && provider.executionCount() !== 0; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(budget.reservedStreamByteCredit).toBe(0);
+    provider.dispose();
+  });
+
+  it("rechecks a parser's in-place normalized graph instead of reusing raw stats", async () => {
+    const port = new FakePort();
+    let entered = 0;
+    const provider = createMessagePortServiceProvider({
+      port,
+      limits: { maxDtoDepth: 3 },
+      services: () => [reference],
+      prepareRequest: (call) => {
+        let nested: unknown = "deep";
+        for (let depth = 0; depth < 5; depth += 1) nested = { next: nested };
+        (call.request as Record<string, unknown>).extra = nested;
+        return { value: call.request };
+      },
+      handleCall: () => { entered += 1; return { result: "unexpected" }; },
+    });
+    port.emit(callMessage("call:in-place"));
+    await Promise.resolve();
+    expect(entered).toBe(0);
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "resource_limit_exceeded" } });
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("releases pending output bytes and stream window after cancellation", async () => {
+    const port = new FakePort();
+    const provider = createMessagePortServiceProvider({
+      port,
+      services: () => [streamReference],
+      handleCall: () => (async function* () {
+        yield "a".repeat(20);
+        yield "b".repeat(20);
+      })(),
+      prepareItem: (value) => ({ value }),
+    });
+    port.emit(streamCallMessage("stream:pending-output", 2, 60));
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => (message as { type?: unknown }).type === RUNTIME_NEXT_TYPE); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent.some((message) => (message as { type?: unknown }).type === RUNTIME_NEXT_TYPE)).toBe(true);
+    expect(provider.retainedPayloadBytes()).toBeGreaterThan(0);
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: "stream:pending-output", serviceInstanceId: streamReference.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && provider.executionCount() !== 0; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.executionCount()).toBe(0);
+    expect(provider.retainedPayloadBytes()).toBe(0);
+    provider.dispose();
+  });
+
+  it("releases stream admission when the handler fails before streamReady", async () => {
+    const port = new FakePort();
+    const budget = createRuntimeBudget({ maxActiveStreamsPerRuntime: 1 });
+    const provider = createMessagePortServiceProvider({
+      port,
+      budget,
+      services: () => [streamReference],
+      handleCall: () => { throw new Error("stream setup failed"); },
+    });
+    port.emit(streamCallMessage("stream:handler-error", 1, 128));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "handler_failed" } });
+    expect(budget.activeStreams).toBe(0);
+    expect(budget.reservedStreamByteCredit).toBe(0);
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("releases stream admission when the handler returns a non-AsyncIterable", async () => {
+    const port = new FakePort();
+    const budget = createRuntimeBudget({ maxActiveStreamsPerRuntime: 1 });
+    const provider = createMessagePortServiceProvider({
+      port,
+      budget,
+      services: () => [streamReference],
+      handleCall: () => ({ not: "a stream" }),
+    });
+    port.emit(streamCallMessage("stream:not-iterable", 1, 128));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent.at(-1)).toMatchObject({ type: RUNTIME_ERROR_MESSAGE_TYPE, error: { code: "handler_failed" } });
+    expect(budget.activeStreams).toBe(0);
+    expect(budget.reservedStreamByteCredit).toBe(0);
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("releases pre-ready stream admission on cancel after a non-cooperative handler finally returns", async () => {
+    const port = new FakePort();
+    const budget = createRuntimeBudget({ maxActiveStreamsPerRuntime: 1 });
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provider = createMessagePortServiceProvider({
+      port,
+      budget,
+      services: () => [streamReference],
+      handleCall: async () => {
+        entered();
+        await gate;
+        return { [Symbol.asyncIterator]: async function* () { yield 1; } };
+      },
+    });
+    const call = streamCallMessage("stream:cancel-before-ready", 1, 128);
+    port.emit(call);
+    await enteredPromise;
+    expect(budget.activeStreams).toBe(1);
+    expect(budget.reservedStreamByteCredit).toBe(128);
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId });
+    expect(provider.pendingCount()).toBe(0);
+    expect(budget.activeStreams).toBe(0);
+    expect(budget.reservedStreamByteCredit).toBe(0);
+    release();
+    for (let attempt = 0; attempt < 20 && provider.executionCount() !== 0; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.executionCount()).toBe(0);
+    expect(budget.activeStreams).toBe(0);
+    expect(budget.reservedStreamByteCredit).toBe(0);
+    provider.dispose();
+  });
+
+  it("counts pre-ready streams against the peer active-stream limit", async () => {
+    const port = new FakePort();
+    const budget = createRuntimeBudget({ maxActiveStreamsPerPeer: 1, maxActiveStreamsPerRuntime: 2 });
+    let entered = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const provider = createMessagePortServiceProvider({
+      port,
+      budget,
+      services: () => [streamReference],
+      handleCall: async () => {
+        entered += 1;
+        if (entered === 1) await firstGate;
+        return { [Symbol.asyncIterator]: async function* () { yield 1; } };
+      },
+    });
+    const first = streamCallMessage("stream:peer-limit:first");
+    port.emit(first);
+    for (let attempt = 0; attempt < 20 && entered !== 1; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(entered).toBe(1);
+    expect(provider.pendingCount()).toBe(1);
+    expect(provider.executionCount()).toBe(1);
+
+    const second = streamCallMessage("stream:peer-limit:second");
+    port.emit(second);
+    await Promise.resolve();
+    expect(entered).toBe(1);
+    expect(port.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: RUNTIME_ERROR_MESSAGE_TYPE, callId: second.callId, error: expect.objectContaining({ code: "resource_limit_exceeded" }) }),
+    ]));
+    expect(provider.pendingCount()).toBe(1);
+    expect(provider.executionCount()).toBe(1);
+
+    releaseFirst();
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => (message as { callId?: unknown; streamReady?: unknown }).callId === first.callId && (message as { streamReady?: unknown }).streamReady === true); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent).toEqual(expect.arrayContaining([expect.objectContaining({ type: RUNTIME_RESULT_TYPE, callId: first.callId, streamReady: true })]));
+
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: first.callId, serviceInstanceId: streamReference.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && provider.executionCount() !== 0; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.executionCount()).toBe(0);
+
+    const third = streamCallMessage("stream:peer-limit:third");
+    port.emit(third);
+    for (let attempt = 0; attempt < 20 && entered !== 2; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(entered).toBe(2);
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => {
+      const value = message as { callId?: unknown; streamReady?: unknown };
+      return value.callId === third.callId && value.streamReady === true;
+    }); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(port.sent.some((message) => {
+      const value = message as { callId?: unknown; streamReady?: unknown };
+      return value.callId === third.callId && value.streamReady === true;
+    })).toBe(true);
+
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: third.callId, serviceInstanceId: streamReference.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && provider.executionCount() !== 0; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(provider.executionCount()).toBe(0);
+    expect(budget.activeStreams).toBe(0);
     provider.dispose();
   });
 });

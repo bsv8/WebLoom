@@ -31,6 +31,19 @@ export interface StreamTransferDescriptor<TRequest, TItem> {
   readonly item?: TransferExtractor<TItem>;
 }
 
+/**
+ * 大文件/媒体流推荐的精确二进制分块形状；data 本身就是本块的完整
+ * ArrayBuffer，必须通过 capability transfer 声明转移所有权，不能传 subarray。
+ */
+export interface BinaryChunk {
+  /** 文件或逻辑流中的绝对偏移。 */
+  readonly offset: number;
+  /** 本块的 exact-size 二进制数据。 */
+  readonly data: ArrayBuffer;
+  /** 是否为逻辑流最后一块。 */
+  readonly eof?: boolean;
+}
+
 export type CapabilityKind = "local" | "rpc" | "stream";
 
 /** 可序列化的 capability 身份；不包含 parser、transfer 或 handler。 */
@@ -136,6 +149,8 @@ export interface StreamSubscribeOptions<TItem> extends RpcCallOptions {
   readonly onNext: (item: TItem) => void | Promise<void>;
   /** 初始窗口；默认 16，最大 256。 */
   readonly initialCredit?: number;
+  /** 初始字节窗口；按 DTO budgetBytes 计费。省略时根据单消息上限以及 peer/runtime 的 stream 容量公平分配，实际值可能由 Provider 进一步缩小。 */
+  readonly initialByteCredit?: number;
 }
 
 /** 一个 typed stream 的本端生命周期。 */

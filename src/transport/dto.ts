@@ -59,6 +59,7 @@ export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = Object.freeze({
   maxTransfers: 32,
   maxMessagePorts: 8,
   maxStreamCredit: 256,
+  maxStreamByteCredit: 64 * 1024 * 1024,
 });
 
 export type RuntimeLimitsInput = Partial<RuntimeLimits>;
@@ -73,6 +74,8 @@ export interface RuntimeBudget {
   activeStreams: number;
   executionSlots: number;
   retainedPayloadBytes: number;
+  /** 当前已经分配但尚未消费的 stream 字节 credit。 */
+  reservedStreamByteCredit: number;
   /** 以 FIFO 顺序登记一个等待全局 execution slot 的 transport 队列。 */
   registerExecutionWaiter(waiter: RuntimeExecutionWaiter): () => void;
   /** 释放一个全局 execution slot，并公平唤醒一个等待者。 */
@@ -87,6 +90,7 @@ export function createRuntimeBudget(limits?: RuntimeLimitsInput): RuntimeBudget 
     activeStreams: 0,
     executionSlots: 0,
     retainedPayloadBytes: 0,
+    reservedStreamByteCredit: 0,
     registerExecutionWaiter(waiter) {
       if (typeof waiter !== "function") throw new TypeError("Runtime execution waiter must be a function");
       waiters.add(waiter);
@@ -113,7 +117,7 @@ export function createRuntimeBudget(limits?: RuntimeLimitsInput): RuntimeBudget 
   return budget;
 }
 
-/** 合并并验证可信 Runtime 装配提供的预算。 */
+/** 合并默认值并验证可信 Runtime 装配提供的预算。 */
 export function normalizeRuntimeLimits(input: RuntimeLimitsInput | undefined): RuntimeLimits {
   const result = { ...DEFAULT_RUNTIME_LIMITS, ...(input ?? {}) };
   for (const [key, value] of Object.entries(result)) {
@@ -126,10 +130,70 @@ export function normalizeRuntimeLimits(input: RuntimeLimitsInput | undefined): R
   if (result.maxMessagePorts > result.maxTransfers) throw new TypeError("maxMessagePorts cannot exceed maxTransfers");
   if (result.maxTransferEntries < result.maxTransfers) throw new TypeError("maxTransferEntries cannot be less than maxTransfers");
   if (result.maxStreamCredit > 256) throw new TypeError("maxStreamCredit cannot exceed 256");
+  if (result.maxStreamByteCredit > DEFAULT_RUNTIME_LIMITS.maxStreamByteCredit) throw new TypeError("maxStreamByteCredit cannot exceed the v4 default budget");
   return Object.freeze(result);
 }
 
+/**
+ * 计算未显式指定 initialByteCredit 时使用的有限默认窗口。
+ *
+ * 默认窗口按 peer/runtime 的活动 stream 容量公平分摊，避免一个空闲
+ * stream 预留整个 retained-byte 配额；实际窗口还会在调用点继续受当前
+ * peer/runtime 剩余容量限制。
+ */
+export function defaultStreamByteCredit(limits: RuntimeLimits): number {
+  const peerShare = Math.floor(limits.maxRetainedPayloadBytesPerPeer / limits.maxActiveStreamsPerPeer);
+  const runtimeShare = Math.floor(limits.maxRetainedPayloadBytesPerRuntime / limits.maxActiveStreamsPerRuntime);
+  return Math.max(1, Math.min(limits.maxMessageBudgetBytes, limits.maxStreamByteCredit, peerShare, runtimeShare));
+}
+
+/**
+ * 合并 endpoint 与共享 Runtime 预算的限制；每个字段取更严格值。
+ *
+ * 预算由可信装配层创建，但仍在这里重新规范化，避免调用方手工构造的
+ * 预算对象把某个全局限制扩大回 v4 默认值。
+ */
+export function mergeRuntimeLimits(input: RuntimeLimitsInput | undefined, ...budgets: readonly RuntimeBudget[]): RuntimeLimits {
+  const endpoint = normalizeRuntimeLimits(input);
+  const merged = { ...endpoint };
+  const keys = Object.keys(DEFAULT_RUNTIME_LIMITS) as (keyof RuntimeLimits)[];
+  for (const budget of budgets) {
+    const budgetLimits = normalizeRuntimeLimits(budget.limits);
+    for (const key of keys) merged[key] = Math.min(merged[key], budgetLimits[key]);
+  }
+  return normalizeRuntimeLimits(merged);
+}
+
+/** 从 Runtime 的共享 retained-byte 容量中预留一个 stream 字节窗口。 */
+export function reserveRuntimeStreamByteCredit(budget: RuntimeBudget, bytes: number, maxRetainedPayloadBytes = budget.limits.maxRetainedPayloadBytesPerRuntime): boolean {
+  if (!Number.isSafeInteger(bytes) || bytes < 1) return false;
+  if (budget.retainedPayloadBytes > maxRetainedPayloadBytes - budget.reservedStreamByteCredit - bytes) return false;
+  budget.reservedStreamByteCredit += bytes;
+  return true;
+}
+
+/** 消费一个已经预留的 stream 字节窗口 token。 */
+export function consumeRuntimeStreamByteCredit(budget: RuntimeBudget, bytes: number): boolean {
+  if (!Number.isSafeInteger(bytes) || bytes < 1 || budget.reservedStreamByteCredit < bytes) return false;
+  budget.reservedStreamByteCredit -= bytes;
+  return true;
+}
+
+/** 将已处理的 stream 字节 token 归还到共享窗口。 */
+export function returnRuntimeStreamByteCredit(budget: RuntimeBudget, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 1) return;
+  budget.reservedStreamByteCredit += bytes;
+}
+
+/** 释放 stream 关闭时仍未消费的字节窗口 token。 */
+export function releaseRuntimeStreamByteCredit(budget: RuntimeBudget, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 1) return;
+  budget.reservedStreamByteCredit = Math.max(0, budget.reservedStreamByteCredit - bytes);
+}
+
 export interface DtoStats {
+  /** 可达图的最长路径深度。 */
+  readonly depth: number;
   /** 唯一对象节点数。 */
   readonly nodes: number;
   /** 引用边/字段槽位数。 */
@@ -142,10 +206,45 @@ export interface DtoStats {
   readonly reachableTransferables: readonly Transferable[];
 }
 
+/**
+ * 框架内部的单次 payload 准备结果。
+ *
+ * 该对象只由 createPreparedPayload() 产生，插件不能通过普通对象伪造
+ * fast-path 标记；PreparedPayload 也不会进入 wire。value 仍然是原始 DTO，
+ * transfer 和 stats 只是同一次 walker 的本地旁路元数据。
+ */
+export interface PreparedPayload {
+  /** parser 规范化后的值。 */
+  readonly value: unknown;
+  /** 经 extractor 去重并校验过的 transfer 列表。 */
+  readonly transfer: readonly Transferable[];
+  /** 与 value 同一次 walker 产生的统计。 */
+  readonly stats: DtoStats;
+}
+
+const preparedPayloads = new WeakSet<object>();
+
+/** 创建框架内部 payload fast-path；统计必须由本次工厂调用原子生成。 */
+export function createPreparedPayload(
+  value: unknown,
+  transfer: readonly Transferable[] | undefined,
+  options: { readonly limits?: RuntimeLimitsInput; readonly phase?: "validate" | "receive" | "dispatch" } = {},
+): PreparedPayload {
+  const validation = validateTransferListWithStats(value, transfer, options);
+  const prepared = Object.freeze({ value, transfer: validation.transfer, stats: validation.stats });
+  preparedPayloads.add(prepared);
+  return prepared;
+}
+
+/** 仅识别由框架工厂创建的 PreparedPayload。 */
+export function isPreparedPayload(value: unknown): value is PreparedPayload {
+  return !!value && typeof value === "object" && preparedPayloads.has(value);
+}
+
 export interface ValidateDtoOptions {
   /** DTO 边界；缺省使用 v4 默认值。 */
   readonly limits?: Partial<DtoLimits>;
-  /** 已声明的 transfer；MessagePort 只有在这里才可进入规范化图。 */
+  /** 已声明的 transfer；接收端允许先观察未声明资源，契约边界再校验所有权。 */
   readonly transferables?: ReadonlySet<Transferable>;
   /** 原始 parser 输入检查允许暂时观察 MessagePort。 */
   readonly allowUnlistedMessagePorts?: boolean;
@@ -399,8 +498,8 @@ export function validateDto(value: unknown, options: ValidateDtoOptions = {}): D
     return subtreeDepth;
   };
 
-  walk(value, 0);
-  return Object.freeze({ nodes, edges, budgetBytes, messagePorts: Object.freeze(messagePorts), reachableTransferables: Object.freeze(reachableTransferables) });
+  const depth = walk(value, 0);
+  return Object.freeze({ depth, nodes, edges, budgetBytes, messagePorts: Object.freeze(messagePorts), reachableTransferables: Object.freeze(reachableTransferables) });
 }
 
 /** 验证 transfer extractor 的原始列表、可达性和数量预算。 */
@@ -418,26 +517,13 @@ export function validateTransferListWithStats(
   options: { readonly limits?: RuntimeLimitsInput; readonly phase?: "validate" | "receive" | "dispatch" } = {},
 ): TransferValidation {
   const limits = normalizeRuntimeLimits(options.limits);
-  if (transfer === undefined) {
-    const stats = validateDto(value, {
-      limits: {
-        maxDepth: limits.maxDtoDepth,
-        maxNodes: limits.maxDtoNodes,
-        maxEdges: limits.maxDtoEdges,
-        maxBudgetBytes: limits.maxMessageBudgetBytes,
-      },
-      transferables: new Set<Transferable>(),
-      phase: options.phase ?? "validate",
-    });
-    return { transfer: Object.freeze([]), stats };
-  }
-  if (!Array.isArray(transfer) || transfer.length > limits.maxTransferEntries) {
+  if (transfer !== undefined && (!Array.isArray(transfer) || transfer.length > limits.maxTransferEntries)) {
     throw new WebLoomError("transfer_invalid", "Capability transfer list exceeds its bounded entry limit", options.phase ?? "validate");
   }
   const result: Transferable[] = [];
   const seen = new Set<Transferable>();
   let ports = 0;
-  for (const item of transfer) {
+  for (const item of transfer ?? []) {
     if (!isSupportedTransfer(item)) throw new WebLoomError("transfer_invalid", "Capability transfer extractor returned an unsupported resource", options.phase ?? "validate");
     if (seen.has(item)) continue;
     seen.add(item);

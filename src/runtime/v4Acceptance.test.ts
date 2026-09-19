@@ -243,6 +243,7 @@ function streamCall(
     timeoutMs: 500,
     request: { topic: "acceptance" },
     initialCredit,
+    initialByteCredit: 128,
   };
 }
 
@@ -471,7 +472,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     const subscription = bridge.getClient(Events).subscribe({ topic: "late" }, { initialCredit: 1, onNext() {} });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
     await subscription.ready;
     transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 }, [latePort.port]);
     await expect(subscription.closed).rejects.toMatchObject({ code: "transfer_invalid" });
@@ -566,7 +567,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     });
     const call = transport.sent.at(-1)?.message;
     if (!call || call.type !== RUNTIME_CALL_TYPE) throw new Error("stream call was not sent");
-    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true });
+    transport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: call.initialByteCredit ?? 1 });
     await subscription.ready;
     transport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: call.callId, serviceInstanceId: call.serviceInstanceId, sequence: 1, item: 1 });
     await firstEntered;
@@ -594,7 +595,7 @@ describe("WebLoom v4 acceptance boundaries", () => {
     });
     const cancelCall = cancelTransport.sent.at(-1)?.message;
     if (!cancelCall || cancelCall.type !== RUNTIME_CALL_TYPE) throw new Error("cancel stream call was not sent");
-    cancelTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, streamReady: true });
+    cancelTransport.emit({ type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: cancelCall.initialByteCredit ?? 1 });
     await drainingCancel.ready;
     cancelTransport.emit({ type: RUNTIME_NEXT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: acceptanceBinding, callId: cancelCall.callId, serviceInstanceId: cancelCall.serviceInstanceId, sequence: 1, item: 1 });
     await cancelEnteredPromise;
