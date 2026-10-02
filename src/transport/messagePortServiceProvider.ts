@@ -32,6 +32,7 @@ import {
   type RuntimeCallMessage,
   type RuntimeWireMessage,
 } from "../runtime/runtimeProtocol.js";
+import { streamCleanupCompletion } from "../runtime/privateCallValidity.js";
 import { createMessagePortRuntimeTransport, type MessagePortLike } from "./messagePortServiceTransport.js";
 import type { RuntimeReceiveMetadata, RuntimeTransport } from "./serviceBridge.js";
 import { createRuntimeEndpointBinding, createRuntimeEndpointSession, sameRuntimeEndpointBinding, type RuntimeEndpointSession } from "../runtime/runtimeSession.js";
@@ -136,6 +137,10 @@ interface StreamEntry {
   iteratorDone: boolean;
   returnStarted: boolean;
   returnDone: boolean;
+  /** 清理未完成（return() 被拒绝或等待预算耗尽）：执行名额必须继续占用。 */
+  cleanupIncomplete?: boolean;
+  /** 包装器暴露的底层清理完成信号来源（用于订阅真实完成时刻）。 */
+  cleanupSignalSource?: unknown;
   pumpDone: boolean;
   /** 已发出但尚未收到归还 credit 的 item budget 队列。 */
   outstandingByteBudgets: number[];
@@ -311,6 +316,32 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     budget.retainedPayloadBytes += bytes;
   };
 
+  /**
+   * 观察迟到的清理完成。
+   *
+   * `return()` 被拒绝不代表清理完成（可能只是等待预算耗尽）：执行名额继续占用，直到**可信
+   * 的完成信号**到达才回收。信号由私有 stream 包装器通过 `PRIVATE_STREAM_CLEANUP_SIGNAL`
+   * 暴露；这里绝不通过调用 `next()` 推断完成——超时后 `next()` 会立刻返回 `done:true`，
+   * 那样会把"仍在清理"误判成"已清理"。
+   *
+   * 没有可信信号的普通 iterator 保持占用不变，由 runtime drain 如实报告未完成执行数，
+   * 而不是提前回收名额。
+   */
+  const watchLateCleanup = (stream: StreamEntry): void => {
+    const signal = streamCleanupCompletion(stream.cleanupSignalSource);
+    if (signal === undefined) return;
+    void signal.then(() => {
+      stream.cleanupIncomplete = false;
+      stream.returnDone = true;
+      maybeReleaseStreamExecution(stream);
+    }, () => {
+      // 清理失败也代表它已经结束（不再占用）。
+      stream.cleanupIncomplete = false;
+      stream.returnDone = true;
+      maybeReleaseStreamExecution(stream);
+    });
+  };
+
   const returnIterator = (stream: StreamEntry): void => {
     if (stream.returnStarted) return;
     stream.returnStarted = true;
@@ -318,13 +349,19 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     if (!candidate) { stream.returnDone = true; maybeReleaseStreamExecution(stream); return; }
     let result: unknown;
     try { result = candidate.call(stream.iterator); }
-    catch { stream.returnDone = true; maybeReleaseStreamExecution(stream); return; }
+    catch {
+      // 同步抛出：清理未完成，占用保留，等待迟到完成。
+      stream.cleanupIncomplete = true;
+      watchLateCleanup(stream);
+      return;
+    }
     void Promise.resolve(result).then(() => {
       stream.returnDone = true;
       maybeReleaseStreamExecution(stream);
     }, () => {
-      stream.returnDone = true;
-      maybeReleaseStreamExecution(stream);
+      // 拒绝 ≠ 清理完成：保持占用，等底层真正结束后再回收。
+      stream.cleanupIncomplete = true;
+      watchLateCleanup(stream);
     });
   };
 
@@ -606,7 +643,10 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
     if (activeCalls.has(message.callId) || executionSlots.has(message.callId)) { ledger.closeUndelivered(); sendError(message, "invalid_message", "dispatch"); return; }
     // A published domain grant is part of the service exposure identity.  A
     // caller must echo it exactly; omission is not equivalent to possession.
-    if (message.grantId !== reference.grantId) { ledger.closeUndelivered(); sendError(message, "permission_denied", "dispatch"); return; }
+    // An exposure without a published grant cannot be *elevated* by supplying one:
+    // such a call is judged by the provider itself (private entries compare the
+    // assembly-issued ticket before the handler runs).
+    if (reference.grantId !== undefined ? message.grantId !== reference.grantId : false) { ledger.closeUndelivered(); sendError(message, "permission_denied", "dispatch"); return; }
     const initialCredit = message.mode === "stream" ? message.initialCredit : 0;
     const requestedInitialByteCredit = message.mode === "stream" ? message.initialByteCredit : 0;
     if (message.mode === "stream" && (!Number.isSafeInteger(initialCredit) || initialCredit < 1 || initialCredit > limits.maxStreamCredit
@@ -676,7 +716,11 @@ export function createMessagePortServiceProvider(options: MessagePortServiceProv
         // completed iterator.return().
         const admission = active.streamAdmission;
         if (!admission) throw new WebLoomError("resource_limit_exceeded", safeErrorMessage("resource_limit_exceeded"), "dispatch");
-        stream = { active, call: active.call, controller, reference, window: message.initialCredit ?? 16, byteWindow: initialByteCredit, admission, iterator, credit: message.initialCredit ?? 16, sequence: 1, running: false, closed: false, iteratorDone: false, returnStarted: false, returnDone: false, pumpDone: false, outstandingByteBudgets: [], outstandingByteHead: 0, pendingOutputBytes: 0 };
+        stream = {
+          active, call: active.call, controller, reference, window: message.initialCredit ?? 16, byteWindow: initialByteCredit, admission, iterator, credit: message.initialCredit ?? 16, sequence: 1, running: false, closed: false, iteratorDone: false, returnStarted: false, returnDone: false, pumpDone: false, outstandingByteBudgets: [], outstandingByteHead: 0, pendingOutputBytes: 0,
+          // 私有 stream 包装器把底层清理完成信号挂在可迭代对象上：迟到回收只认这个信号。
+          cleanupSignalSource: result,
+        };
         active.streamAdmission = undefined;
         streams.set(message.callId, stream);
         if (!post(transport, codec, { type: RUNTIME_RESULT_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId: message.callId, serviceInstanceId: reference.serviceInstanceId, streamReady: true, acceptedInitialByteCredit: initialByteCredit })) {

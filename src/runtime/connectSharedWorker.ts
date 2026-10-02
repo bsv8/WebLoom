@@ -11,6 +11,8 @@ import type { WindowApp, RuntimeHandle, RuntimeStatusListener, RuntimeStatusSnap
 import { RuntimeUnavailableError } from "./runtimeTypes.js";
 import { createCapabilityBridge } from "../transport/serviceBridge.js";
 import { createMessagePortRuntimeTransport, type MessagePortLike } from "../transport/messagePortServiceTransport.js";
+import { authorizedPrivateInstance } from "./privateGrant.js";
+import { assertPrivateResultPublishable, guardPrivateStream, isAsyncIterable, type PrivateCallValidity } from "./privateCallValidity.js";
 import { createMessagePortServiceProvider } from "../transport/messagePortServiceProvider.js";
 import { invokeCapabilityHandler } from "../host/capabilityRegistry.js";
 import { hostForWindowApp } from "./windowRuntime.js";
@@ -159,12 +161,70 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
       try { value = capability.request.parse(call.request); } catch { throw new WebLoomError("request_validation_failed", "Capability request failed validation", "receive"); }
       return { value, transfer: capability.transfer?.request?.(value) };
     },
-    handleCall: async ({ request, reference, signal, deadlineAt, binding: callBinding, peer }) => {
+    handleCall: async ({ message: callMessage, request, reference, signal, deadlineAt, binding: callBinding, peer }) => {
       const registration = clientHost.capabilities.registration({ kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion });
       if (!registration) throw new WebLoomError("service_stale", "Window exposure is no longer available", "dispatch");
+      // 反向私有调用同样要授权（PSM-R13）：Worker 调用 Window 的私有函数时，
+      // RPC 与 stream 都在执行 handler 之前核对连接绑定票据。
+      // 反向方向同样只认「机密 + 存活实例」的对应记录；无可授权实例时直接拒绝。
+      const privateIdentity = authorizedPrivateInstance({
+        private: registration.reference.attributes?.private === true,
+        candidates: clientHost.privateGrantCandidates?.(
+          { kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion },
+          bridge.remoteUnits?.() ?? [],
+        ) ?? [],
+        grantId: callMessage?.grantId,
+        connectionId: callBinding?.connectionId,
+      });
+      if (privateIdentity === undefined) {
+        throw new WebLoomError("permission_denied", "Private capability call is not authorized for this consumer", "dispatch", {
+          capabilityId: reference.capabilityId,
+          serviceInstanceId: reference.serviceInstanceId,
+        });
+      }
       const handler = registration.handler as ((value: unknown, context: import("../contracts/capability.js").HandlerCallContext) => unknown | Promise<unknown>) | undefined;
       if (!handler) throw new WebLoomError("service_stale", "Window service handler is unavailable", "dispatch");
-      return handler(request, { signal, deadlineAt, reference, binding: callBinding, origin: "remote", peer });
+      const isPrivate = registration.reference.attributes?.private === true;
+      // 反向方向与 Worker 侧执行同一条生命周期规则（PSM-R13）：撤销即中止合并信号，
+      // RPC 发布结果前复核，stream 的授权绑定持续到流结束并拦截后续 item。
+      const recheck = (): string | undefined => authorizedPrivateInstance({
+        private: isPrivate,
+        candidates: clientHost.privateGrantCandidates?.(
+          { kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion },
+          bridge.remoteUnits?.() ?? [],
+        ) ?? [],
+        grantId: callMessage?.grantId,
+        connectionId: callBinding?.connectionId,
+      });
+      const validityController = new AbortController();
+      const validityUnsubscribe = isPrivate && typeof bridge.subscribe === "function"
+        ? bridge.subscribe(() => {
+          if (recheck() !== privateIdentity) {
+            validityController.abort(new WebLoomError("permission_denied", "Private capability consumer instance was revoked", "dispatch", {
+              capabilityId: reference.capabilityId,
+              serviceInstanceId: reference.serviceInstanceId,
+            }));
+          }
+        })
+        : undefined;
+      const merged = mergeProviderSignals(signal, validityController.signal);
+      const validity = {
+        get aborted() { return validityController.signal.aborted; },
+        get reason() { return validityController.signal.reason; },
+        release() { validityUnsubscribe?.(); merged.dispose(); },
+      } satisfies PrivateCallValidity;
+      let streamResult = false;
+      try {
+        const produced = await handler(request, { signal: merged.signal, deadlineAt, reference, binding: callBinding, origin: "remote", peer });
+        if (isPrivate && isAsyncIterable(produced)) {
+          streamResult = true;
+          return guardPrivateStream(produced, { validity, recheck, identity: privateIdentity });
+        }
+        if (isPrivate) assertPrivateResultPublishable(validity, recheck, privateIdentity);
+        return produced;
+      } finally {
+        if (!isPrivate || !streamResult) validity.release();
+      }
     },
     prepareResult: (value, call) => {
       const registration = clientHost.capabilities.registration({ kind: "rpc", id: call.capabilityId, version: call.contractVersion });
@@ -274,6 +334,26 @@ function connectInternal(options: InternalOptions): RuntimeHandle {
 export function connectSharedWorker(options: ConnectSharedWorkerOptions): RuntimeHandle { return connectInternal(options); }
 
 /** testing 入口才允许注入可控 Worker 工厂。 */
+/** 合并两个取消信号（提供端在途调用用）。 */
+function mergeProviderSignals(primary: AbortSignal, secondary: AbortSignal): { readonly signal: AbortSignal; readonly aborted: boolean; dispose(): void } {
+  const controller = new AbortController();
+  const abort = (reason: unknown): void => { if (!controller.signal.aborted) controller.abort(reason); };
+  if (primary.aborted) abort(primary.reason);
+  if (secondary.aborted) abort(secondary.reason);
+  const onPrimary = (): void => abort(primary.reason);
+  const onSecondary = (): void => abort(secondary.reason);
+  primary.addEventListener("abort", onPrimary, { once: true });
+  secondary.addEventListener("abort", onSecondary, { once: true });
+  return {
+    signal: controller.signal as AbortSignal,
+    get aborted() { return controller.signal.aborted; },
+    dispose() {
+      primary.removeEventListener("abort", onPrimary);
+      secondary.removeEventListener("abort", onSecondary);
+    },
+  };
+}
+
 export function connectSharedWorkerForTesting(options: ConnectSharedWorkerOptions, workerFactory: SharedWorkerFactory): RuntimeHandle { return connectInternal({ ...options, workerFactory }); }
 
 /** advanced 装配层取得连接 bridge；普通 RuntimeHandle 不暴露该实现细节。 */

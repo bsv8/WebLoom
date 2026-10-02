@@ -37,6 +37,9 @@ const allowedPackFiles = [
   /^dist\/chunk-[A-Za-z0-9_-]+\.js(?:\.map)?$/,
   /^dist\/[^/]+\.d\.ts$/,
   /^docs\/proposals\/webloom-v4\/(?:requirements|implementation-plan|verification)\.md$/,
+  // 下游迁移说明随包发布，README 直接链接它们。
+  /^docs\/plugin-consumer-migration\.md$/,
+  /^docs\/plugin-service-migration\.md$/,
 ];
 const requiredPackFiles = [
   "package.json",
@@ -44,6 +47,8 @@ const requiredPackFiles = [
   "README.md",
   "docs/api.md",
   "docs/migration-baseline.md",
+  "docs/plugin-consumer-migration.md",
+  "docs/plugin-service-migration.md",
   "dist/index.js",
   "dist/index.d.ts",
   "dist/advanced.js",
@@ -273,6 +278,8 @@ try {
   installConsumer(coreConsumer, "webloom-core-consumer", { "webloom-framework": dependency });
   writeTypeSmoke(coreConsumer, `
     import { createWindowApp, defineCapability, definePlugin } from "webloom-framework";
+    import type { PluginConsumer, AvailableConsumerCapability, PluginDefinition } from "webloom-framework";
+    import { createPluginHost } from "webloom-framework/advanced";
 
     const Demo = defineCapability<{ value: number }>({
       kind: "local", id: "demo.service", version: "1",
@@ -289,6 +296,41 @@ try {
     if (app.runtimeKind !== "window-main") throw new Error("Window Runtime API is unavailable");
     if (app.capability(Demo).value !== 1) throw new Error("typed local capability is unavailable");
     await app.dispose();
+
+    // 插件实例消费视图是 core 公开类型：能从 setup 的 ctx 取出并保存，
+    // 交给下游 UI 注册/资源加载器长期持有（PCB-R02/R07）。
+    const consumerPlugin = definePlugin({
+      id: "demo-consumer",
+      dependencies: [{ capability: Demo }] as const,
+      runtime: "window-main",
+      setup: (context) => {
+        // consumer 只暴露受限读取入口：读取声明过的依赖 OK。
+        const consumer: PluginConsumer = context.consumer;
+        const theme = defineCapability<{ name: string }>({ kind: "local", id: "demo.theme", version: "1" });
+        const available: AvailableConsumerCapability<readonly [], readonly [{ readonly capability: typeof Demo }]> = Demo;
+        void available;
+        void consumer.optionalCapability(Demo);
+        // 窄化 consumer：未声明的 capability 在编译期就无法传入。
+        const narrow: PluginConsumer<readonly [], readonly [{ readonly capability: typeof Demo }]> = consumer;
+        // @ts-expect-error capability 参数必须是契约对象，不能是字符串 id
+        narrow.capability("demo.service");
+        // @ts-expect-error capability 参数必须是契约对象，数字也不行
+        narrow.optionalCapability(1);
+        // @ts-expect-error 未声明的 capability 不能传给窄化 consumer
+        narrow.capability(theme);
+        // @ts-expect-error 窄化 consumer 也不是管理入口
+        narrow.provide;
+        // @ts-expect-error 消费视图不是管理入口，没有 provide
+        consumer.provide;
+        // @ts-expect-error 消费视图不是管理入口，没有 handle
+        consumer.handle;
+        // @ts-expect-error 消费视图不暴露完整 Host
+        consumer.host;
+        // @ts-expect-error 消费视图不暴露 App
+        consumer.app;
+      },
+    });
+    void consumerPlugin;
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(coreConsumer);
   runRuntimeSmoke(coreConsumer, `
@@ -301,22 +343,129 @@ try {
     console.log("core-only consumer smoke passed");
   `);
 
+  // core-only 运行时装载：真实走一遍实例消费视图，确认撤销语义在发布包里
+  // 与源码一致，且 core 入口不需要 React。
+  runRuntimeSmoke(coreConsumer, `
+    const core = await import("webloom-framework");
+    const Demo = core.defineCapability({ kind: "local", id: "smoke.demo", version: "1" });
+    const held = [];
+    const provider = core.definePlugin({
+      id: "smoke-provider",
+      provides: [Demo],
+      setup(ctx) { ctx.provide(Demo, { value: 7 }); },
+    });
+    const consumerPlugin = core.definePlugin({
+      id: "smoke-consumer",
+      dependencies: [{ capability: Demo }],
+      runtime: "window-main",
+      setup(ctx) { held.push(ctx.consumer); },
+    });
+    const app = await core.createWindowApp({ plugins: [provider, consumerPlugin] });
+    const consumer = held[0];
+    if (!consumer) throw new Error("setup did not receive a PluginConsumer");
+    if (consumer.capability(Demo).value !== 7) throw new Error("consumer capability read failed");
+    // 同一契约重复读取必须返回稳定引用（React 快照需要）。
+    if (consumer.capability(Demo) !== consumer.capability(Demo)) throw new Error("consumer capability reference is not stable");
+    // Host 生命周期管理属于装配层，只从 advanced 入口取；core 消费者不
+    // 需要它也能读能力（上面的 capability 读取已在 core 完成）。
+    const { hostForWindowApp } = await import("webloom-framework/advanced");
+    const host = hostForWindowApp(app);
+    // 新模型没有用户启停接口：装配清单里的插件全部参与系统，释放只能由可信
+    // 装配层显式 revoke，并且留下可诊断的运行条件。
+    for (const removed of ["enable", "disable", "submitIntent", "suspend"]) {
+      if (typeof host[removed] === "function") throw new Error("Host still exposes a user enable/disable API: " + removed);
+    }
+    if ("desiredEnabled" in host.state("smoke-consumer")) throw new Error("plugin state still exposes desiredEnabled");
+    await host.revoke("smoke-consumer", "smoke stop");
+    // 撤权后旧视图永久失效，不再按 pluginId 自动重绑。
+    let revoked = false;
+    try { consumer.capability(Demo); } catch { revoked = true; }
+    if (!revoked) throw new Error("revoked PluginConsumer still resolved capabilities");
+    if (consumer.status !== "revoked") throw new Error("revoked PluginConsumer did not report revoked status");
+    await host.retry("smoke-consumer");
+    if (held.length !== 2) throw new Error("restart did not issue a new PluginConsumer");
+    if (held[1].instanceId === consumer.instanceId) throw new Error("restart reused the old instance id");
+    // 旧 consumer 仍然失效；同名重启不会让旧视图复活。
+    let stillRevoked = false;
+    try { consumer.capability(Demo); } catch { stillRevoked = true; }
+    if (!stillRevoked) throw new Error("old PluginConsumer was reactivated after restart");
+    await app.dispose();
+    console.log("core-only PluginConsumer runtime smoke passed");
+  `);
+
   // Advanced consumer verifies that implementation details are available only
   // through the explicit v4 advanced entry.
   const advancedConsumer = join(smokeRoot, "advanced-consumer");
   installConsumer(advancedConsumer, "webloom-advanced-consumer", { "webloom-framework": dependency });
   writeTypeSmoke(advancedConsumer, `
     import { createPluginHost, createCapabilityRegistry } from "webloom-framework/advanced";
+    import { defineCapability, RESOURCE_REGISTRY, type ResourceContext, type ResourceDefinition } from "webloom-framework";
     const host = createPluginHost();
     const registry = createCapabilityRegistry();
     void host;
     void registry;
+
+    // 实例所属资源的 typed 能力解析（PCB-R05）：资源上下文只提供
+    // capability()/optionalCapability()，插件侧没有字符串 getCapability(id)。
+    const Profile = defineCapability<{ name: string }>({ kind: "local", id: "smoke.profile", version: "1" });
+    const definition: ResourceDefinition<string> = {
+      id: "smoke.profile",
+      scope: "plugin",
+      invalidation: "immediate",
+      key: (_args: readonly string[], context: ResourceContext) => [context.capability(Profile).name],
+      load: async (_args: readonly string[], context: ResourceContext) => context.capability(Profile).name,
+    };
+    void definition;
+    // @ts-expect-error 插件资源不再提供字符串 getCapability 入口
+    const removed: unknown = (undefined as unknown as ResourceContext).getCapability;
+    void removed;
+    // @ts-expect-error RESOURCE_REGISTRY 的 register 需要完整资源定义
+    RESOURCE_REGISTRY.value.register({ id: "x" });
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(advancedConsumer);
   runRuntimeSmoke(advancedConsumer, `
     const advanced = await import("webloom-framework/advanced");
     if (typeof advanced.createPluginHost !== "function" || typeof advanced.createCapabilityRegistry !== "function") throw new Error("advanced entry is unavailable");
     console.log("advanced consumer smoke passed");
+  `);
+
+  // 资源 owner 的 typed 解析：插件资源按自身实例解析能力，宿主资源走
+  // 装配层 resolver；两者不互相降级（PCB-R05）。
+  runRuntimeSmoke(advancedConsumer, `
+    const core = await import("webloom-framework");
+    const { hostForWindowApp } = await import("webloom-framework/advanced");
+    // 被资源消费的 Profile 能力由插件自己提供，避免依赖外部装配顺序：
+    // 这样 setup 执行时能力已经在本实例目录中，资源 loader 才能按 owner
+    // 身份解析它（PCB-R05）。
+    const Profile = core.defineCapability({ kind: "local", id: "smoke.resource.profile", version: "1" });
+    const plugin = core.definePlugin({
+      id: "smoke-resource-plugin",
+      provides: [Profile],
+      dependencies: [{ capability: core.RESOURCE_REGISTRY }],
+      runtime: "window-main",
+      setup(ctx) {
+        ctx.provide(Profile, { name: "owner-scoped" });
+        ctx.capability(core.RESOURCE_REGISTRY).register({
+          id: "smoke.profile",
+          scope: "plugin",
+          invalidation: "immediate",
+          key: () => ["smoke.profile"],
+          // 资源 loader 使用定义所属实例的 typed 能力，而不是全局查询。
+          load: async (_args, context) => context.capability(Profile).name,
+        });
+      },
+    });
+    const app = await core.createWindowApp({ plugins: [plugin] });
+    const host = hostForWindowApp(app);
+    host.resourceStore.ensure("smoke.profile", []);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const data = host.resourceStore.read("smoke.profile", [])?.data;
+    if (data !== "owner-scoped") throw new Error("plugin-owned resource did not resolve its owner capability");
+    // 撤权后定义注销，读取不会降级为宿主资源。
+    await host.revoke("smoke-resource-plugin", "smoke stop");
+    if (host.resourceStore.read("smoke.profile", []) !== undefined) throw new Error("revoked owner resource still readable");
+    await app.dispose();
+    console.log("resource owner typed capability smoke passed");
   `);
 
   // React 消费者安装 React 和声明包，验证 webloom-framework/react 的运行时及类型边界。
@@ -331,8 +480,15 @@ try {
   });
   writeTypeSmoke(reactConsumer, `
     import { createElement, type ReactElement } from "react";
-    import { createWindowApp } from "webloom-framework";
-    import { WebLoomProvider, useWebLoomApp } from "webloom-framework/react";
+    import { createWindowApp, defineCapability, type PluginConsumer } from "webloom-framework";
+    import {
+      PluginConsumerProvider,
+      WebLoomProvider,
+      usePluginCapability,
+      useHasPluginCapability,
+      useOptionalPluginCapability,
+      useWebLoomApp,
+    } from "webloom-framework/react";
 
     const app = await createWindowApp({ plugins: [] });
     function Probe(): ReactElement {
@@ -344,15 +500,81 @@ try {
       { app, children: createElement(Probe) },
     );
     void element;
+
+    // 插件实例消费边界的 React 接入：Provider 只接受框架签发的 consumer，
+    // 三个插件 hook 只能在该实例的声明范围内读取能力（PCB-R03）。
+    const Theme = defineCapability<{ name: string }>({ kind: "local", id: "smoke.theme", version: "1" });
+    const Absent = defineCapability<{ ok: boolean }>({ kind: "local", id: "smoke.absent", version: "1" });
+    function ThemeProbe(): ReactElement {
+      const theme = usePluginCapability(Theme);
+      const has = useHasPluginCapability(Absent);
+      const absent = useOptionalPluginCapability(Absent);
+      void has;
+      void absent;
+      return createElement("output", null, theme.name);
+    }
+    function ConsumerTree({ consumer }: { consumer: PluginConsumer }): ReactElement {
+      return createElement(
+        PluginConsumerProvider,
+        { consumer, children: createElement(ThemeProbe) },
+      );
+    }
+    void ConsumerTree;
   `, ["ES2022", "DOM", "DOM.Iterable"]);
   typecheckConsumer(reactConsumer);
   runRuntimeSmoke(reactConsumer, `
     const react = await import("webloom-framework/react");
     if (typeof react.WebLoomProvider !== "function" || typeof react.useCapability !== "function") throw new Error("webloom-framework/react entry is unavailable");
+    // 插件实例消费边界的公开 React 面：Provider 与三个插件 hook。
+    for (const name of ["PluginConsumerProvider", "usePluginCapability", "useOptionalPluginCapability", "useHasPluginCapability"]) {
+      if (typeof react[name] !== "function") throw new Error("webloom-framework/react entry is missing " + name);
+    }
+    // 内部防误用 context 不是公共 API，不应从子入口扩散出去。
+    if (react.PluginConsumerContext !== undefined) throw new Error("PluginConsumerContext must not be a public export");
+    if (react.usePluginConsumer !== undefined) throw new Error("usePluginConsumer must not be a public export");
+    if (react.useIsInsidePluginBoundary !== undefined) throw new Error("useIsInsidePluginBoundary must not be a public export");
     const testing = await import("webloom-framework/testing");
     if (typeof testing.createFakePluginHost !== "function") throw new Error("webloom-framework/testing entry is unavailable");
     await import("react-dom");
     console.log("react consumer smoke passed");
+  `);
+
+  // React 运行时装载：真实创建窗口 App，签发 consumer 并在 Provider 下
+  // 渲染；撤权后 Provider 停止渲染旧实例子树。
+  runRuntimeSmoke(reactConsumer, `
+    const core = await import("webloom-framework");
+    const reactDom = await import("react-dom/server");
+    const React = await import("react");
+    const ui = await import("webloom-framework/react");
+    const { hostForWindowApp } = await import("webloom-framework/advanced");
+    const Theme = core.defineCapability({ kind: "local", id: "smoke.react.theme", version: "1" });
+    const held = [];
+    const app = await core.createWindowApp({ plugins: [
+      core.definePlugin({ id: "smoke.react.provider", provides: [Theme], setup(ctx) { ctx.provide(Theme, { name: "dark" }); } }),
+      core.definePlugin({ id: "smoke.react.consumer", dependencies: [{ capability: Theme }], runtime: "window-main", setup(ctx) { held.push(ctx.consumer); } }),
+    ] });
+    const consumer = held[0];
+    function View() {
+      const theme = ui.usePluginCapability(Theme);
+      return React.createElement("output", null, theme.name);
+    }
+    const markup = reactDom.renderToStaticMarkup(
+      React.createElement(ui.PluginConsumerProvider, { consumer }, React.createElement(View)),
+    );
+    if (!markup.includes("dark")) throw new Error("PluginConsumerProvider did not render the plugin capability");
+    const host = hostForWindowApp(app);
+    await host.revoke("smoke.react.consumer", "smoke stop");
+    const afterRevoke = reactDom.renderToStaticMarkup(
+      React.createElement(ui.PluginConsumerProvider, { consumer }, React.createElement(View)),
+    );
+    if (afterRevoke.includes("dark")) throw new Error("revoked plugin subtree kept rendering");
+    // 伪造 consumer（结构相同但不是框架签发）在 Provider 处被拒绝。
+    const forged = { pluginId: "smoke.react.consumer", unitId: "smoke.react.consumer", instanceId: "fake", status: "active", capability: () => { throw new Error("nope"); }, optionalCapability: () => undefined, subscribe: () => () => {} };
+    let rejected = false;
+    try { reactDom.renderToStaticMarkup(React.createElement(ui.PluginConsumerProvider, { consumer: forged }, React.createElement(View))); } catch { rejected = true; }
+    if (!rejected) throw new Error("forged PluginConsumer was accepted by the Provider");
+    await app.dispose();
+    console.log("react PluginConsumerProvider runtime smoke passed");
   `);
 
   // Worker 消费者不安装 React；其声明只使用 ES2022 + WebWorker lib。

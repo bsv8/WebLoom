@@ -25,6 +25,7 @@ import type {
   ScopedTaskScheduler,
 } from "./lifecycle.js";
 import type { MessageBus } from "./messageBus.js";
+import type { PluginConsumer } from "./consumer.js";
 
 /** 宿主注入的只读结构化属性；不得放入私钥、口令或 Seed。 */
 export type PluginAttributes = Readonly<Record<string, unknown>>;
@@ -54,6 +55,14 @@ type AvailableCapability<
   TProvides extends readonly Capability[],
   TDependencies extends readonly CapabilityDependency[],
 > = DeclaredCapability<TProvides> | DeclaredRuntimeDependencyCapability<TDependencies>;
+
+/**
+ * setup 阶段 ctx.capability 的可用集合：自身 provides + 非 peer 的 dependencies。
+ *
+ * 该集合保持 v4 既有推导（依赖泛型缺省为宽类型时不会在编译期拒绝未声明能力，由运行时
+ * `resolveCapability` 拦截）。`ctx.consumer` 是本轮新增的受限视图，它有更严格的推导
+ * 规则，见 `contracts/consumer.ts` 的 `ConsumerDependencyCapability`。
+ */
 type DeclaredLocal<TProvides extends readonly Capability[]> = Extract<DeclaredCapability<TProvides>, { kind: "local" }>;
 type DeclaredRemote<TProvides extends readonly Capability[]> = Extract<DeclaredCapability<TProvides>, { kind: "rpc" | "stream" }>;
 
@@ -72,6 +81,37 @@ export interface PluginContext<
   readonly unitId: string;
   /** 当前插件实例作用域。 */
   readonly scope: LifecycleScope;
+  /**
+   * 当前实例的受限消费视图（PCB-R02）。
+   *
+   * setup 期间可捕获它并交给 UI 注册/React Provider/资源加载器，使消费方
+   * 始终按本实例的身份读取能力。泛型沿用本单元的 provides/dependencies，
+   * 因此未声明的 capability 在编译期就无法传入。实例停用后该视图立即失效。
+   */
+  readonly consumer: PluginConsumer<TProvides, TDependencies>;
+  /**
+   * 读取**本运行单元所属的私有能力**（PSM-R13）。
+   *
+   * 私有入口不进入 `provides`、公共服务目录或 Connect 名单；授权来自 Host 记录的真实
+   * 实例身份（同 pluginId + 同 unitId），调用方不能自填所属标识。私有能力跨 realm 时
+   * 绑定部署槽位与提供者服务世代：任一侧撤销后旧句柄立即失效，在途调用被取消。
+   */
+  readonly privateCapability: <C extends Capability>(capability: C) => CapabilityClient<C>;
+  /**
+   * 注册所属单元的**私有** handler（PSM-R13）。
+   *
+   * 必须先在该单元的 `privateProvides` 里声明。私有入口不进公共 capability 注册表，
+   * 因此不会出现在服务目录、peer 暴露或 Connect 自动导出名单中；只有同 pluginId +
+   * 同 unitId 的调用实例能用 `privateCapability()` 解析。
+   */
+  readonly handlePrivate: <C extends RemoteCapability>(
+    capability: C,
+    handler: C extends RpcCapability<infer TRequest, infer TResponse>
+      ? RpcHandler<RpcCapability<TRequest, TResponse>>
+      : C extends StreamCapability<infer TRequest, infer TItem>
+        ? StreamHandler<StreamCapability<TRequest, TItem>>
+        : never,
+  ) => void;
   /** 撤权和停止信号。 */
   readonly signal: AbortSignal;
   /** 可信装配批准后的权限视图。 */
@@ -139,6 +179,13 @@ export interface RuntimeUnitDescriptor<
   readonly dependencies?: readonly RuntimeUnitDependency[];
   /** 该单元提供的 capability 静态身份。 */
   readonly provides?: readonly CapabilityDescriptor[];
+  /**
+   * 该单元实现的**私有** capability 静态身份（PSM-R13）。
+   *
+   * 私有入口不进入公共 `provides`，因此不会出现在服务目录、peer exposure 或 Connect
+   * 自动导出名单里；授权只来自 Host 记录的真实实例身份（同 pluginId + 同 unitId）。
+   */
+  readonly privateProvides?: readonly CapabilityDescriptor[];
   /** 领域贡献。 */
   readonly contribution?: TContribution;
   /** 该单元申请的权限。 */
@@ -160,9 +207,7 @@ export type RuntimeUnitDescriptorInput<
   readonly provides?: readonly Capability[];
 };
 
-export type PluginStartupMode = "required" | "optional";
-
-/** 插件静态 manifest；startup/defaultEnabled/canDisable 是唯一启停策略。 */
+/** 插件静态 manifest；只有身份、依赖与运行单元，没有用户启停策略。 */
 export interface PluginManifest<
   TContribution = PluginContribution,
   TConfig extends PluginConfig = PluginConfig,
@@ -173,12 +218,6 @@ export interface PluginManifest<
   readonly name: string;
   /** 可选诊断描述。 */
   readonly description?: string;
-  /** 初始启停策略。 */
-  readonly startup: PluginStartupMode;
-  /** 默认启用意图。 */
-  readonly defaultEnabled: boolean;
-  /** 是否允许控制面停用。 */
-  readonly canDisable: boolean;
   /** 多 Runtime 静态单元。 */
   readonly units?: readonly RuntimeUnitDescriptor<TContribution, TConfig>[];
 }
@@ -189,20 +228,24 @@ export type PluginManifestInput<
   TConfig extends PluginConfig = PluginConfig,
 > = PluginManifest<TContribution, TConfig>;
 
-/** 插件运行状态。 */
+/**
+ * 插件运行状态。
+ *
+ * 这里只描述“实例生命周期与依赖等待”，不表达用户启停意图：所有被装配的插件都会
+ * 尝试运行，等待依赖、正在启动、运行中、停止中与失败都由依赖图和运行时条件决定。
+ */
 export type PluginStateKind =
   | "registered"
   | "starting"
   | "stopping"
   | "enabled"
-  | "disabled"
   | "blocked"
-  | "error-disabled"
+  | "failed"
   | "cleanup-pending"
   | "unknown";
 
 /** 对外稳定的插件生命周期语义。 */
-export type PluginLifecycleState = "disabled" | "waiting" | "starting" | "running" | "stopping" | "failed";
+export type PluginLifecycleState = "waiting" | "starting" | "running" | "stopping" | "failed";
 
 /** Host 查询到的插件状态。 */
 export interface PluginState {
@@ -214,10 +257,6 @@ export interface PluginState {
   readonly lifecycleState: PluginLifecycleState;
   /** 脱敏错误文本。 */
   readonly error?: string;
-  /** 当前启用意图。 */
-  readonly desiredEnabled: boolean;
-  /** 当前意图修订。 */
-  readonly desiredRevision?: number;
   /** 当前启动实例。 */
   readonly instanceId?: string;
   /** 当前运行单元。 */
@@ -240,9 +279,7 @@ export interface PluginUnitState {
   readonly runtime: RuntimeKind;
   /** 当前启动实例。 */
   readonly instanceId?: string;
-  /** 当前意图修订。 */
-  readonly desiredRevision?: number;
-  /** 单元状态。 */
+  /** 单元状态；只由依赖图与运行条件决定。 */
   readonly kind: PluginStateKind;
   /** 脱敏错误文本。 */
   readonly error?: string;
@@ -254,10 +291,12 @@ export interface PluginUnitState {
 export interface PluginReverseDep {
   /** 反向依赖插件标识。 */
   readonly pluginId: string;
-  /** 依赖者是否启用。 */
-  readonly enabled: boolean;
+  /** 依赖者当前是否在运行；这是生命周期诊断，不是用户启停意图。 */
+  readonly running: boolean;
   /** 触发依赖的 capability 身份。 */
   readonly capabilities: readonly CapabilityDescriptor[];
+  /** 该依赖是否为可选；可选依赖只影响排序，不建立撤销级联。 */
+  readonly optional?: boolean;
 }
 
 /** 插件依赖图快照。 */
@@ -274,6 +313,13 @@ export interface PluginGraph {
   readonly reverse: Readonly<Record<string, readonly PluginReverseDep[]>>;
   /** capability 到提供者。 */
   readonly providers: Readonly<Record<string, readonly string[]>>;
+  /**
+   * 排序用的反向依赖，包含已绑定的可选依赖边。
+   *
+   * `reverse` 只表达必需依赖（撤销/失效级联）；销毁顺序必须包含可选边，否则消费者可能
+   * 在它的可选提供者释放之后才清理。
+   */
+  readonly orderingReverse: Readonly<Record<string, readonly PluginReverseDep[]>>;
   /** 依赖环。 */
   readonly cycles: readonly (readonly string[])[];
   /** 运行单元图。 */
@@ -307,22 +353,6 @@ export interface StartupCapabilityErrorDetails {
   readonly providerState?: PluginStateKind;
   /** 提供者错误。 */
   readonly providerError?: string;
-  /** 当前启用意图。 */
-  readonly configuredEnabled?: boolean;
-}
-
-/** 启动插件失败详情。 */
-export interface StartupPluginErrorDetails {
-  /** 插件标识。 */
-  readonly pluginId: string;
-  /** 失败单元。 */
-  readonly unitId?: string;
-  /** 声明提供的 capability。 */
-  readonly capabilities: readonly CapabilityDescriptor[];
-  /** 当前状态。 */
-  readonly state: PluginStateKind;
-  /** 脱敏错误。 */
-  readonly error?: string;
 }
 
 /** 插件定义：静态 manifest 与当前 realm setup 分离。 */

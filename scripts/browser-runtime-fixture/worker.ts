@@ -11,7 +11,6 @@ const app = startSharedWorkerApp({
     runtime: "shared-worker",
     provides: [WorkerRpc, TransferRpc, Events, BusinessPortRpc, BusinessPortEvents] as const,
     dependencies: [{ capability: PageRpc, source: "peer" }] as const,
-    startup: "required" as const,
     setup(ctx) {
       setupCount += 1;
       ctx.handle(WorkerRpc, async (request, call) => {

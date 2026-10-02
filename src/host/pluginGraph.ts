@@ -21,8 +21,8 @@ import type { RuntimeKind } from "../contracts/lifecycle.js";
 export interface PluginGraphOptions {
   /** 当前 Host 的 Runtime；未指定时只用于静态检查。 */
   readonly runtime?: RuntimeKind;
-  /** 当前已经启用的插件，用于生成反向依赖状态。 */
-  readonly enabledPluginIds?: ReadonlySet<string>;
+  /** 当前正在运行的插件，用于反向依赖的“运行中”诊断；不是用户启停意图。 */
+  readonly runningPluginIds?: ReadonlySet<string>;
   /** Host-owned 或远端已发布的 descriptor。 */
   readonly builtinCapabilities?: ReadonlySet<CapabilityDescriptor | string>;
   /** 是否允许尚未出现在本图中的跨 Runtime provider。 */
@@ -124,8 +124,16 @@ export function buildPluginGraph(
   const provides: Record<string, readonly CapabilityDescriptor[]> = {};
   const providers: Record<string, string[]> = {};
   const reverse: Record<string, PluginReverseDep[]> = {};
+  /**
+   * 排序用的反向边：包含**已绑定**的可选依赖。
+   *
+   * `reverse` 只表达必需依赖，因此用于“必须随之失效/撤销”的级联；销毁顺序是另一件事：
+   * 即使消费者对某个可选提供者只是降级，它的清理也应该在提供者释放之前完成，否则可能
+   * 读到已释放的服务。两者因此分开维护。
+   */
+  const orderingReverse: Record<string, PluginReverseDep[]> = {};
   const unitMap = collectUnits(manifests, options.runtime);
-  const enabled = options.enabledPluginIds ?? new Set<string>();
+  const running = options.runningPluginIds ?? new Set<string>();
 
   for (const manifest of manifests) {
     const deps = [...dependenciesOfManifest(manifest, options.runtime)];
@@ -139,13 +147,19 @@ export function buildPluginGraph(
   for (const manifest of manifests) {
     const deps = [...(dependenciesOfManifest(manifest, options.runtime) ?? [])];
     for (const dependency of deps) {
-      // Optional capabilities do not establish a lifecycle edge.  The
-      // consumer remains usable when the provider is intentionally stopped.
-      if (dependency.optional) continue;
       for (const providerId of providers[descriptorKey(dependency.capability)] ?? []) {
-        (reverse[providerId] ??= []).push({
+        // 可选依赖不建立生命周期边（消费者只降级，不被连带撤销），但仍然建立顺序边。
+        if (!dependency.optional) {
+          (reverse[providerId] ??= []).push({
+            pluginId: manifest.id,
+            running: running.has(manifest.id),
+            capabilities: Object.freeze([dependency.capability]),
+          });
+        }
+        (orderingReverse[providerId] ??= []).push({
           pluginId: manifest.id,
-          enabled: enabled.has(manifest.id),
+          running: running.has(manifest.id),
+          optional: dependency.optional === true,
           capabilities: Object.freeze([dependency.capability]),
         });
       }
@@ -177,6 +191,8 @@ export function buildPluginGraph(
 
   const reverseFrozen: Record<string, readonly PluginReverseDep[]> = {};
   for (const [pluginId, values] of Object.entries(reverse)) reverseFrozen[pluginId] = Object.freeze(values);
+  const orderingFrozen: Record<string, readonly PluginReverseDep[]> = {};
+  for (const [pluginId, values] of Object.entries(orderingReverse)) orderingFrozen[pluginId] = Object.freeze(values);
   const providerFrozen: Record<string, readonly string[]> = {};
   for (const [key, values] of Object.entries(providers)) providerFrozen[key] = Object.freeze(values);
   const units: Record<string, PluginUnitGraph> = {};
@@ -188,6 +204,7 @@ export function buildPluginGraph(
     optionalDependencies: freezeRecord(optionalDependencies),
     provides: freezeRecord(provides),
     reverse: freezeRecord(reverseFrozen),
+    orderingReverse: freezeRecord(orderingFrozen),
     providers: freezeRecord(providerFrozen),
     cycles: Object.freeze(cycles),
     units: Object.freeze(units),
@@ -206,9 +223,6 @@ export function validatePluginGraph(
     if (ids.has(manifest.id)) throw new Error(`Plugin "${manifest.id}" is duplicated`);
     ids.add(manifest.id);
     if (typeof manifest.name !== "string" || manifest.name.trim() === "") throw new TypeError(`Plugin "${manifest.id}" name must be a non-empty string`);
-    if (manifest.startup !== "required" && manifest.startup !== "optional") throw new TypeError(`Plugin "${manifest.id}" startup must be required or optional`);
-    if (typeof manifest.defaultEnabled !== "boolean" || typeof manifest.canDisable !== "boolean") throw new TypeError(`Plugin "${manifest.id}" startup policy is incomplete`);
-    if (manifest.startup === "required" && (!manifest.defaultEnabled || manifest.canDisable)) throw new TypeError(`Plugin "${manifest.id}" required startup policy is inconsistent`);
     const unitIds = new Set<string>();
     for (const unit of manifest.units ?? []) {
       if (!unit || typeof unit.id !== "string" || unit.id.trim() === "" || unitIds.has(unit.id)) throw new TypeError(`Plugin "${manifest.id}" has a duplicate or empty unit id`);
@@ -254,11 +268,95 @@ export function validatePluginGraph(
   }
 }
 
-/** 查询依赖某 provider 的已启用插件。 */
+/**
+ * 查询依赖某 provider 的插件；传入运行集合时只返回当前在运行的依赖者。
+ *
+ * 这里没有任何“用户启用”语义：反向依赖是依赖图事实，运行集合只是生命周期快照。
+ */
 export function reverseDependentsOf(
   graph: PluginGraph,
   pluginId: string,
-  enabledPluginIds?: ReadonlySet<string>,
+  runningPluginIds?: ReadonlySet<string>,
 ): readonly PluginReverseDep[] {
-  return (graph.reverse[pluginId] ?? []).filter((item) => enabledPluginIds === undefined || enabledPluginIds.has(item.pluginId));
+  return (graph.reverse[pluginId] ?? []).filter((item) => runningPluginIds === undefined || runningPluginIds.has(item.pluginId));
+}
+
+/**
+ * 按声明依赖计算插件的启动层级。
+ *
+ * 层级 = 1 + 所有“已确定提供者”的依赖提供者的最大层级。必需依赖与**已绑定的可选依赖**
+ * 都参与排序：可选依赖的提供者已经出现在装配清单里时，消费者应当等它就绪，而不是先启动
+ * 再读到缺席状态。没有提供者的可选依赖不产生边，因此不形成等待。
+ *
+ * 同一层级内保持装配清单顺序，互不依赖的分支因此可以并行启动。返回结果用于“先提供
+ * 者、后消费者”的排序，不依赖 priority 或插件分类。
+ */
+export function startupLayers(graph: PluginGraph): readonly (readonly string[])[] {
+  const layers = new Map<string, number>();
+  const byId = new Set(graph.plugins);
+  const resolve = (pluginId: string, path: Set<string>): number => {
+    const cached = layers.get(pluginId);
+    if (cached !== undefined) return cached;
+    // 环在 validatePluginGraph 阶段已经被拒绝；这里仍然收敛，避免递归溢出。
+    if (path.has(pluginId)) return 0;
+    path.add(pluginId);
+    let depth = 0;
+    const ordered = [
+      ...(graph.dependencies[pluginId] ?? []),
+      ...(graph.optionalDependencies[pluginId] ?? []),
+    ];
+    for (const dependency of ordered) {
+      for (const providerId of graph.providers[capabilityKey(dependency)] ?? []) {
+        if (!byId.has(providerId) || providerId === pluginId) continue;
+        depth = Math.max(depth, resolve(providerId, path) + 1);
+      }
+    }
+    path.delete(pluginId);
+    layers.set(pluginId, depth);
+    return depth;
+  };
+  for (const pluginId of graph.plugins) resolve(pluginId, new Set());
+  const grouped = new Map<number, string[]>();
+  for (const pluginId of graph.plugins) {
+    const depth = layers.get(pluginId) ?? 0;
+    const bucket = grouped.get(depth);
+    if (bucket) bucket.push(pluginId);
+    else grouped.set(depth, [pluginId]);
+  }
+  return Object.freeze([...grouped.keys()].sort((a, b) => a - b).map((depth) => Object.freeze(grouped.get(depth) ?? [])));
+}
+
+/**
+ * 计算销毁层级：消费者先于提供者释放。
+ *
+ * 层级 = 该插件之下最长消费者链的长度；叶子消费者为 0，提供者依次更深。按层级升序执行
+ * 即可满足“消费者清理完成后才释放提供者”，同一层内的插件互不依赖，可以并行清理。
+ */
+export function teardownLayers(graph: PluginGraph, pluginIds: readonly string[]): readonly (readonly string[])[] {
+  const targets = new Set(pluginIds);
+  const depth = new Map<string, number>();
+  const resolve = (pluginId: string, path: Set<string>): number => {
+    const cached = depth.get(pluginId);
+    if (cached !== undefined) return cached;
+    if (path.has(pluginId)) return 0;
+    path.add(pluginId);
+    let value = 0;
+    // 用排序边（含已绑定可选依赖）：消费者必须先于它的可选提供者完成清理。
+    for (const dependent of graph.orderingReverse[pluginId] ?? []) {
+      if (!targets.has(dependent.pluginId)) continue;
+      value = Math.max(value, resolve(dependent.pluginId, path) + 1);
+    }
+    path.delete(pluginId);
+    depth.set(pluginId, value);
+    return value;
+  };
+  for (const pluginId of targets) resolve(pluginId, new Set());
+  const grouped = new Map<number, string[]>();
+  for (const pluginId of pluginIds) {
+    const level = depth.get(pluginId) ?? 0;
+    const bucket = grouped.get(level);
+    if (bucket) bucket.push(pluginId);
+    else grouped.set(level, [pluginId]);
+  }
+  return Object.freeze([...grouped.keys()].sort((a, b) => a - b).map((level) => Object.freeze(grouped.get(level) ?? [])));
 }

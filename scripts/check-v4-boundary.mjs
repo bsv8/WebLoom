@@ -26,6 +26,36 @@ const oldGenericCall = /\.call\s*<[^>]+>\s*\(/;
 const intentionalTypecheckFixtures = new Set([
   "src/contracts/capability.typecheck.ts",
 ]);
+// 插件服务模型迭代（PSM）删除的用户启停表面。这些 token 只能出现在历史文档和
+// 证明旧接口被拒绝的负面 fixture 里，正式源码与产物一律不允许残留。
+const removedEnableDisableSurface = [
+  /\bPluginIntent(?:Command|Snapshot|Controller|Coordinator|SubmissionResult|CommandResult)\b/,
+  /\bdesiredEnabled\b/,
+  /\bdesiredRevision\b/,
+  /\bdefaultEnabled\b/,
+  /\bcanDisable\b/,
+  /\bcreateInMemoryPluginConfigStore\b/,
+  /\bsubmitIntent\s*[:(]/,
+  /\b(?:host|ctx|context)\.(?:enable|disable|suspend)\s*\(/,
+  /\berror-disabled\b/,
+];
+// 负面 fixture 与回归测试需要引用被删除的符号，因此逐文件豁免，而不是整目录通配。
+const intentionalRemovedSurfaceFixtures = new Set([
+  "src/contracts/consumer.typecheck.ts",
+  "src/host/pluginLifecycle.test.ts",
+]);
+
+/** 去掉注释与字符串字面量后再判断“旧接口是否重新出现”。 */
+function stripCommentsAndLiterals(content) {
+  return content
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``");
+}
+// 依赖拓扑与运行条件是新模型的合法词汇，不能被上面的规则误伤。
+const allowedLifecycleVocabulary = /\brevoked:/;
 
 async function filesUnder(directory) {
   const entries = await (await import("node:fs/promises")).readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -47,11 +77,19 @@ for (const directory of sourceFiles) {
     if (!intentionalTypecheckFixtures.has(relativePath)
       && (stringCapability.test(content) || untypedStringCapability.test(content))) violations.push(`${relativePath} contains a string capability call`);
     if (oldGenericCall.test(content)) violations.push(`${relativePath} contains a manually supplied call generic`);
+    if (!intentionalRemovedSurfaceFixtures.has(relativePath)) {
+      // 注释与字符串里的“已删除”说明不算回归；真实代码路径里的符号才算。
+      const code = stripCommentsAndLiterals(content);
+      for (const pattern of removedEnableDisableSurface) {
+        if (pattern.test(code)) violations.push(`${relativePath} reintroduces the removed enable/disable surface matching ${pattern}`);
+      }
+    }
   }
 }
 
 const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-if (packageJson.version !== "0.5.0") violations.push(`package.json version is ${packageJson.version}, expected 0.5.0`);
+// 0.6.0 是插件服务模型迭代的破坏性版本；低于它说明旧启停 API 还在线上。
+if (packageJson.version !== "0.6.0") violations.push(`packageJson version is ${packageJson.version}, expected 0.6.0`);
 const exports = Object.keys(packageJson.exports ?? {});
 for (const entry of [".", "./advanced", "./react", "./testing"]) if (!exports.includes(entry)) violations.push(`package.json is missing export ${entry}`);
 for (const entry of exports) if (![".", "./advanced", "./react", "./testing"].includes(entry)) violations.push(`package.json exposes non-v4 entry ${entry}`);

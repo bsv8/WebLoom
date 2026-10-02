@@ -35,6 +35,9 @@ importers:
       typescript:
         specifier: 5.5.4
         version: 5.5.4
+      vite:
+        specifier: 7.3.6
+        version: 7.3.6
       vitest:
         specifier: 3.2.4
         version: 3.2.4(jsdom@25.0.1)

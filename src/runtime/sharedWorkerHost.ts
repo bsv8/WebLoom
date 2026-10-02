@@ -11,6 +11,8 @@ import { invokeCapabilityHandler } from "../host/capabilityRegistry.js";
 import { materializePluginDefinitions, type RuntimePluginDefinition } from "./pluginDefinitions.js";
 import { createCapabilityBridge } from "../transport/serviceBridge.js";
 import { createMessagePortRuntimeTransport } from "../transport/messagePortServiceTransport.js";
+import { authorizedPrivateInstance } from "./privateGrant.js";
+import { assertPrivateResultPublishable, guardPrivateStream, isAsyncIterable, type PrivateCallValidity } from "./privateCallValidity.js";
 import { createMessagePortServiceProvider } from "../transport/messagePortServiceProvider.js";
 import { cloneFrozenAttributes } from "../transport/dto.js";
 import { createRuntimeMessageCodec, RUNTIME_PROTOCOL_VERSION, RUNTIME_SNAPSHOT_TYPE } from "./runtimeProtocol.js";
@@ -85,6 +87,26 @@ export interface PeerLifecycleEvent {
 
 /** 可信 Host 查询到的 active peer 只读投影。 */
 export type ActivePeerSnapshot = Omit<PeerLifecycleEvent, "event" | "drain" | "handoffRevision"> & { readonly event: "active" };
+
+/** 合并两个取消信号；返回的对象带 abort() 与 dispose()。 */
+function mergeCallSignals(primary: AbortSignal, secondary: AbortSignal): { readonly signal: AbortSignal; readonly aborted: boolean; dispose(): void } {
+  const controller = new AbortController();
+  const abort = (reason: unknown): void => { if (!controller.signal.aborted) controller.abort(reason); };
+  if (primary.aborted) abort(primary.reason);
+  if (secondary.aborted) abort(secondary.reason);
+  const onPrimary = (): void => abort(primary.reason);
+  const onSecondary = (): void => abort(secondary.reason);
+  primary.addEventListener("abort", onPrimary, { once: true });
+  secondary.addEventListener("abort", onSecondary, { once: true });
+  return {
+    signal: controller.signal as AbortSignal,
+    get aborted() { return controller.signal.aborted; },
+    dispose() {
+      primary.removeEventListener("abort", onPrimary);
+      secondary.removeEventListener("abort", onSecondary);
+    },
+  };
+}
 
 export interface StartSharedWorkerAppOptions extends Omit<CreatePluginHostOptions, "runtime" | "runtimeUnitImplementationRegistry" | "runtimeId" | "runtimeInstanceId"> {
   /** Worker Runtime 逻辑标识。 */
@@ -426,14 +448,83 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
         const policy = exposurePolicies.get(key);
         if (!registration || !exposures.has(key)) throw new Error("Runtime service exposure is stale");
         const handlerReference = reference;
-        const context = { signal, deadlineAt, ...(call.operationId !== undefined ? { operationId: call.operationId } : {}), reference: handlerReference, binding: call.binding, origin: "remote" as const, peer: callPeer };
-        if (policy?.authorize && !(await policy.authorize(context, request))) throw new WebLoomError("permission_denied", "Peer capability authorization denied", "dispatch", { capabilityId: reference.capabilityId, serviceInstanceId: reference.serviceInstanceId });
-        if (exposures.get(key)?.serviceInstanceId !== handlerReference.serviceInstanceId) throw new WebLoomError("service_stale", "Runtime service exposure was replaced while authorization was pending", "dispatch", { serviceInstanceId: handlerReference.serviceInstanceId });
-        if (peerScope.state !== "active" || signal.aborted) throw new WebLoomError("service_revoked", "Peer scope was revoked", "dispose", { serviceInstanceId: reference.serviceInstanceId });
-        if (policy?.scope && policy.scope.state !== "active") throw new WebLoomError("service_revoked", "Peer capability authorization scope is revoked", "dispose", { serviceInstanceId: reference.serviceInstanceId });
-        const handler = registration.handler as ((value: unknown, context: import("../contracts/capability.js").HandlerCallContext) => unknown | Promise<unknown>) | undefined;
-        if (!handler) throw new WebLoomError("service_stale", "Runtime service handler is unavailable", "dispatch");
-        return handler(request, context);
+        // 私有入口的授权在执行 handler 之前完成（PSM-R13）：客户端过滤不够，
+        // 接收端必须核对装配层签发的票据；缺失或不匹配一律拒绝，handler 不执行。
+        // 私有授权：只认「装配机密 + 仍然存活的授权实例」这一条条对应记录。
+        // 对端没有发布任何可授权实例（例如空快照）时一律拒绝，不降级成只校验连接。
+        const isPrivate = registration.reference.attributes?.private === true;
+        const privateCheck = (): string | undefined => authorizedPrivateInstance({
+          private: isPrivate,
+          candidates: host?.privateGrantCandidates?.(
+            { kind: reference.kind, id: reference.capabilityId, version: reference.contractVersion },
+            bridge.remoteUnits?.() ?? [],
+          ) ?? [],
+          grantId: call.grantId,
+          connectionId: call.binding?.connectionId,
+        });
+        const privateIdentity = privateCheck();
+        if (privateIdentity === undefined) {
+          throw new WebLoomError("permission_denied", "Private capability call is not authorized for this consumer", "dispatch", {
+            capabilityId: reference.capabilityId,
+            serviceInstanceId: reference.serviceInstanceId,
+          });
+        }
+        // 私有调用的授权有效期：在途工作绑定"消费实例仍然活着"这一事实。授权等待期间
+        // 实例被撤销（对端快照里消失）时立即中止，等待结束后也复核同一实例，绝不放行
+        // 一个已经失效的旧请求（PSM-R13）。
+        const validity = new AbortController();
+        let validityUnsubscribe: (() => void) | undefined;
+        if (isPrivate && typeof bridge.subscribe === "function") {
+          validityUnsubscribe = bridge.subscribe(() => {
+            if (privateCheck() !== privateIdentity) validity.abort(new WebLoomError("permission_denied", "Private capability consumer instance was revoked", "dispatch", {
+              capabilityId: reference.capabilityId,
+              serviceInstanceId: reference.serviceInstanceId,
+            }));
+          });
+        }
+        const mergedSignal = mergeCallSignals(signal, validity.signal);
+        const validityInput = {
+          validity: {
+            get aborted() { return validity.signal.aborted; },
+            get reason() { return validity.signal.reason; },
+            release() { validityUnsubscribe?.(); mergedSignal.dispose(); },
+          } satisfies PrivateCallValidity,
+          recheck: privateCheck,
+          identity: privateIdentity,
+        };
+        let isAsyncIterableStreamResult = false;
+        const context = { signal: mergedSignal.signal, deadlineAt, ...(call.operationId !== undefined ? { operationId: call.operationId } : {}), reference: handlerReference, binding: call.binding, origin: "remote" as const, peer: callPeer };
+        try {
+          if (policy?.authorize && !(await policy.authorize(context, request))) {
+            throw new WebLoomError("permission_denied", "Peer capability authorization denied", "dispatch", { capabilityId: reference.capabilityId, serviceInstanceId: reference.serviceInstanceId });
+          }
+          if (isPrivate) {
+            if (validity.signal.aborted) throw validity.signal.reason as Error;
+            if (privateCheck() !== privateIdentity) {
+              throw new WebLoomError("permission_denied", "Private capability consumer instance was revoked while authorization was pending", "dispatch", {
+                capabilityId: reference.capabilityId,
+                serviceInstanceId: reference.serviceInstanceId,
+              });
+            }
+          }
+          if (exposures.get(key)?.serviceInstanceId !== handlerReference.serviceInstanceId) throw new WebLoomError("service_stale", "Runtime service exposure was replaced while authorization was pending", "dispatch", { serviceInstanceId: handlerReference.serviceInstanceId });
+          if (peerScope.state !== "active" || signal.aborted || mergedSignal.aborted) throw new WebLoomError("service_revoked", "Peer scope was revoked", "dispose", { serviceInstanceId: reference.serviceInstanceId });
+          if (policy?.scope && policy.scope.state !== "active") throw new WebLoomError("service_revoked", "Peer capability authorization scope is revoked", "dispose", { serviceInstanceId: reference.serviceInstanceId });
+          const handler = registration.handler as ((value: unknown, context: import("../contracts/capability.js").HandlerCallContext) => unknown | Promise<unknown>) | undefined;
+          if (!handler) throw new WebLoomError("service_stale", "Runtime service handler is unavailable", "dispatch");
+          const produced = await handler(request, context);
+          // stream：授权绑定持续到流结束或取消，后续 item 同样受拦截。
+          if (isPrivate && isAsyncIterable(produced)) {
+            isAsyncIterableStreamResult = true;
+            return guardPrivateStream(produced, validityInput);
+          }
+          // RPC：发布结果前再复核一次，撤销后的迟到结果不会被发出。
+          if (isPrivate) assertPrivateResultPublishable(validityInput.validity, privateCheck, privateIdentity);
+          return produced;
+        } finally {
+          // stream 的释放交给 guardPrivateStream（流结束/取消时才清理）。
+          if (!isPrivate || !isAsyncIterableStreamResult) validityInput.validity.release();
+        }
       },
       prepareResult: (value, call) => {
         const registration = host?.capabilities.registration({ kind: "rpc", id: call.capabilityId, version: call.contractVersion });

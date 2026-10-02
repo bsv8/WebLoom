@@ -352,7 +352,7 @@ function validateSnapshot(value: Record<string, unknown>, limits: ReturnType<typ
   if (value.state !== "ready" && value.services.length !== 0) return false;
   const unitKeys = new Set<string>();
   for (const unit of value.units) {
-    if (!record(unit) || !boundedText(unit.pluginId, MAX_ID_LENGTH) || !boundedText(unit.unitId, MAX_ID_LENGTH) || unit.runtime !== value.runtimeKind || !["registered", "starting", "stopping", "enabled", "disabled", "blocked", "error-disabled", "cleanup-pending", "unknown"].includes(String(unit.state))) return false;
+    if (!record(unit) || !boundedText(unit.pluginId, MAX_ID_LENGTH) || !boundedText(unit.unitId, MAX_ID_LENGTH) || unit.runtime !== value.runtimeKind || !["registered", "starting", "stopping", "enabled", "blocked", "failed", "cleanup-pending", "unknown"].includes(String(unit.state))) return false;
     if (unit.instanceId !== undefined && !boundedText(unit.instanceId, MAX_ID_LENGTH)) return false;
     const key = `${unit.pluginId}\u0000${unit.unitId}`;
     if (unitKeys.has(key)) return false;

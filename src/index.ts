@@ -5,6 +5,7 @@ export * from "./contracts/plugin.js";
 export * from "./contracts/lifecycle.js";
 export * from "./contracts/messageBus.js";
 export * from "./contracts/resource.js";
+export type { PluginConsumer, PluginConsumerStatus, AvailableConsumerCapability } from "./contracts/consumer.js";
 
 export { defineCapability } from "./contracts/capability.js";
 export { definePlugin } from "./authoring/definePlugin.js";

@@ -55,7 +55,6 @@ function updateTerminalReady(
 const pagePlugin = definePlugin({
   id: "browser-window-page",
   provides: [PageRpc] as const,
-  startup: "required" as const,
   setup(ctx) {
     ctx.handle(PageRpc, (request) => ({ result: `page:${request.value}` }));
   },

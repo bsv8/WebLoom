@@ -1,6 +1,6 @@
 # WebLoom
 
-WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.5.0 管理真实的
+WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.6.0 管理真实的
 `window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、依赖图、
 ResourceScope、权限租约、typed capability、服务桥和资源缓存；路由、存储、日志、
 国际化等产品能力由插件或下游应用注入。
@@ -19,6 +19,62 @@ WebLoom 是 ESM 单包，提供四个入口：
 - `webloom-framework/testing`：无产品语义的假 Host、假传输和测试辅助。
 
 React 是可选 peer dependency。只使用 `webloom-framework` 时不需要安装 React。
+
+## 插件服务模型：三个访问面
+
+| 接口面 | 使用者 | 边界 |
+| --- | --- | --- |
+| 对内公开 API | 其他插件 | 发布 typed capability，消费方声明依赖 |
+| Connect 公开 API | 外部 App，经网关调用 | 产品显式发布名单并绑定 App 会话 |
+| 私有 API | 插件自己的实现与自己的 UI | 不登记为公共 capability，只经私有 Context/闭包访问 |
+
+装配清单里的插件**全部参与系统**：没有 `startup`/`defaultEnabled`/`canDisable`，也没有
+`enable`/`disable`/`submitIntent`。启动顺序由依赖图决定（A 依赖 B、B 依赖 C ⇒ C → B → A
+启动、A → B → C 计划销毁），共享提供者不会因一个消费者被释放而销毁，初始化失败进入可
+诊断状态而不是让整个 Runtime 失败。可信装配层用 `host.revoke(pluginId, reason)` 释放实例
+（留下 `revoked:<reason>` 运行条件），条件解除后 `host.retry(pluginId)` 重建。
+
+插件把页面、菜单或 widget 交给应用挂载之后，组件按 `ctx.consumer`（Host 为该运行实例
+签发的受限视图）读取**对内公开**能力，而不是按 App 或 Host 全局查询；**私有**实现留在
+插件自己的 Context 或闭包里：
+
+```tsx
+import { PluginConsumerProvider, usePluginCapability } from "webloom-framework/react";
+
+const contactsPage = definePlugin({
+  id: "contacts-page",
+  dependencies: [{ capability: Contacts }] as const,
+  setup(ctx) {
+    // 下游自己保存注册项与 consumer 的对应关系，schema 由你定义。
+    routes.set("/contacts", { consumer: ctx.consumer });
+  },
+});
+
+function ContactsPage() {
+  const contacts = usePluginCapability(Contacts);
+  return <ul>{contacts.list().map((name) => <li key={name}>{name}</li>)}</ul>;
+}
+
+<PluginConsumerProvider consumer={entry.consumer}><ContactsPage /></PluginConsumerProvider>;
+```
+
+可解析集合等于该实例声明的 `provides + dependencies`；未声明与错版本在编译期和运行时
+都被拒绝。视图不提供 `provide/handle/enable/dispose`、Host、App 和根 Scope。实例撤权后
+Provider 立即停止渲染旧子树，同名重启签发新实例与新 consumer；保留的远程 client/stream
+同样失效。local capability 返回的普通对象属于既有引用，不在本边界内撤销。
+
+网页插件向其他插件提供 typed UI 注册服务（页面/设置块/指示灯的 schema 由产品定义）。
+贡献插件用 `/advanced` 的 `createScopedRegistryView(ctx.capability(REG), ctx.scope, ...)`
+登记条目：归属由框架按实例身份写入，不需要自填 owner；跨实例注销被拒绝；实例释放时条目
+同步撤下。
+
+内置 `RESOURCE_REGISTRY` 也要显式声明，并且拿到的注册表绑定当前实例：资源 owner 由 Host
+写入，跨实例注销与 owner 伪造被拒绝；`get()`/`_ids()` 只返回本实例的定义，其他插件的私有
+loader 不会泄露；资源上下文用 typed `capability(C)` 而不是字符串 `getCapability(id)`。
+完整接入步骤与保证范围见
+[`docs/plugin-consumer-migration.md`](docs/plugin-consumer-migration.md)；本轮删除的用户启停
+API 与行为变化见
+[`docs/plugin-service-migration.md`](docs/plugin-service-migration.md)。
 
 ## 最小 Window Runtime
 
@@ -144,9 +200,11 @@ capability 时使用 `runtime.capability(C)`；需要分阶段把远程依赖装
 | `contractVersion` | capability 的精确业务契约版本。 |
 | `permission` | 字符串形式的权限动作；具体集合由宿主批准。 |
 | `attributes` | 宿主绑定的只读扩展元数据，不包含私密材料。 |
-| `desiredEnabled` | 用户或控制面希望产品启用的持久意图。 |
-| `state` | 当前 Runtime/运行实例的实际状态，不等于启用意图。 |
+| `state` | 当前 Runtime/运行实例的实际状态；只由依赖图与运行条件决定。 |
 | `blockedBy` | 实例无法启动时缺失的依赖或 Scope 原因。 |
+| `instanceId`（consumer） | Host 为该次运行签发的消费视图身份；重建实例必然变化。 |
+| `blockedBy` | 运行单元无法运行的原因：缺失依赖、运行条件或被显式释放。 |
+| `consumer` | setup 阶段签发的实例受限消费视图：只能读取本实例已声明的能力。 |
 
 ## 开发与验收
 
@@ -167,4 +225,6 @@ advanced、React 和 Worker 消费者的 `tsc --noEmit` 与运行时 smoke，并
 体积、`.d.ts` 和 `.js.map` 的本地路径及产品字段。版本、发布身份与许可证确认属于
 发布责任人的操作，本仓库不自动执行发布。
 
-详细 API 约束见 [`docs/api.md`](docs/api.md)。
+详细 API 约束见 [`docs/api.md`](docs/api.md)；插件 UI 接入见
+[`docs/plugin-consumer-migration.md`](docs/plugin-consumer-migration.md)，服务模型与启停迁移见
+[`docs/plugin-service-migration.md`](docs/plugin-service-migration.md)。

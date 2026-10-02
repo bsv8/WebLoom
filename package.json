@@ -1,6 +1,6 @@
 {
   "name": "webloom-framework",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "通用前端插件生命周期框架",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -75,6 +75,7 @@
     "react-dom": "18.3.1",
     "tsup": "8.5.1",
     "typescript": "5.5.4",
+    "vite": "7.3.6",
     "vitest": "3.2.4"
   }
 }

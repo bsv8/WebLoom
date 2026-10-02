@@ -315,6 +315,8 @@ function snapshotStreamOptions(options: StreamSubscribeOptions<unknown>): Stream
     signal: options.signal,
     timeoutMs: options.timeoutMs,
     operationId: options.operationId,
+    // 调用方授权票据必须原样带上线（PSM-R13）：漏掉它会让合法私有订阅被拒。
+    grantId: options.grantId,
     onNext: options.onNext,
     initialCredit: options.initialCredit,
     initialByteCredit: options.initialByteCredit,
@@ -361,6 +363,8 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
   let pendingCount = 0;
   let peerRetainedPayloadBytes = 0;
   let currentState: CapabilityBridge["state"] = "empty";
+  /** 对端最近一次已应用快照的单元实例（私有授权核对消费实例用）。 */
+  let currentRemoteUnits: readonly { readonly pluginId: string; readonly unitId: string; readonly runtime: string; readonly instanceId?: string; readonly state: string }[] = Object.freeze([]);
   let terminalFailure: WebLoomError | undefined;
   let remoteRuntimeId: string | undefined;
   let remoteRuntimeKind: RuntimeKind | undefined;
@@ -729,7 +733,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       }, timeout);
       if (merged.signal.aborted) { onAbort(); return; }
       try {
-        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared);
+        sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "unary", timeoutMs: timeout, request: prepared.value, ...(callOptions.grantId ?? reference.grantId) !== undefined ? { grantId: callOptions.grantId ?? reference.grantId } : {}, ...(callOptions.operationId !== undefined ? { operationId: callOptions.operationId } : {}) }, prepared);
       } catch {
         settleUnary(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)));
       }
@@ -882,7 +886,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
       // always sent so the provider starts from the same requested value.
       // An auto-sized request may still be narrowed by the provider's current
       // retained-byte state; streamReady returns that accepted value.
-      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, initialByteCredit: byteWindow, ...(optionsForSubscribe.initialByteCredit === undefined ? { initialByteCreditAuto: true as const } : {}), ...(reference.grantId !== undefined ? { grantId: reference.grantId } : {}), ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared);
+      sendWire({ type: RUNTIME_CALL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: localBinding, callId, capabilityId: entry.capability.id, contractVersion: entry.capability.version, serviceInstanceId: reference.serviceInstanceId, mode: "stream", timeoutMs: timeout, request: prepared.value, initialCredit: window, initialByteCredit: byteWindow, ...(optionsForSubscribe.initialByteCredit === undefined ? { initialByteCreditAuto: true as const } : {}), ...(optionsForSubscribe.grantId ?? reference.grantId) !== undefined ? { grantId: optionsForSubscribe.grantId ?? reference.grantId } : {}, ...(optionsForSubscribe.operationId !== undefined ? { operationId: optionsForSubscribe.operationId } : {}) }, prepared);
     } catch {
       terminateStream(entry, frameworkError("request_clone_failed", "dispatch", contextFor(entry.capability, reference)), false);
     }
@@ -1478,6 +1482,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     revision = snapshot.revision;
     appliedSnapshotFingerprint = fingerprint;
     currentServices = Object.freeze(services);
+    currentRemoteUnits = Object.freeze(snapshot.units.map((unit) => Object.freeze({ ...unit })));
     currentState = snapshot.state === "ready" ? "ready" : snapshot.state === "starting" ? "empty" : snapshot.state === "disposed" ? "disposed" : "stale";
     if (currentState !== "ready" && snapshot.state !== "starting") for (const proxy of proxies.values()) revokeProxy(proxy, `Remote Runtime is ${snapshot.state}`);
     emit();
@@ -1490,6 +1495,7 @@ export function createCapabilityBridge(options: CreateCapabilityBridgeOptions): 
     get runtimeKind() { return remoteRuntimeKind; },
     get binding() { return localBinding; },
     get endpointState() { return session.state; },
+    remoteUnits() { return currentRemoteUnits; },
     getClient<C extends RemoteCapability>(capability: C, scope?: LifecycleScope): CapabilityClient<C> {
       const key = `${capability.kind}\u0000${capability.id}\u0000${capability.version}\u0000${scope?.identity.scopeId ?? "root"}`;
       let proxy = proxies.get(key);

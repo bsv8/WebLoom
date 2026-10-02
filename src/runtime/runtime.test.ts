@@ -129,7 +129,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "echo-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) {
         setupCount += 1;
         ctx.handle(Echo, (request) => ({ result: `${request.value}:${ctx.instanceId}` }));
@@ -162,7 +161,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "shared-budget-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) {
         ctx.handle(Echo, async (request) => {
           await gate;
@@ -194,7 +192,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "lifecycle-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) { ctx.handle(Echo, (request) => { handlerCalls += 1; return { result: request.value }; }); },
     });
     const worker = createWorker(workerPlugin, [Echo], {
@@ -248,7 +245,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "window-close-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) { ctx.handle(Echo, (request) => ({ result: `worker:${request.value}` })); },
     });
     const worker = createWorker(workerPlugin);
@@ -277,7 +273,6 @@ describe("v4 Runtime", () => {
       plugins: [definePlugin({
         id: "page-io",
         provides: [LocalIo] as const,
-        startup: "required" as const,
         setup(ctx) { ctx.handle(LocalIo, (request) => ({ result: `page:${request.value}` })); },
       })],
     });
@@ -285,7 +280,6 @@ describe("v4 Runtime", () => {
       id: "session-provider",
       provides: [Echo] as const,
       dependencies: [{ capability: LocalIo, source: "peer" }] as const,
-      startup: "required" as const,
       setup(ctx) {
         ctx.handle(Echo, async (request, call) => {
           const peer = call.peer;
@@ -310,7 +304,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "top-level-provider",
       provides: [Echo, Other] as const,
-      startup: "required" as const,
       setup(ctx) {
         ctx.handle(Echo, (request) => ({ result: `top:${request.value}` }));
         ctx.handle(Other, (request) => ({ result: `other:${request.value}` }));
@@ -335,7 +328,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "dynamic-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) { ctx.handle(Echo, (request) => ({ result: request.value })); },
     });
     const worker = createWorker(workerPlugin, [], {
@@ -357,7 +349,6 @@ describe("v4 Runtime", () => {
     const workerPlugin = definePlugin({
       id: "closed-dynamic-provider",
       provides: [Echo] as const,
-      startup: "required" as const,
       setup(ctx) { ctx.handle(Echo, (request) => ({ result: request.value })); },
     });
     const worker = createWorker(workerPlugin, [], {

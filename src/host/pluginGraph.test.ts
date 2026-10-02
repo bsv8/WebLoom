@@ -14,7 +14,7 @@ const result = { parse(value: unknown): { result: string } {
 const Echo = defineCapability({ kind: "rpc", id: "graph.echo", version: "1", request: parser, response: result });
 
 function manifest(id: string, unit: NonNullable<PluginManifest["units"]>[number]): PluginManifest {
-  return { id, name: id, startup: "optional", defaultEnabled: true, canDisable: true, units: [unit] };
+  return { id, name: id, units: [unit] };
 }
 
 describe("v4 plugin graph", () => {
@@ -51,9 +51,6 @@ describe("v4 plugin graph", () => {
     const multi = {
       id: "multi",
       name: "multi",
-      startup: "optional" as const,
-      defaultEnabled: true,
-      canDisable: true,
       units: [
         { id: "a", runtime: "window-main" as const },
         { id: "b", runtime: "window-main" as const },

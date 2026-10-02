@@ -3,7 +3,7 @@
 import type { Capability, CapabilityClient } from "../contracts/capability.js";
 import { RUNTIME_PROTOCOL_VERSION } from "./runtimeProtocol.js";
 import type { PluginManifest } from "../contracts/plugin.js";
-import { createPluginHost, StartupPluginError, type CreatePluginHostOptions, type HostInspection, type PluginHost } from "../host/createPluginHost.js";
+import { createPluginHost, type CreatePluginHostOptions, type HostInspection, type PluginHost } from "../host/createPluginHost.js";
 import { createRuntimeUnitImplementationRegistry } from "../host/runtimeUnitImplementationRegistry.js";
 import type { LifecycleDisposeResult, RuntimeSnapshot } from "../contracts/lifecycle.js";
 import type { RuntimePluginDefinition } from "./pluginDefinitions.js";
@@ -94,10 +94,11 @@ export async function createWindowApp(options: CreateWindowAppOptions): Promise<
   const { id: _id, plugins: _plugins, ...hostOptions } = options;
   const host = createPluginHost({ ...hostOptions, runtime: "window-main", runtimeId: id, runtimeInstanceId: instanceId, runtimeUnitImplementationRegistry: implementations });
   try {
+    // 插件启动失败不会让 Runtime 失败：失败/等待依赖的插件进入可诊断状态，服务可用性
+    // 与实例生命周期分开表达。只有装配本身不合法才拒绝创建 Runtime。
     await host.registerAll(materialized.map((item) => item.manifest));
   } catch (error) {
     await host.dispose("window Runtime initialization failed").catch(() => undefined);
-    if (error instanceof StartupPluginError) throw new RuntimeInitializationError({ pluginId: error.details.pluginId, unitId: error.details.unitId, phase: "startup", error: error.details.error ?? error.message });
     throw new RuntimeInitializationError({ phase: "startup", error: message(error) });
   }
   return createAppFromHost(id, instanceId, host);

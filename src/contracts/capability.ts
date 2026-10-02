@@ -135,6 +135,13 @@ export interface RpcCallOptions {
   readonly timeoutMs?: number;
   /** 产品审计/幂等标识；框架不自动去重或重放。 */
   readonly operationId?: string;
+  /**
+   * 调用方持有的领域授权标识（PSM-R13）。
+   *
+   * 私有入口用它承载装配层签发的授权票据：接收端在执行 handler 之前核对，
+   * 缺失或不匹配直接拒绝。票据不进服务目录，因此普通 RuntimeHandle 拿不到。
+   */
+  readonly grantId?: string;
 }
 
 /** typed unary 客户端。 */
@@ -291,6 +298,13 @@ export interface CapabilityBridge {
   drain(timeoutMs?: number): Promise<RuntimeDrainResult>;
   /** 订阅目录/连接状态变化。 */
   subscribe(listener: () => void): () => void;
+  /**
+   * 对端最近一次已应用快照中的运行单元实例（只读投影）。
+   *
+   * 私有授权要核对"消费实例是否仍然活着"：实例撤销后它会从对端快照消失，接收端据此
+   * 让旧票据立即失效，而不需要新增协议字段。
+   */
+  remoteUnits?(): readonly { readonly pluginId: string; readonly unitId: string; readonly runtime: string; readonly instanceId?: string; readonly state: string }[];
   /** 当前已发布的完整服务引用。 */
   services(): readonly ServiceReference[];
 }

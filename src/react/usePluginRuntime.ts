@@ -1,11 +1,17 @@
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { CapabilityDescriptor } from "../contracts/capability.js";
 import type { PluginGraph, PluginManifest, PluginReverseDep, PluginState } from "../contracts/plugin.js";
-import type { PluginIntentSubmissionResult } from "../contracts/lifecycle.js";
 import { hostForWindowApp } from "../runtime/windowRuntime.js";
 import type { WindowApp } from "../runtime/runtimeTypes.js";
 import { useWebLoomApp } from "./PluginHostProvider.js";
 
+/**
+ * 装配层插件运行时视图。
+ *
+ * 这里只有读取、诊断与生命周期事件，没有用户启停：被装配的插件全部参与系统，是否
+ * 运行由依赖图与运行条件决定。需要“释放某实例”时由可信装配层调用 Host 的
+ * `revoke()`，React 侧不再提供启停入口。
+ */
 export interface UsePluginRuntime {
   /** 读取插件状态。 */
   state(id: string): PluginState;
@@ -13,13 +19,7 @@ export interface UsePluginRuntime {
   graph(): PluginGraph;
   /** 读取反向依赖。 */
   reverseDeps(id: string): readonly PluginReverseDep[];
-  /** 启动插件。 */
-  enable(id: string): Promise<void>;
-  /** 停止插件。 */
-  disable(id: string): Promise<{ ok: true } | { ok: false; reason: string }>;
-  /** 提交启停意图。 */
-  submitIntent(id: string, desiredEnabled: boolean): Promise<PluginIntentSubmissionResult>;
-  /** 删除插件。 */
+  /** 删除插件（装配层操作）。 */
   unregister(id: string): Promise<void>;
   /** Host/App 修订。 */
   version(): number;
@@ -27,8 +27,8 @@ export interface UsePluginRuntime {
   manifests(): string[];
   /** 插件 id。 */
   installed(): string[];
-  /** 当前是否运行。 */
-  isEnabled(id: string): boolean;
+  /** 当前是否在运行。 */
+  isRunning(id: string): boolean;
   /** 清单。 */
   getManifest(id: string): PluginManifest | undefined;
   /** typed descriptor 当前是否已暴露。 */
@@ -39,7 +39,7 @@ function hostFor(app: WindowApp) {
   return hostForWindowApp(app);
 }
 
-/** 领域插件管理 hook；只能在 WindowApp 上使用。 */
+/** 插件运行时诊断 hook；只能在 WindowApp（可信装配层）上使用。 */
 export function usePluginRuntime(): UsePluginRuntime {
   const app = useWebLoomApp();
   const subscribe = useCallback((listener: () => void) => app.subscribe(listener), [app]);
@@ -52,14 +52,11 @@ export function usePluginRuntime(): UsePluginRuntime {
       state: (id: string) => host.state(id),
       graph: () => host.graph(),
       reverseDeps: (id: string) => host.reverseDeps(id),
-      enable: (id: string) => host.enable(id),
-      disable: (id: string) => host.disable(id),
-      submitIntent: (id: string, desiredEnabled: boolean) => host.submitIntent(id, desiredEnabled),
       unregister: (id: string) => host.unregister(id),
       version: () => snapshot.revision,
       manifests: () => host.manifests(),
       installed: () => host.installed(),
-      isEnabled: (id: string) => host.state(id).kind === "enabled",
+      isRunning: (id: string) => host.state(id).kind === "enabled",
       getManifest: (id: string) => host.getManifest(id),
       hasCapability: (capability: CapabilityDescriptor) => host.capabilities.has(capability),
     } satisfies UsePluginRuntime;

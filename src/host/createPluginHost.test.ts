@@ -22,7 +22,6 @@ describe("v4 PluginHost", () => {
     const provider = definePlugin({
       id: "provider",
       provides: [LocalValue, Echo] as const,
-      startup: "required" as const,
       setup(ctx) {
         ctx.provide(LocalValue, { count: 7 });
         ctx.handle(Echo, async (request, call) => {
@@ -47,7 +46,7 @@ describe("v4 PluginHost", () => {
     await host.dispose();
   });
 
-  it("rejects undeclared capability registration and required policy contradictions", async () => {
+  it("拒绝未声明的 capability 注册，并把失败原因留在状态与诊断里", async () => {
     const Other = defineCapability<{ value: number }>({ kind: "local", id: "test.other", version: "1" });
     const bad = definePlugin({
       id: "bad-provider",
@@ -65,24 +64,24 @@ describe("v4 PluginHost", () => {
     }]);
     const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
     await host.registerAll([bad.manifest]);
-    expect(host.state("bad-provider").kind).toBe("error-disabled");
+    // 装配不再整体失败：插件进入 failed 并保留脱敏原因，服务目录不含未注册能力。
+    expect(host.state("bad-provider").kind).toBe("failed");
+    expect(host.state("bad-provider").lifecycleState).toBe("failed");
+    expect(host.explain("bad-provider").reasons.length).toBeGreaterThan(0);
     expect(host.serviceReferences()).toEqual([]);
     await host.dispose();
-
-    expect(() => definePlugin({
-      id: "invalid-required",
-      startup: "required",
-      defaultEnabled: false,
-      setup() {},
-    })).toThrow(/required startup policy/);
   });
 
-  it("keeps required missing dependencies visible", async () => {
+  it("没有启停策略字段：manifest 只保留身份、依赖与运行单元", () => {
+    const plugin = definePlugin({ id: "policy-free", setup() {} });
+    expect(Object.keys(plugin.manifest).sort()).toEqual(["id", "name", "units"]);
+  });
+
+  it("必需依赖缺失时保持 blocked 并给出可诊断原因", async () => {
     const Missing = defineCapability({ kind: "rpc", id: "test.missing", version: "1", request: requestParser, response: responseParser });
     const required = definePlugin({
       id: "required-consumer",
       dependencies: [{ capability: Missing, sourceRuntime: "window-main" }] as const,
-      startup: "required" as const,
       setup() {},
     });
     const implementations = createRuntimeUnitImplementationRegistry([{
@@ -92,12 +91,14 @@ describe("v4 PluginHost", () => {
       capabilities: required.capabilities,
     }]);
     const host = createPluginHost({ runtimeUnitImplementationRegistry: implementations });
-    await expect(host.registerAll([required.manifest])).rejects.toThrow();
-    expect(host.state("required-consumer").kind).toBe("blocked");
+    await host.registerAll([required.manifest]);
+    expect(host.state("required-consumer")).toMatchObject({ kind: "blocked", lifecycleState: "waiting" });
+    expect(host.state("required-consumer").blockedBy).toEqual(["missing:rpc:test.missing@1"]);
+    expect(host.explain("required-consumer").reasons).toEqual(["missing:rpc:test.missing@1"]);
     await host.dispose();
   });
 
-  it("turns enable into a durable desired-enabled transition after disable", async () => {
+  it("释放实例后不自动重建，retry 后得到全新实例", async () => {
     const plugin = definePlugin({
       id: "reversible",
       provides: [LocalValue] as const,
@@ -115,11 +116,17 @@ describe("v4 PluginHost", () => {
     await host.registerAll([plugin.manifest]);
     const firstInstance = host.state("reversible").instanceId;
 
-    await host.disable("reversible");
-    expect(host.state("reversible")).toMatchObject({ kind: "disabled", desiredEnabled: false });
+    // 可信装配层的生命周期事件：释放实例并记录运行条件，不写入任何用户意图。
+    await host.revoke("reversible", "domain condition");
+    expect(host.state("reversible")).toMatchObject({ kind: "blocked", lifecycleState: "waiting" });
+    expect(host.state("reversible").blockedBy).toEqual(["revoked:domain condition"]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // 运行条件未解除前不自动重建。
+    expect(host.state("reversible").kind).toBe("blocked");
 
-    await host.enable("reversible");
-    expect(host.state("reversible")).toMatchObject({ kind: "enabled", desiredEnabled: true });
+    await host.retry("reversible");
+    expect(host.state("reversible")).toMatchObject({ kind: "enabled", lifecycleState: "running" });
+    expect(host.state("reversible").blockedBy).toBeUndefined();
     expect(host.state("reversible").instanceId).not.toBe(firstInstance);
     expect(host.capability(LocalValue)).toEqual({ count: 11 });
     await host.dispose();

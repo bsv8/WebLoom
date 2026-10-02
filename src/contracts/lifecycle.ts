@@ -466,44 +466,6 @@ export class UpgradeGateRejectedError extends Error {
   }
 }
 
-/** 插件启停绝对意图命令。 */
-export interface PluginIntentCommand {
-  readonly commandId: string;
-  readonly authorityInstanceId: string;
-  readonly expectedRevision: number;
-  readonly pluginId: string;
-  readonly desiredEnabled: boolean;
-}
-/** 插件启停意图快照。 */
-export interface PluginIntentSnapshot {
-  readonly revision: number;
-  readonly desiredEnabled: Readonly<Record<string, boolean>>;
-  readonly desiredRevision: Readonly<Record<string, number>>;
-}
-/** 意图持久化结果。 */
-export type PluginIntentCommandResult =
-  | { status: "accepted" | "duplicate"; commandId: string; snapshot: PluginIntentSnapshot; persisted: true }
-  | { status: "stale-authority"; commandId: string; expectedAuthorityInstanceId: string }
-  | { status: "command-conflict"; commandId: string; message: string }
-  | { status: "revision-conflict"; commandId: string; snapshot: PluginIntentSnapshot }
-  | { status: "persistence-failed"; commandId: string; message: string; snapshot: PluginIntentSnapshot };
-/** Host 提交意图的完整结果。 */
-export type PluginIntentSubmissionResult = PluginIntentCommandResult | { status: "transport-error"; message: string; retryable: boolean };
-/** 单一启停控制面。 */
-export interface PluginIntentController {
-  readonly authorityInstanceId: string;
-  snapshot(): PluginIntentSnapshot;
-  submit(command: PluginIntentCommand): Promise<PluginIntentCommandResult>;
-  subscribe(listener: (snapshot: PluginIntentSnapshot) => void): () => void;
-}
-/** Host 接入的启停控制面。 */
-export interface PluginIntentCoordinator {
-  readonly authorityInstanceId: string;
-  snapshot(): PluginIntentSnapshot;
-  submit(command: PluginIntentCommand): Promise<PluginIntentSubmissionResult>;
-  subscribe(listener: (snapshot: PluginIntentSnapshot) => void): () => void;
-}
-
 /** scoped 后台任务定义。 */
 export interface ScopedTaskDefinition {
   readonly id: string;

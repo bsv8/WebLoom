@@ -3,7 +3,6 @@
 export * from "./host/createPluginHost.js";
 export * from "./host/runtimeUnitImplementationRegistry.js";
 export * from "./lifecycle/resourceScope.js";
-export * from "./lifecycle/pluginIntentController.js";
 export * from "./messaging/messageBus.js";
 export * from "./host/capabilityRegistry.js";
 export * from "./transport/serviceBridge.js";

@@ -16,7 +16,12 @@ import type {
 } from "../contracts/plugin.js";
 import type { PluginPermission, RuntimeKind } from "../contracts/lifecycle.js";
 
-/** 普通插件定义选项；插件声明只使用 typed capability 与单一启动策略。 */
+/**
+ * 普通插件定义选项。
+ *
+ * 没有 startup/defaultEnabled/canDisable：被装配的插件全部参与系统，生命周期由
+ * 已声明依赖的图决定，不存在用户启停意图。
+ */
 export interface DefinePluginOptions<
   TProvides extends readonly Capability[] = readonly Capability[],
   TDependencies extends readonly CapabilityDependency[] = readonly CapabilityDependency[],
@@ -30,8 +35,15 @@ export interface DefinePluginOptions<
   readonly name?: string;
   /** 诊断描述。 */
   readonly description?: string;
-  /** 本插件声明提供的能力。 */
+  /** 本插件声明提供的公共能力。 */
   readonly provides?: TProvides;
+  /**
+   * 本单元实现的私有能力（PSM-R13）。
+   *
+   * 私有入口用 `ctx.handlePrivate()` 注册、用 `ctx.privateCapability()` 解析；它不进入
+   * 公共 provides、服务目录与 Connect 名单。
+   */
+  readonly privateProvides?: readonly Capability[];
   /** 本插件声明消费的能力。 */
   readonly dependencies?: TDependencies;
   /** 默认执行 Runtime。 */
@@ -44,12 +56,6 @@ export interface DefinePluginOptions<
   readonly config?: TConfig;
   /** 领域贡献。 */
   readonly contribution?: TContribution;
-  /** 唯一启动策略；默认为 optional。 */
-  readonly startup?: "required" | "optional";
-  /** 默认启用意图；required 时必须为 true。 */
-  readonly defaultEnabled?: boolean;
-  /** optional 插件默认为可停用；required 必须为 false。 */
-  readonly canDisable?: boolean;
   /** 当前 realm 的插件实现。 */
   readonly setup: PluginSetup<TProvides, TDependencies, TConfig, TExtension>;
 }
@@ -88,12 +94,6 @@ export function definePlugin<
   nonEmpty(options.id, "Plugin id");
   if (typeof options.setup !== "function") throw new TypeError(`Plugin "${options.id}" setup must be a function`);
   const unitId = nonEmpty(options.unitId ?? options.id, `Plugin "${options.id}" unitId`);
-  const startup = options.startup ?? "optional";
-  const defaultEnabled = options.defaultEnabled ?? true;
-  const canDisable = options.canDisable ?? startup !== "required";
-  if (startup === "required" && (!defaultEnabled || canDisable)) {
-    throw new TypeError(`Plugin "${options.id}" required startup policy is inconsistent`);
-  }
   const provides = [...(options.provides ?? [])];
   const dependencies = [...(options.dependencies ?? [])];
   const runtime = options.runtime;
@@ -101,6 +101,9 @@ export function definePlugin<
     id: unitId,
     ...(runtime !== undefined ? { runtime } : {}),
     ...(provides.length > 0 ? { provides: provides.map((capability) => capabilityDescriptor(capability)) } : {}),
+    ...(options.privateProvides && options.privateProvides.length > 0
+      ? { privateProvides: Object.freeze(options.privateProvides.map((capability) => capabilityDescriptor(capability))) }
+      : {}),
     ...(dependencies.length > 0 ? { dependencies: normalizeDependencies(dependencies, runtime ?? "window-main") } : {}),
     ...(options.permissions !== undefined ? { permissions: [...options.permissions] } : {}),
     ...(options.config !== undefined ? { config: options.config } : {}),
@@ -110,9 +113,6 @@ export function definePlugin<
     id: options.id,
     name: options.name ?? options.id,
     ...(options.description !== undefined ? { description: options.description } : {}),
-    startup,
-    defaultEnabled,
-    canDisable,
     units: [descriptor],
   };
   return Object.freeze({

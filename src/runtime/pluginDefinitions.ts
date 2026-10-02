@@ -85,9 +85,6 @@ export function materializePluginDefinition(input: RuntimePluginDefinition, runt
     id: input.manifest.id,
     name: input.manifest.name,
     ...(input.manifest.description !== undefined ? { description: input.manifest.description } : {}),
-    startup: input.manifest.startup,
-    defaultEnabled: input.manifest.defaultEnabled,
-    canDisable: input.manifest.canDisable,
     units: Object.freeze([materializedUnit]),
   });
   const capabilities = Object.freeze([...(input.capabilities ?? [])]);

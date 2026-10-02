@@ -37,7 +37,7 @@ describe("v4 React bindings", () => {
 
   it("does not rerender a capability consumer for an unrelated App change", async () => {
     const app = await createWindowApp({ plugins: [
-      definePlugin({ id: "value", provides: [Value] as const, startup: "required" as const, setup(ctx) { ctx.provide(Value, { value: "stable" }); } }),
+      definePlugin({ id: "value", provides: [Value] as const, setup(ctx) { ctx.provide(Value, { value: "stable" }); } }),
       definePlugin({ id: "other", provides: [Other] as const, setup(ctx) { ctx.provide(Other, { value: "other" }); } }),
     ] });
     const host = hostForWindowApp(app);
@@ -45,8 +45,9 @@ describe("v4 React bindings", () => {
     render(<WebLoomProvider app={app}><CapabilityView onRender={() => { renders += 1; }} /></WebLoomProvider>);
     expect(screen.getByTestId("value").textContent).toBe("stable");
     const before = renders;
-    await act(async () => { await host.disable("other"); });
-    await waitFor(() => expect(host.state("other").kind).toBe("disabled"));
+    await act(async () => { await host.revoke("other", "test stop"); });
+    // 被释放的插件进入“等待运行条件”而不是用户禁用状态。
+    await waitFor(() => expect(host.state("other").kind).toBe("blocked"));
     expect(screen.getByTestId("value").textContent).toBe("stable");
     expect(renders).toBe(before);
     await app.dispose();
@@ -57,12 +58,12 @@ describe("v4 React bindings", () => {
     function StateView() {
       const state = usePluginState("lifecycle");
       const runtime = usePluginRuntime();
-      return <output data-testid="state">{`${state?.kind}:${runtime.isEnabled("lifecycle")}`}</output>;
+      return <output data-testid="state">{`${state?.kind}:${runtime.isRunning("lifecycle")}`}</output>;
     }
     render(<WebLoomProvider app={app}><StateView /></WebLoomProvider>);
     expect(screen.getByTestId("state").textContent).toBe("enabled:true");
-    await hostForWindowApp(app).disable("lifecycle");
-    await waitFor(() => expect(screen.getByTestId("state").textContent).toBe("disabled:false"));
+    await hostForWindowApp(app).revoke("lifecycle", "test stop");
+    await waitFor(() => expect(screen.getByTestId("state").textContent).toBe("blocked:false"));
     await app.dispose();
   });
 });

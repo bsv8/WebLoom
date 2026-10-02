@@ -11,6 +11,7 @@ import {
   RUNTIME_NEXT_TYPE,
 } from "../runtime/runtimeProtocol.js";
 import { createMessagePortServiceProvider, type MessagePortServiceCallInput } from "./messagePortServiceProvider.js";
+import { guardPrivateStream } from "../runtime/privateCallValidity.js";
 import type { MessagePortLike } from "./messagePortServiceTransport.js";
 import { createRuntimeEndpointSession } from "../runtime/runtimeSession.js";
 import { createRuntimeBudget } from "./dto.js";
@@ -66,6 +67,102 @@ describe("v4 MessagePort provider", () => {
     port.emit({ ...callMessage(), serviceInstanceId: "echo:old" });
     await Promise.resolve();
     expect(port.sent.at(-1)).toMatchObject({ type: `${RUNTIME_PROTOCOL_VERSION}.error`, error: { code: "service_stale" } });
+    provider.dispose();
+  });
+
+  it("wrapper + provider: cleanup budget expiry keeps the execution slot until the real cleanup settles", async () => {
+    // 联测：provider 的 stream 来自 guardPrivateStream，用户可见超时之后执行名额必须仍是 1，
+    // 底层清理迟到完成后才降到 0。provider 不得通过 next() 推断清理完成。
+    const port = new FakePort();
+    let releaseCleanup: (() => void) | undefined;
+    let cleanupFinished = false;
+    const provider = createMessagePortServiceProvider({
+      port,
+      services: () => [streamReference],
+      handleCall: () => guardPrivateStream({
+        async *[Symbol.asyncIterator]() {
+          try {
+            yield { topic: "updates", value: "first" };
+            await new Promise<void>(() => undefined);
+          } finally {
+            await new Promise<void>((resolve) => { releaseCleanup = resolve; });
+            cleanupFinished = true;
+          }
+        },
+      }, {
+        validity: { aborted: false, reason: undefined, release: () => undefined },
+        recheck: () => "instance:one",
+        identity: "instance:one",
+        // 预算很短：很快就会对用户可见地超时。
+        drainTimeoutMs: 20,
+      }),
+    });
+    port.emit(streamCallMessage("stream:wrapped"));
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => (message as { streamReady?: unknown }).streamReady === true); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(provider.executionCount()).toBe(1);
+    // 关闭这条流：包装器进入关闭，用户可见超时会在 20ms 后发生。
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: "stream:wrapped", serviceInstanceId: streamReference.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && releaseCleanup === undefined; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(releaseCleanup).toBeDefined();
+    // 预算已耗尽、底层清理未完成：执行名额保持占用。
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    expect(cleanupFinished).toBe(false);
+    expect(provider.executionCount()).toBe(1);
+    // 底层清理迟到完成：名额这时才回收。
+    releaseCleanup!();
+    for (let attempt = 0; attempt < 40 && provider.executionCount() > 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(cleanupFinished).toBe(true);
+    expect(provider.executionCount()).toBe(0);
+    provider.dispose();
+  });
+
+  it("keeps the execution slot when iterator cleanup is incomplete and reclaims it on late completion", async () => {
+    // 清理"未完成"不等于清理完成：return() 被拒绝（等待预算耗尽）时执行名额必须继续占用，
+    // 直到底层 iterator 真正结束才回收。
+    const port = new FakePort();
+    let releaseCleanup: (() => void) | undefined;
+    let cleanupFinished = false;
+    const provider = createMessagePortServiceProvider({
+      port,
+      services: () => [streamReference],
+      handleCall: async function* () {
+        try {
+          yield { topic: "updates", value: "first" };
+          // 生成器保持挂起：return() 只能进入 finally。
+          await new Promise<void>(() => undefined);
+        } finally {
+          // 清理挂起：底层还没结束，用户侧已经看到流停止。
+          await new Promise<void>((resolve) => { releaseCleanup = resolve; });
+          cleanupFinished = true;
+        }
+      },
+    });
+    port.emit(streamCallMessage("stream:cleanup"));
+    for (let attempt = 0; attempt < 20 && !port.sent.some((message) => (message as { streamReady?: unknown }).streamReady === true); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(provider.executionCount()).toBe(1);
+    // 关闭这条流：provider 调用 iterator.return()，但底层清理仍在等待。
+    port.emit({ type: RUNTIME_CANCEL_TYPE, protocolVersion: RUNTIME_PROTOCOL_VERSION, binding: callerBinding, callId: "stream:cleanup", serviceInstanceId: streamReference.serviceInstanceId });
+    for (let attempt = 0; attempt < 20 && releaseCleanup === undefined; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(releaseCleanup).toBeDefined();
+    expect(cleanupFinished).toBe(false);
+    expect(provider.executionCount()).toBe(1);
+    // 底层清理迟到完成：名额这时才回收。
+    releaseCleanup!();
+    for (let attempt = 0; attempt < 40 && provider.executionCount() > 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(cleanupFinished).toBe(true);
+    expect(provider.executionCount()).toBe(0);
     provider.dispose();
   });
 

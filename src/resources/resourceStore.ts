@@ -11,6 +11,8 @@ import type {
   ResourceSnapshot,
 } from "../contracts/resource.js";
 import { RESOURCE_OWNER } from "../contracts/resource.js";
+import type { Capability, CapabilityClient } from "../contracts/capability.js";
+import { UNOWNED_RESOURCE_OWNER } from "./instanceResourceRegistry.js";
 
 interface ResourceRecord<T = unknown> {
   snapshot: ResourceSnapshot<T>;
@@ -43,13 +45,35 @@ export interface ResourceStoreApi {
 
 type Attributes = Readonly<Record<string, unknown>>;
 
+/**
+ * 资源上下文的能力解析回调。
+ *
+ * `ownerId` 是资源定义所属的真实插件实例；实现方必须按该实例的 consumer
+ * 解析，并在 owner 已撤销时抛错，而不是退回全局字符串查询。
+ */
+export type ResourceCapabilityResolver = <C extends Capability>(ownerId: string, capability: C, optional: boolean) => CapabilityClient<C> | undefined;
+
+/**
+ * owner 有效性检查回调。
+ *
+ * key/load/subscribe 三个阶段都先调用它：owner 实例已撤销时直接抛错，
+ * 不会被 `optionalCapability` 当成“已声明但暂时缺席”吞掉，也不会退化成
+ * 宿主资源解析。
+ */
+export type ResourceOwnerAssert = (ownerId: string) => void;
+
 function createContext(
   ownerId: string,
-  getCapability: <T>(id: string) => T | undefined,
+  resolveCapability: ResourceCapabilityResolver,
   getAttributes: (ownerId?: string) => Attributes,
 ): ResourceContext {
   return {
-    getCapability,
+    capability(capability: Capability) {
+      return resolveCapability(ownerId, capability, false) as CapabilityClient<never>;
+    },
+    optionalCapability(capability: Capability) {
+      return resolveCapability(ownerId, capability, true) as CapabilityClient<never> | undefined;
+    },
     attributes: getAttributes(ownerId),
     ownerId,
   } as ResourceContext & { ownerId: string };
@@ -59,6 +83,11 @@ function recordKey(definitionId: string, key: ResourceKey): string {
   return `${definitionId}::${key.join("::")}`;
 }
 
+/** 读取定义实际登记的 owner；未登记的宿主资源使用保留标识。 */
+function ownerOf(definition: ResourceDefinition<unknown, readonly string[]>): string {
+  return (definition as ResourceDefinition<unknown, readonly string[]> & { [RESOURCE_OWNER]?: string })[RESOURCE_OWNER] ?? UNOWNED_RESOURCE_OWNER;
+}
+
 function defaultEquals(a: unknown, b: unknown): boolean {
   return Object.is(a, b);
 }
@@ -66,8 +95,9 @@ function defaultEquals(a: unknown, b: unknown): boolean {
 /** 创建通用 Resource Store。 */
 export function createResourceStore(
   registry: ResourceRegistry,
-  getCapability: <T>(id: string) => T | undefined,
+  resolveCapability: ResourceCapabilityResolver,
   getAttributes: (ownerId?: string) => Attributes = () => ({}),
+  assertOwnerActive: ResourceOwnerAssert = () => undefined,
 ): ResourceStoreApi {
   const records = new Map<string, ResourceRecord>();
   const microtaskQueue = new Map<string, { definitionId: string; args: readonly string[] }>();
@@ -93,17 +123,25 @@ export function createResourceStore(
   };
 
   const contextFor = (definition: ResourceDefinition<unknown, readonly string[]>): ResourceContext =>
-    createContext(
-      ((definition as ResourceDefinition<unknown, readonly string[]> & { [RESOURCE_OWNER]?: string })[RESOURCE_OWNER] ?? "__unowned__"),
-      getCapability,
-      getAttributes,
-    );
+    createContext(ownerOf(definition), resolveCapability, getAttributes);
+
+  /**
+   * 取定义实际登记的 owner，并确认该 owner 仍有效。
+   *
+   * 已撤销的 owner 在这里直接抛错：key/load/subscribe 都不会再跑，缓存与
+   * 在途加载也不会因为 ownerId 查不到就降级成宿主 unowned 资源。
+   */
+  const liveContextFor = (definition: ResourceDefinition<unknown, readonly string[]>): ResourceContext => {
+    const context = contextFor(definition);
+    assertOwnerActive(context.ownerId);
+    return context;
+  };
 
   const getOrCreateRecord = <T>(
     definition: ResourceDefinition<T, readonly string[]>,
     args: readonly string[],
   ): ResourceRecord<T> => {
-    const context = contextFor(definition as ResourceDefinition<unknown, readonly string[]>);
+    const context = liveContextFor(definition as ResourceDefinition<unknown, readonly string[]>);
     const key = definition.key(args, context);
     const keyString = recordKey(definition.id, key);
     const current = records.get(keyString) as ResourceRecord<T> | undefined;
@@ -123,7 +161,7 @@ export function createResourceStore(
       subscribers: new Set(),
       invalidationScheduled: false,
       loadRevision: 0,
-      owner: ((definition as ResourceDefinition<unknown, readonly string[]> & { [RESOURCE_OWNER]?: string })[RESOURCE_OWNER] ?? "__unowned__"),
+      owner: ownerOf(definition as ResourceDefinition<unknown, readonly string[]>),
       providerUnsubscribe: null,
     };
     records.set(keyString, record);
@@ -141,7 +179,7 @@ export function createResourceStore(
     record: ResourceRecord<T>,
   ): void => {
     record.abortController?.abort();
-    const context = contextFor(definition as ResourceDefinition<unknown, readonly string[]>);
+    const context = liveContextFor(definition as ResourceDefinition<unknown, readonly string[]>);
     const key = definition.key(args, context);
     if (record.snapshot.key.join("::") !== key.join("::")) return;
 
@@ -196,7 +234,7 @@ export function createResourceStore(
   const invalidateNow = (definitionId: string, args: readonly string[]): void => {
     const definition = registry.get<unknown, readonly string[]>(definitionId);
     if (!definition) return;
-    const context = contextFor(definition);
+    const context = liveContextFor(definition);
     const key = definition.key(args, context);
     const record = records.get(recordKey(definitionId, key));
     if (!record) return;
@@ -219,7 +257,7 @@ export function createResourceStore(
       invalidateNow(definitionId, args);
       return;
     }
-    const key = recordKey(definitionId, definition.key(args, contextFor(definition)));
+    const key = recordKey(definitionId, definition.key(args, liveContextFor(definition)));
     if (microtaskQueue.has(key)) return;
     microtaskQueue.set(key, { definitionId, args });
     if (!microtaskScheduled) {
@@ -281,7 +319,7 @@ export function createResourceStore(
     read<T>(definitionId: string, args: readonly string[]) {
       const definition = registry.get<T, readonly string[]>(definitionId);
       if (!definition) return undefined;
-      const key = definition.key(args, contextFor(definition));
+      const key = definition.key(args, liveContextFor(definition));
       return (records.get(recordKey(definitionId, key)) as ResourceRecord<T> | undefined)?.snapshot;
     },
     invalidate: scheduleInvalidation,

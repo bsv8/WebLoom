@@ -1,5 +1,7 @@
 # WebLoom v4 三仓施工单
 
+> 2026-10-02 当前施工单：[插件服务模型与所属 UI](#pcb-plan)。PSM 任务待实施；先完成 WebLoom 验收再迁移 Keymaster。以下第 1–7 节是原 v4 历史施工，不沿用其完成勾选或发布目标。
+
 - 状态：源码已有未提交实施；已执行结果见 verification.md，外部与产品验收仍按该文件标为未关闭。2026-09-10 设计冻结修订。
 - 规范：[需求与设计](./requirements.md)，V4-R01–V4-R16。
 - 交付版本：`webloom-framework@0.4.0`，唯一 wire `webloom.runtime.v1`。
@@ -441,3 +443,233 @@ pnpm verify:lifecycle-release
 仅当 V4-001–019 和 AT-01–30 所需证据全部满足，才能称“三仓 v4 迭代完成”。如果只完成代码与本地验收，最终报告必须准确写到该层。
 
 最终交付包含：三仓代码/依赖/教程变更、需求与施工单状态更新、verification 证据、旧 API 清除报告、同一 tarball/registry integrity、产品恢复与部署状态。没有额外的“以后再去掉兼容层”或 SWCF-009 尾项。
+
+
+<a id="pcb-plan"></a>
+<a id="plugin-service-plan"></a>
+
+## 8. 插件服务模型与所属 UI 施工单（2026-10-02 修订）
+
+- 状态：保留上一轮实现/验收证据，但本次复核发现 4 项已有要求的阻断问题（8.11），相关任务不能最终关闭。新增 PSM-009–011 待实施；本次只修改文档并复核代码，不实施新功能。
+- 规范：[需求第 15 节 PSM-R01–PSM-R13](./requirements.md#plugin-service-requirements)。基线为
+  0.5.0 工作树（含上一波未提交修改，全部保留）。破坏性版本确定为 `0.6.0`。
+- 本节替代原第 8 节 PCB 施工单；第 1–7 节是原 v4 三仓施工历史范围，不按其版本目标或顺序重做。
+- 上一波证据见 [verification 第 7 节](./verification.md#pcb-verification)，只证明其实际检查范围，不证明本轮资源私有性、私有 UI 或无启停模型已完成。
+- 本轮实施范围仅 WebLoom 框架、示例、测试与文档。Keymaster 先等待框架验收，再另行分层施工；本次文档交付不执行程序修改、发布或部署。
+
+### 8.1 施工顺序与落点
+
+```text
+PSM-001 基线与契约清单
+  → PSM-002 统一实例/公开服务边界
+  → PSM-003 无用户启停的依赖生命周期
+  → PSM-004 可信 UI 注册与私有上下文
+  → PSM-005 资源视图纠偏
+  → PSM-006 跨 Runtime / Connect 分界回归
+  → PSM-007 公共 API 与迁移材料
+  → PSM-008 完整验收与框架交付
+  → 关闭 8.11 既有阻断项
+  → PSM-009 完整插件与部署绑定
+  → PSM-010 多 Worker 与所属私有通信
+  → PSM-011 扩展验收与交接
+  → 后续 Keymaster 分层迁移（不属于本轮实施）
+```
+
+| 责任模块 | 源码/材料落点 | 主要变化 |
+| --- | --- | --- |
+| 声明与生命周期 | `src/contracts/plugin.ts`、`src/contracts/lifecycle.ts`、Host 与现有配置/意图实现 | 移除用户启停，保留实例与依赖可用性 |
+| 实例消费 | `src/contracts/consumer.ts`、`src/host/pluginConsumer.ts`、`src/host/createPluginHost.ts` | 复用统一解析，保留身份和 scope |
+| 通用注册/贡献 | `src/lifecycle/scopedRegistry.ts`、贡献适配接口与 Host 绑定点 | 可信归属、实例清理，不加入产品 UI schema |
+| React | `src/react/PluginConsumerProvider.tsx`、hooks、`src/react.ts` | 私有 Context 与 consumer 并存，删除用户启停 React 接口 |
+| 资源 | `src/resources/instanceResourceRegistry.ts`、registry/store 与资源契约 | 查询与读取按 owner 收口，封住私有 loader 与全局 store 旁路 |
+| 跨 Runtime | 现有 peer 暴露、RPC/stream、快照 schema 及契约清单 | 保留传输机制；移除意图字段时同步两端 |
+| 消费者/文档 | browser fixture、pack smoke、README、`docs/api.md`、迁移指南 | 新模型示例、类型负面用例、准确限制说明 |
+
+具体符号以实施时清单为准，不能只改表中的文件而遗漏导出、快照或测试中的真实消费点。
+
+### 8.2 PSM-001 · 保存基线并冻结 API 差异
+
+覆盖 PSM-R01、R09、R10。
+
+- [x] 记录 HEAD、版本、全部未提交文件及既有验证；不 reset、不用 HEAD 覆盖现有修改。
+- [x] 列出启停相关声明、Host/React 方法、配置存储、意图控制器、快照/投影及独立消费者的实际调用点；区分业务配置和启停专用配置。
+- [x] 核实多提供者绑定、依赖循环、运行条件、scope 撤销与服务可用性当前语义，确定目标公开类型和错误分类，附中文说明。
+- [x] 固定私有 UI 正例及资源泄露反例：无私有 provides 仍可读内部数据；另一插件不得拿到 owner 的 load 闭包。
+- [x] 运行相关基线检查；失败分别记录既有问题与本轮新增问题，不预填通过。
+
+交付：API 删除/保留/新增清单、快照影响清单、可复现回归与基线记录。先确定一个最终模型，不设计永久兼容开关。
+
+### 8.3 PSM-002 · 统一公开消费与私有实现边界
+
+覆盖 PSM-R03、R04、R09；依赖 PSM-001。
+
+- [x] 复用上一波 consumer，不重造身份系统；核对 setup、UI、资源解析使用同一 kind/id/version、提供者绑定与有效性检查。
+- [x] 保留签发来源检查、稳定订阅与代理缓存；无效视图不能重绑同名新实例。
+- [x] 明确 PluginContext 以实例有效期约束框架操作，不把 setup 返回当成一切内部调用失效点；不向 consumer 添加根 Host/App。
+- [x] 编写未公开私有服务的 Context/闭包示例，证明自有 UI 可以读取、其他插件无公共解析入口。
+- [x] 保留 optional/has 的未声明与契约错误拒绝；类型测试证明 consumer 无管理成员。
+- [x] 用“提供方已运行，消费方漏声明”和“只有传递依赖”负面用例覆盖 setup、consumer、React hooks、UI 注册服务、资源 resolver 与 RPC/stream 获取；未声明必须在取得句柄/执行 handler 前拒绝，optional/has 不吞错。
+- [x] 错误包含消费实例、请求契约及未声明原因；禁止自动补依赖、内置服务免检和全局查找 fallback。交接材料列明产品必须实施的私有 import/裸单例门禁。
+
+验收：公有依赖受检，私有实现无需登记，scope 撤销后框架操作拒绝。不能用公开 Secret capability 模拟私有实现。
+
+### 8.4 PSM-003 · 移除用户启停，保留依赖与实例生命周期
+
+覆盖 PSM-R02、R09；依赖 PSM-002。
+
+- [x] 删除 manifest 的 startup/defaultEnabled/canDisable 及相关类型、Host enable/disable/submitIntent、启停意图控制器、专用持久化与 React 启停 API；无旧别名或默认启用兼容分支。
+- [x] 已装配插件全部进入依赖图；明确实例生命周期、服务可用性/原因，去掉 desiredEnabled/desiredRevision 与旧意图状态表达。
+- [x] 从声明与确定的提供者绑定构建拓扑顺序；打乱登记顺序仍先初始化提供者，所需能力可用后再启动消费者；**已确定提供者的可选依赖同样参与排序**，未绑定的可选依赖不形成等待。无依赖分支允许并行，不用 priority 手写调度。
+- [x] 计划销毁/替换按反向拓扑**分层**清理受影响实例，先同步封住新业务调用、再清理依赖者、最后释放提供者；必须等待消费者清理完成才释放提供者，同层无关插件并行；Host 整体销毁同样按反向依赖顺序而非登记顺序倒序。共享提供者不随单个消费者清理而误销毁。
+- [x] 提供者意外失败立即撤销失效路径，再幂等清理必需依赖者；恢复按正向拓扑重建。可选绑定参与顺序，缺席不等待、失效可降级，旧句柄失效。
+- [x] 用事件轨迹断言 A → B → C 依赖链的启动/销毁顺序，覆盖乱序登记、异步初始化、分支共享、可选缺席、清理失败及提供者突然失效；不能只断言最终状态。
+- [x] 保留可信宿主装配清理、scope/dispose、依赖等待/失效、实例重建、取消及失败诊断；明确所有登记不等于所有副作用自动启动。
+- [x] 验证可选依赖、必需依赖、循环、绑定歧义及非关键服务失败；候选服务选择走明确绑定，不靠禁用其他插件。
+- [x] 产品运行条件可驱动可用性与旧实例清理，不能恢复用户启停存储；恢复不重放业务请求。
+- [x] 同步移除快照/投影意图字段、契约清单与公开导出。如影响序列化格式，更新正式 schema/版本校验并测试两端一致及旧构建明确拒绝；不额外重写 RPC/stream/transfer。
+- [x] 将旧“停用/重新启用”测试改为真实实例撤销/重建事件，保留旧句柄、迟到注册/结果失效断言，不删除撤权测试来通过检查。
+
+验收：无启停持久化也能运行；失败与锁定不等于用户禁用；清理和恢复仍可靠。该阶段是实质生命周期重构，不能仅把 canDisable 固定为 false。
+
+### 8.5 PSM-004 · 网页注册服务与所属 UI
+
+覆盖 PSM-R04、R05、R06；依赖 PSM-003。
+
+- [x] 复用 scoped registry 并完成 Host 到通用服务门面的可信调用归属绑定，形成可用公开/可信适配入口；不要求插件自行提交字符串身份。
+- [x] 绑定贡献 consumer 与动态注册到实际实例，覆盖注册/更新/注销、局部失败、晚到注册、撤销清理和同名新实例；更新同样受归属约束且不能改写归属字段，**异步注册在撤销之后完成时被立即回收**。
+- [x] 在 fixture 定义网页服务的页面、设置块、header 三类条目；schema 只在 fixture，不进入框架核心。
+- [x] 假 Storage 注册三类 UI，组件捕获同一所属私有 Context；网页插件挂载使用 Storage consumer，网页插件不获取私有服务。
+- [x] 替换 `plugin-consumer-main.ts` 中以 provides/Secret 表示私有实现的示例；私有服务无公开能力描述符。
+- [x] 回归 App hooks 在插件 Provider 内拒绝、自己的私有 Context 正常、嵌套共享组件保留提供方身份、StrictMode 与稳定引用。
+
+验收：网页插件只依赖注册服务自身所需能力，不反向依赖所有业务插件。三个 UI 接口无需逐组件权限；跨插件依赖仍受检。
+
+### 8.6 PSM-005 · 封住资源定义与 store 旁路
+
+覆盖 PSM-R07；依赖 PSM-004。
+
+- [x] `instanceResourceRegistry.get/_ids` 检查有效性，只访问本实例定义；外国 owner 的可调用定义不可取得，可信 Host 的完整查询保持内部使用。
+- [x] 检查 register/unregister、owner 伪造、unowned、重复 ID 与同名新实例；不靠 ID 前缀决定权限。
+- [x] 梳理 ResourceStore 的 ensure/读取/subscribe/invalidate 等入口，提供或复用所属实例视图；普通插件不能拿裸全局 store 绕过限制。
+- [x] 复用底层缓存与资源状态机；loader 的 typed 解析绑定定义 owner，owner 缺失/撤销拒绝，不 fallback 全局 resolver。
+- [x] 跨插件共享只经明确发布的 typed reader/subscription 能力，证明消费者无法直接取得 loader 或任意失效他人缓存。
+- [x] 保留加载取消、订阅释放、缓存隔离及迟到结果拒绝；撤销后查询/列举也拒绝。
+
+验收：复现的“仅声明 RESOURCE_REGISTRY 就能直接调用他人私有 load”失败；正常自有资源、显式共享 reader 与可信宿主资源可运行。
+
+### 8.7 PSM-006 · 跨 Runtime 与 Connect 分界验证
+
+覆盖 PSM-R08、R03、R10；依赖 PSM-005。
+
+- [x] 回归消费者实例 scope 绑定的 RPC client/stream，撤销后旧请求、句柄与订阅失效，不能借根 scope 存活；**句柄绑定解析当下的服务实例世代**，提供者重建后旧句柄以 `service_stale`/`service_revoked` 失败而不改用新实现，重新解析才得到新句柄。
+- [x] 用模拟网关的显式公开名单证明内部可用服务不自动成为外部服务；绑定 App 会话，伪造 plugin/app 参数不能改变可信身份。
+- [x] 记录产品应如何复用 peer 暴露策略支持同一插件跨 realm 的私有调用，不创建按任意 pluginId 获权的全局查找器。
+- [x] local 副作用门面校验 scope；说明普通对象、闭包与已复制数据不可自动撤销，最终 I/O 授权由领域服务执行。
+
+验收不引入真实钱包、网络保存或 Connect SDK 实现；验证框架接入合同，产品协议另行验收。
+
+### 8.8 PSM-007 · 公开契约与下游交接材料
+
+覆盖 PSM-R01、R09；依赖 PSM-006。
+
+- [x] 同步 core/advanced/react 导出、contract inventory、类型负面 fixture 与 package consumers；核心不引 React/产品代码。
+- [x] 更新 README、API 与 migration 文档，写明三访问面、私有 UI 正例、网页服务注册、资源视图、无用户启停及 local 保证范围。
+- [x] 审计活跃文档/示例中旧 setup-only、私有 Secret provides、启停接口与免检分支；历史说明明确标历史，不删除真实历史证据。
+- [x] 将 API 差异映射到 Keymaster 的 runtime adapter、UI contribution adapter、资源适配及 Connect 接入，列出必须移除的全局 Host/字符串 resolver 旁路；只交接，不修改下游。
+- [x] 依据实际破坏性变化确定包版本与 snapshot/schema 影响，准备一致的消费版本，不能沿用旧发布号或自动发布。版本确定为 `0.6.0`；快照单位状态枚举变化（移除 `disabled`/`error-disabled`、新增 `failed`、删除 `desiredEnabled`/`desiredRevision`），两端使用同一份校验列表并测试旧构建被拒绝；未发布、未修改下游锁文件。
+
+### 8.9 PSM-008 · 完整验收与框架交付
+
+覆盖 PSM-R10；依赖 PSM-007。
+
+- [x] 先运行受影响的类型、Host、生命周期、React、资源测试；稳定后执行完整门禁。
+- [x] 真实 Chromium 运行网页注册 + 三个自有 UI + 私有 Context + 撤销/重建 + RPC/stream 用例；不以 jsdom 或旧 ready smoke 代替。
+- [x] pack 独立消费者仅安装 tarball，证明公开类型和实际运行符合新模型；不引用本仓源码或 Keymaster 私有模块。
+- [x] 逐项记录需求 15.11 矩阵、命令、版本、负面断言、失败与未验收项；新增 PSM 验证章节，不挪用旧 PCB 已通过状态。
+- [x] 给出准确版本、本地 tarball 路径及 integrity、最终 API 差异与迁移说明。发布/部署不在本单自动执行范围。
+
+本轮实际执行的命令与结果见 verification 第 8 节。完整门禁沿用仓库实际命令，并随入口变化
+同步脚本，不能通过删除断言达标：
+
+```bash
+pnpm test:types
+pnpm lint:boundaries
+pnpm lint:v4
+pnpm test
+pnpm build
+pnpm run pack:consumer
+pnpm run test:browser
+```
+
+PSM-001–008 的最终关闭须先满足 8.11 复核；新增目标还需 PSM-009–011 完成、PSM-R11–R13 有独立证据，才能称本次扩展的 WebLoom 框架支持完成。构建通过不等于资源私有性或最终 I/O 已受保护；WebLoom 完成不等于 Keymaster 已迁移。
+
+### 8.10 后续 Keymaster 顺序（交接，不在本轮实施）
+
+1. **契约与运行时适配**：使用已验收的同一框架产物，调整 manifest/依赖图/实例状态，移除 kind 与用户启停产品模型、旧适配免检及字符串解析旁路。运行条件仍由产品权威控制。
+2. **网页插件与 UI 挂载**：建立 typed 注册服务，贡献方 consumer 与私有 Context 跟随各 UI 挂载，收回全局 Host 注入。
+3. **基础服务逐个迁移**：Storage、Vault 等分别梳理对内公开、Connect 公开与私有面；浏览器/设置/指示灯留在所属插件，资源视图及最终 I/O 授权同步验收。
+4. **业务插件与 Connect**：逐个补依赖/注册，Connect 仅发布明确名单并绑定 App 身份；分层跑产品回归，最后完成整体升级。
+
+迁移期间可以分步施工，但最终不保留旧新双轨。删除启停专用记录不删除钱包、文件或业务配置；具体数据迁移与每层验收在 Keymaster 施工单定义。
+
+### 8.11 给施工者：复核结论与既有任务重新关闭条件
+
+**请先修复下列既有阻断，再实施 8.12–8.14 新阶段。不要把多 Worker 支持混入“上一轮问题已经修好”的声明。保留已有实现与真实历史证据，复用 units/typed transport/scope，不重写为一个函数一个 Worker，不拆成另一套插件系统，不修改 Keymaster。**
+
+本次检查确认：必需依赖链的异步销毁与乱序 Host 销毁已修复；已绑定可选依赖的启动顺序已修复；带 update 规则的不同 owner 更新被拒绝；普通迟到注册有回收；旧 RPC 句柄的新调用拒绝跨世代。以下组合场景仍未满足原计划，均有最小运行时复现：
+
+| 编号/既有任务 | 阻断问题 | 修改建议与重新验收 |
+| --- | --- | --- |
+| REVIEW-01 / PSM-003 | `pluginGraph.ts` 的 reverse 仍跳过可选依赖，teardownLayers 因而在整体销毁时先释放可选提供者，再清理消费者 | 排序图纳入已绑定可选边；必需失效级联与可选降级另行判断。测试异步整体销毁、可选边环与缺席 |
+| REVIEW-02 / PSM-004 | `scopedRegistry.ts` 的 update/unregister 只检查旧门面的本地登记记录。同名条目被新实例接管后，旧门面仍可改写或删除新条目 | 每次写操作及返回注销句柄校验当前条目的实际 owner/注册世代，不只检查历史记录；测试同名接管后的更新/注销与清理 |
+| REVIEW-03 / PSM-004 | 旧异步 register 晚到会把底层 Map 中的新条目覆盖为旧 owner；现有测试只断言条目存在，未检查 owner 与内容 | 给实际提交阶段加世代/scope 围栏，或使用可验证的条件提交适配。测试先新登记、后旧完成，断言新 owner、组件与内容保持一致；清理失败不能冒充成功 |
+| REVIEW-04 / PSM-006 | 同 realm RPC 只绑定消费者取消信号。可选提供者撤销后，已执行的旧 handler 仍正常返回第一代结果 | 将在途请求/流绑定提供者有效期，提供者失效立即取消并拒绝迟到发布；旧句柄世代检查仍保留，不能只拒绝下一次调用 |
+
+既有完成勾选代表先前证据，本表是最终关闭的附加复核门槛。修复时必须把这些复现保留为正式回归，并更新 verification；不能仅修文档或删掉要求。新增阶段未实现属于未来任务，不能拿来混淆上述既有问题。
+
+本次实际复核：`pnpm exec vitest run` 为 23 个文件、220 个测试通过；`pnpm test:types`（含契约清单）通过。另用 7 个临时组合用例核验修复，3 个通过、4 个失败，对应 REVIEW-01–04；旧 RPC 句柄新调用拒绝的断言通过，但同一用例的在途返回断言失败。临时用例检查后已清理，未修改正式程序；未重跑浏览器/打包验收，文档链接与变更格式检查通过。
+
+### 8.12 PSM-009 · 完整插件组织与部署契约（新增，部分完成）
+
+覆盖 PSM-R11、R12；依赖 REVIEW-01–04 关闭。
+
+- [x] 保存本次工作树与复核基线，列出已有 manifest.units、definePlugin、materialize、每个 Host 单元选择、单 bridge 的实际限制。
+- [x] 提供一个插件包含 Web/Worker 实现的 authoring/装配方法，统一静态身份与单元描述，分别导入 realm 实现；复用原 units，不强迫每个后台函数另建业务 pluginId。（`definePluginPackage` 接收真实 `definePlugin` 单元，合并为一份 manifest；`implementationsForRuntime` 按 realm 取实现）
+- [x] 固定部署绑定契约，区分 RuntimeKind、逻辑槽位/Runtime 标识及启动实例；定义多个 SharedWorker 的服务来源消歧和单元级依赖，不把 sourceRuntime kind 当作唯一地址。（`runtimeSlotBindings` + `bindUnitSlot`；无绑定时只在唯一发布端点存在时解析）
+- [x] 确定私有跨单元契约的可信所属关系和签发路径，定义内部登记与公共 provides/Connect 名单的区别；不使用外部自填 pluginId 或全局 private resolver。（单元 `privateProvides` + `handlePrivate` + `privateCapability`；授权键取 Host 记录的真实 pluginId/unitId）
+- [x] 明确本阶段至少支持同插件每个选定 realm 一个单元；不附带任意函数自动迁移编译器、同 Host 无限多单元实例、DedicatedWorker fallback 或新产品协议。
+
+交付：公共/可信装配 API 差异、单元/部署/私有访问的类型与中文说明、snapshot/schema 影响清单、测试矩阵。先冻结可实现接入点再做下一步，不依据旧 0.6.0 产物宣称支持。
+
+### 8.13 PSM-010 · 多 Worker 连接与所属私有代理（新增，部分完成）
+
+覆盖 PSM-R11–R13；依赖 PSM-009。
+
+- [x] 将 Window Host 的单 bridge 装配改为明确槽位的并存连接；按绑定解析服务，增加第二个连接不替换第一个。
+- [x] 替换/卸载只处理匹配槽位与匹配连接世代，旧卸载函数不影响新连接；取消、快照目录、缓存和预算归属复用现有机制并按 endpoint 正确绑定。（`attachRemote` 返回连接世代，`detachRemote` 按世代判定）
+- [ ] 私有授权尚未最终关闭：十二轮复核已落实配置/实例记录分离、全部授权回收、重建重签、实例与连接绑定票据、机密与实例一一绑定、空快照不降级、两端执行前核对、RPC 发布结果前复核迟到结果、stream 授权绑定持续到流结束、清理完成前不报告结束与不释放占用、清理阶段产出全部消费丢弃、清理预算覆盖挂起的异步等待、清理循环按批次让出事件循环（不饿死预算定时器）、清理未完成时 transport 保持执行名额并只按包装器的可信完成信号迟到回收（两端接收路径同一规则）；"异步授权等待期间撤销"与"包装器超时 + provider 联测"均有回归。仍缺授权轮换与并发撤销的压力证据。
+- [ ] 私有授权与依赖收敛的最终关闭：本轮已修 4 项复核阻断（反向授权、票据连接绑定、卸载收敛、外部依赖就绪），但缺少"同一 Worker 被两个页面共享"与授权轮换/撤销的压力证据，暂不最终关闭。
+- [x] 同一插件的 Web/Worker 各自初始化并持有私有状态，Worker 函数共享后台引擎，Web UI 捕获所属代理；无函数源码传输、闭包序列化或根 Host 注入。
+- [ ] 依赖收敛尚未最终关闭：就绪判断与实际解析已共用同一来源规则，声明与绑定冲突在**启动前**
+  判为不满足（消费者不会先运行再在解析时失败），远端目录变化自动驱动收敛，显式卸载也收敛。
+      仍缺双页面共享同一 Worker 的证据，故保持未完成。
+- [x] 私有/公开句柄同时绑定消费者和提供者世代；撤销取消在途工作、拒绝迟到结果，同名重建必须重新解析。（REVIEW-04 已关闭，psmBoundary 覆盖在途 RPC/stream）
+- [ ] 复用 SharedWorker 共享连接生命周期：单页面离开只清理所属连接/消费者，不无条件终止其他页面的后台服务；无关 Worker 的工作不中断。（缺"两个 Window 共用一个 Worker"证据，留待 PSM-011）
+
+### 8.14 PSM-011 · 完整插件与多 Worker 验收/交接（新增，部分完成）
+
+覆盖 PSM-R11–R13；依赖 PSM-010。
+
+- [ ] 构造产品无关的完整假 Storage 插件：私有 listAll 与公共文件服务分开；另构造假 Vault 后台服务。
+      Web 侧要求是**一个 Web 单元内的页面、设置、header 三类 UI**，不是"同插件多个 Web 单元"；
+      后者不属于本轮必做范围。（已构造 `plugin-packages.ts`：Web/Worker 双 realm 单元与私有入口；
+      一个 Web 单元内的三类 UI 仍未构造）
+- [x] 真实 Chromium 中一个 Window 同时连接两个不同 SharedWorker，验证精确来源、并存、顺序无关、单边替换/退出及无关服务存活。（`multi-worker.html` 全部断言通过；旧连接延迟卸载不误伤新连接）
+- [ ] 另测两个 Window 共用一个 Worker。
+- [ ] 使用相同服务模块验证共享 Worker 与分离 Worker 两种装配；独立入口不加载其他插件私有实现，Worker 不导入 React/DOM。说明共享线程的阻塞限制。
+- [ ] 类型负面与运行时覆盖漏声明、错绑定、伪造所属身份、其他插件/网页插件/模拟 App 调用私有入口，保证 handler 未执行。
+- [ ] 事件轨迹验证跨 realm 必需服务等待、异步逆序清理、可选降级、故障重建、旧卸载函数、旧句柄、在途 RPC/stream 与迟到结果；不以正常调用成功代替这些断言。
+- [ ] 更新导出、契约清单、API 文档和迁移指南；按实际破坏性变化重新核对版本与 schema，不发布、不改下游。
+- [ ] 完整现有门禁、独立 tarball consumer 与真实浏览器新增证据通过后交付准确产物/integrity，逐项关闭需求 15.15；历史浏览器与包验收不替代本阶段。
+
+交接给 Keymaster 的提示：Storage 已有双 realm 单元，优先沿用；先接框架的部署/私有通信合同，再按插件逐个把 Coordinator 中的后台实现归回所属单元。不能直接删除 Coordinator、批量搬函数或改钱包数据来完成迁移。

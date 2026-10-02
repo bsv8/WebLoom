@@ -70,14 +70,39 @@ if (playwright) {
     server = spawn("pnpm", ["exec", "vite", "preview", "--host", "127.0.0.1", "--port", String(port), "--strictPort", "--outDir", outputDir], {
       cwd: projectRoot,
       stdio: ["ignore", "pipe", "pipe"],
+      // 独立进程组：`pnpm exec` 会再派生一个 vite 进程，只 kill 包装进程会留下
+      // 真正占着端口的孙进程，导致下一次运行以 "Port 4178 is already in use" 失败。
+      detached: true,
     });
     let serverOutput = "";
     server.stdout.on("data", (chunk) => { serverOutput += String(chunk); });
     server.stderr.on("data", (chunk) => { serverOutput += String(chunk); });
-    const stopServer = () => {
-      if (server && !server.killed) server.kill("SIGTERM");
+    // preview 子进程的 pipe 会让父进程的事件循环一直存活；只注册 exit 钩子会让
+    // 脚本在打印结果后挂住不退出，pnpm test:browser 因此永远等不到结束。
+    // 这里终止整个进程组并等待退出，兜底强杀只用于不配合的 preview。
+    const stopped = new Promise((resolve) => {
+      server.once("exit", () => resolve(undefined));
+    });
+    const signalGroup = (signal) => {
+      try { process.kill(-server.pid, signal); }
+      catch { try { server.kill(signal); } catch { /* 进程组已退出 */ } }
     };
-    process.once("exit", stopServer);
+    let forceTimer;
+    const stopServer = async () => {
+      if (server.exitCode === null && !server.killed) {
+        signalGroup("SIGTERM");
+        // 兜底强杀只用于不配合的 preview；定时器不阻止父进程退出。
+        forceTimer = setTimeout(() => signalGroup("SIGKILL"), 5_000);
+        forceTimer.unref?.();
+      }
+      await stopped;
+      clearTimeout(forceTimer);
+      // 子进程退出后它继承的 pipe 仍会让父进程事件循环存活，脚本打印完结果
+      // 就挂着不退出；必须显式销毁这些流。
+      server.stdout?.destroy();
+      server.stderr?.destroy();
+    };
+    process.once("exit", () => { if (server && server.exitCode === null) signalGroup("SIGKILL"); });
     try {
       let ready = false;
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -246,6 +271,101 @@ if (playwright) {
           }
           await mismatchPage.close();
 
+          // 插件实例消费边界的独立页面（PCB-R08）：动态页面、静态首页贡献、
+          // 提供方共享 Picker 三种场景，以及撤权、同名重启和负面断言。
+          const consumerPage = await context.newPage();
+          await consumerPage.goto(`${baseUrl}plugin-consumer.html`, { waitUntil: "domcontentloaded" });
+          await consumerPage.waitForFunction(
+            () => Boolean(window.__WEBLOOM_PCB_RESULT__),
+            undefined,
+            { timeout: 40_000 },
+          );
+          const consumerResult = await consumerPage.evaluate(() => window.__WEBLOOM_PCB_RESULT__);
+          if (!consumerResult || consumerResult.ok !== true
+            // 场景一：动态页面按实例读取能力，已声明但缺席的可选能力正常缺席。
+            || consumerResult.dynamicTheme !== "dark"
+            || consumerResult.optionalState !== "absent:false"
+            // 场景二：静态首页贡献按同一实例读取能力。
+            || consumerResult.homeTheme !== "home:dark"
+            // 场景三：共享 Picker 在提供方 Provider 下运行。
+            || consumerResult.sharedPicker !== "picker-open"
+            // 注册项、consumer 与实际实例一致。
+            || consumerResult.ownerConsistent !== true
+            // 网页插件挂载 Storage 注册的三类 UI，组件读取自己的私有实现。
+            || consumerResult.storagePage !== "page:bucket-a/contacts=v1"
+            || consumerResult.storageSettings !== "settings:bucket-a"
+            || consumerResult.storageHeader !== "header:bucket-a"
+            || JSON.stringify(consumerResult.webUiKinds) !== JSON.stringify([
+              "page", "settings", "header", "page", "settings", "header",
+            ])
+            // 条目归属由框架按实例身份写入。
+            || consumerResult.ownerBound !== true
+            // 贡献实例撤销后它的条目被撤下；另一个 Storage 实例不受影响。
+            || consumerResult.entriesAfterRevoke !== 0
+            || consumerResult.storageUiAfterRevoke !== "page:bucket-b/contacts=v1"
+            // 负面：私有实现无公开入口、越权注销、伪造 consumer、插件子树 App hook。
+            || consumerResult.privateUnreachable !== true
+            || consumerResult.crossOwnerRejected !== true
+            || consumerResult.forgedRejected !== true
+            || consumerResult.appHookRejected !== true
+            // 负面：未声明内置资源注册表的插件既读不到也不能留下资源定义。
+            || consumerResult.undeclaredRegistryRejected !== true
+            || consumerResult.sneakedAbsent !== true
+            // 撤权后旧子树停止渲染、旧 consumer 拒绝；同名重启是新实例。
+            || consumerResult.beforeDisable !== "dark"
+            || consumerResult.afterDisable !== null
+            || consumerResult.revokedRejected !== true
+            || consumerResult.newInstance !== true
+            || consumerResult.stillRevoked !== true
+            || consumerResult.afterRestart !== "dark"
+            // 提供方停用后旧 Picker 引用永久失效。
+            || consumerResult.pickerRevoked !== true
+            // 实例资源按 owner 解析；owner 撤权后不降级为宿主资源。
+            || consumerResult.profileData !== "owner-scoped-profile"
+            || consumerResult.profileAfterRevoke !== false) {
+            throw new Error(`plugin consumer boundary assertions failed: ${JSON.stringify(consumerResult)}`);
+          }
+          await consumerPage.close();
+
+          // 多 Worker 槽位与所属私有通信（PSM-R11–R13）：一个页面同时连接两个
+          // 真实 SharedWorker，验证并存、顺序无关、单边断开与私有跨单元入口。
+          const multiWorkerPage = await context.newPage();
+          await multiWorkerPage.goto(`${baseUrl}multi-worker.html`, { waitUntil: "domcontentloaded" });
+          await multiWorkerPage.waitForFunction(
+            () => Boolean(window.__WEBLOOM_MULTI_WORKER_RESULT__),
+            undefined,
+            { timeout: 40_000 },
+          );
+          const multiWorkerResult = await multiWorkerPage.evaluate(() => window.__WEBLOOM_MULTI_WORKER_RESULT__);
+          if (!multiWorkerResult || multiWorkerResult.ok !== true
+            // 两个真实 Worker 都已就绪（先 Vault 后 Storage 的挂接顺序不影响绑定）。
+            || multiWorkerResult.vaultReady !== true
+            // 必需依赖由 Host 自己收敛：Worker 发布目录后不再需要外部 reconcile。
+            || multiWorkerResult.storageAutoConverged !== true
+            || multiWorkerResult.vaultAutoConverged !== true
+            // 未授权调用方（普通 RuntimeHandle 句柄）拿不到私有函数。
+            || multiWorkerResult.unauthorizedCall !== "permission_denied"
+            || multiWorkerResult.publicStorage !== "a.txt,b.txt"
+            || multiWorkerResult.publicVault !== "100"
+            // 同插件同单元的私有跨单元调用可用。
+            || multiWorkerResult.privateStorage !== "private:a.txt,b.txt"
+            // 其他插件没有私有解析入口（三条路径都被拒）。
+            || multiWorkerResult.outsiderRejected !== true
+            || typeof multiWorkerResult.outsiderDenials !== "string"
+            // 断开 Storage 槽位：Storage 回到等待，Vault 继续工作。
+            || multiWorkerResult.storageStateAfterDetach !== "blocked"
+            || multiWorkerResult.vaultStillWorks !== "100"
+            // 同槽位换成新连接后，旧连接的延迟卸载不能误伤新连接。
+            || multiWorkerResult.staleCleanupKeptConnection !== true
+            || multiWorkerResult.storageReadyAfterReplace !== true
+            || multiWorkerResult.publicStorageAfterReattach !== "a.txt,b.txt"
+            // 完整插件包：同一 pluginId 的 Web/Worker 单元。
+            || multiWorkerResult.packageUnits !== "worker@shared-worker,web@window-main"
+            || multiWorkerResult.vaultPackageUnits !== "worker@shared-worker,web@window-main") {
+            throw new Error(`multi worker slot assertions failed: ${JSON.stringify(multiWorkerResult)}`);
+          }
+          await multiWorkerPage.close();
+
           console.log(JSON.stringify({
             ok: true,
             build: "production",
@@ -256,6 +376,8 @@ if (playwright) {
             terminalDispose: terminalResults,
             terminalLate: lateResult,
             protocolMismatch: mismatchResult,
+            pluginConsumer: consumerResult,
+            multiWorker: multiWorkerResult,
           }, null, 2));
           await context.close();
         } finally {
@@ -263,12 +385,17 @@ if (playwright) {
         }
       }
     } finally {
-      stopServer();
+      await stopServer();
     }
   } catch (error) {
     console.error(error instanceof Error ? error.stack : String(error));
     process.exitCode = 1;
   } finally {
     await rm(outputDir, { recursive: true, force: true });
+    // 所有清理完成后再退出一次：playwright 的传输层可能仍留有 pipe 句柄，
+    // 那样脚本会打印完结果却空转不退出，pnpm run test:browser 永远等不到结束。
+    // 先把 stdout 刷完，避免截断最后一行 JSON。
+    await new Promise((resolve) => process.stdout.write("", resolve));
+    process.exit(process.exitCode ?? 0);
   }
 }

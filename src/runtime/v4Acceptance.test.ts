@@ -261,7 +261,6 @@ function makeAt16Plugin(capabilities: readonly typeof Echo[]) {
   return definePlugin({
     id: "at16-provider",
     provides: capabilities,
-    startup: "required" as const,
     setup(ctx) {
       for (const capability of capabilities) {
         ctx.handle(capability, (request) => ({ result: request.value }));
@@ -290,7 +289,6 @@ describe("WebLoom v4 acceptance boundaries", () => {
       definePlugin({
         id: "atomic-provider",
         provides: [Echo, Hidden] as const,
-        startup: "required" as const,
         setup(ctx) {
           ctx.handle(Echo, (request) => ({ result: request.value }));
           ctx.handle(Hidden, (request) => ({ result: request.value }));
@@ -319,7 +317,6 @@ describe("WebLoom v4 acceptance boundaries", () => {
       definePlugin({
         id: "handler-peer-provider",
         provides: [Echo] as const,
-        startup: "required" as const,
         setup(ctx) {
           ctx.handle(Echo, (request, call) => {
             handlerPeer = call.peer;
@@ -739,13 +736,11 @@ describe("WebLoom v4 acceptance boundaries", () => {
       definePlugin({
         id: "public-provider",
         provides: [Echo] as const,
-        startup: "required" as const,
         setup(ctx) { ctx.handle(Echo, (request) => ({ result: request.value })); },
       }),
       definePlugin({
         id: "private-provider",
         provides: [Hidden] as const,
-        startup: "required" as const,
         setup(ctx) { ctx.handle(Hidden, (request) => ({ result: request.value })); },
       }),
     ], [Echo]);

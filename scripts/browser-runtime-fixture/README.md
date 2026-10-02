@@ -16,5 +16,13 @@ The separate `pnpm run test:ablation` command runs the temporary-copy AT-22
 baseline/mutation/restoration probes for cancel, deadline, service-instance
 filtering, directory validation, and synchronous revoke.
 
+`plugin-consumer.html` is a second entry of the same production build (both HTML
+files are declared in `vite.config.mjs`). It renders real plugin UI through
+`PluginConsumerProvider` and covers dynamic page registration, a static home
+contribution, a provider-shared Picker, and the negative cases: undeclared
+capability, forged consumer, App hook inside a plugin subtree, and a plugin that
+uses the built-in resource registry without declaring it. Its result object
+`window.__WEBLOOM_PCB_RESULT__` is asserted by the runner.
+
 The runner must report `unsupported` when Playwright or a Chromium binary is not
 available. It must not fall back to Node or a same-page `MessageChannel`.

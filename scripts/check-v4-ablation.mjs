@@ -36,8 +36,10 @@ const mutations = [
   {
     name: "directory-validation",
     file: "src/runtime/runtimeProtocol.ts",
-    find: "if (value.type === RUNTIME_SNAPSHOT_TYPE) return validateSnapshot(value);",
-    replace: "if (value.type === RUNTIME_SNAPSHOT_TYPE) return true;",
+    // validateMessage 现在返回结构化结果而不是裸 boolean；消融目标是
+    // “跳过快照校验”这一机制本身，替换后必须让对应测试失败。
+    find: "if (value.type === RUNTIME_SNAPSHOT_TYPE) return { valid: validateSnapshot(value, limits) };",
+    replace: "if (value.type === RUNTIME_SNAPSHOT_TYPE) return { valid: true };",
   },
   {
     name: "revoke",

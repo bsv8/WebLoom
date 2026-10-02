@@ -1,6 +1,6 @@
 // WebLoom 通用资源缓存契约。
 
-import { defineCapability } from "./capability.js";
+import { defineCapability, type Capability, type CapabilityClient } from "./capability.js";
 
 /** 资源键：稳定、可比较且不含秘密的字符串元组。 */
 export type ResourceKey = readonly [resourceId: string, ...parts: readonly string[]];
@@ -22,10 +22,18 @@ export interface ResourceSnapshot<T> {
   readonly revision: number;
 }
 
-/** 资源读取上下文；只提供通用 capability 和宿主扩展属性。 */
+/**
+ * 资源读取上下文；只提供 owner 实例绑定的 typed capability 和宿主扩展属性。
+ *
+ * `capability` / `optionalCapability` 走“定义该资源的那个插件实例”的
+ * consumer，而不是页面当前的 consumer，也不是全局字符串查询；因此资源
+ * loader 只能拿到该实例已声明的能力。
+ */
 export interface ResourceContext<TAttributes extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>> {
-  /** 读取已注入的 capability；不存在时返回 undefined。 */
-  getCapability<T>(id: string): T | undefined;
+  /** 按 typed 契约读取 owner 实例已声明的能力；未声明或实例已撤销时抛错。 */
+  capability<C extends Capability>(capability: C): CapabilityClient<C>;
+  /** 同上，但已声明且当前缺席时返回 undefined；未声明/版本不符仍抛错。 */
+  optionalCapability<C extends Capability>(capability: C): CapabilityClient<C> | undefined;
   /** 资源定义所属的插件实例标识；由注册表绑定，插件不能伪造。 */
   readonly ownerId: string;
   /** 宿主绑定的当前作用域属性；资源定义不能写入。 */

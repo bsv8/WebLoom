@@ -29,7 +29,11 @@ export function createFakeRuntimeTransport(): RuntimeTransport & {
   };
 }
 
-/** 创建测试 Host；生产 Host 的 parser/lifecycle 路径保持不变。 */
+/**
+ * 创建测试 Host；生产 Host 的 parser/lifecycle 路径保持不变。
+ *
+ * 新模型没有启停配置存储，因此这里不再注入任何用户意图初值。
+ */
 export function createFakePluginHost(options: CreatePluginHostOptions = {}): PluginHost {
-  return createPluginHost({ ...options, initialPluginConfig: options.initialPluginConfig ?? {} });
+  return createPluginHost(options);
 }
