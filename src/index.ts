@@ -25,3 +25,6 @@ export { RuntimeInitializationError, RuntimeUnavailableError } from "./runtime/r
 
 export { createMessageBus } from "./messaging/messageBus.js";
 export { createLifecycleScope, createResourceScope } from "./lifecycle/resourceScope.js";
+
+export { defineDaemonBridge, daemonRpcBinding } from "./runtime/daemonPlugin.js";
+export type { DaemonTransport, DaemonRpcBinding } from "./runtime/daemonPlugin.js";

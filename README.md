@@ -228,3 +228,8 @@ advanced、React 和 Worker 消费者的 `tsc --noEmit` 与运行时 smoke，并
 详细 API 约束见 [`docs/api.md`](docs/api.md)；插件 UI 接入见
 [`docs/plugin-consumer-migration.md`](docs/plugin-consumer-migration.md)，服务模型与启停迁移见
 [`docs/plugin-service-migration.md`](docs/plugin-service-migration.md)。
+
+Go 后台插件入口位于 [`go/`](go/)，使用方法见
+[Go 后台与产品传输](docs/api.md#go-后台与既有产品传输)。可运行的前后台记事本
+示例分别位于 [`examples/notes/frontend.ts`](examples/notes/frontend.ts) 和
+[`go/examples/notes/main.go`](go/examples/notes/main.go)。Go module 当前未发布。

@@ -477,3 +477,30 @@ const detach = await attachRemote(app, storageHandle, "storage");
 真实浏览器验收必须使用 Bundler 产出的 SharedWorker chunk 和 Chromium；Node
 MessageChannel 单测只证明 transport simulation，不替代 Window/SharedWorker realm、多个
 页面、transfer ownership 或 Worker 退出验收。
+
+## Go 后台与既有产品传输
+
+源码中的 `go/` 是独立 Go module，导入路径为
+`github.com/bsv8/WebLoom/go/webloom`，尚未发布 Go 版本。它不是新增的 JS
+RuntimeKind；Window/SharedWorker 的既有行为不变。
+
+Go 使用 `Plugin{Manifest, Setup}` 声明单元，Manifest 中的 PluginID 是业务归属、
+UnitID 是运行单元，Provides/Dependencies 使用 `{kind,id,version}` 能力身份。
+`Start(ctx, plugins)` 在运行 Setup 前检查重复能力、缺失依赖与环，按依赖顺序启动；
+Setup 失败清理已启动实例。当前支持 local、rpc，不支持 stream 或单插件热重启。
+
+Setup 内通过 `Provide` 注册普通进程内服务、`Handle` 注册 RPC；`Service`、`RPC`
+取得已声明依赖。内部服务是受信代码协作，不是进程沙箱。`Context()` 用于取消后台
+工作，`OnDispose` 注册资源清理；两个注册方法只在 Setup 阶段使用。
+
+`Close(ctx)` 停止新调用、取消在途调用，待执行退出后逆序清理。等待超时返回错误，
+后台仍继续排空；再次 Close 可以等待同一次真实清理。取消不撤销已经发生的副作用。
+宿主停止 Runtime，插件自身不应在自己的 handler 内等待关闭整个 Runtime。
+
+Window 侧 `defineDaemonBridge({id, transport, bindings})` 返回普通插件定义，
+每个 binding 显式映射一个 typed RPC capability 到产品已有方法。transport 实现
+`call(method, request, {signal})`，负责网络、认证、重连与编码。桥接插件不自建连接，
+停止前台不会关闭后台，也不会自动把所有后台能力暴露到网络。
+
+完整调用示例见 `examples/notes/frontend.ts` 和 `go/examples/notes/main.go`。
+Go 示例的逐行 stdin/stdout JSON 仅是可运行演示传输，不是正式产品网络协议。
