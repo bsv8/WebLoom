@@ -88,8 +88,8 @@ for (const directory of sourceFiles) {
 }
 
 const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-// 0.6.0 是插件服务模型迭代的破坏性版本；低于它说明旧启停 API 还在线上。
-if (packageJson.version !== "0.6.0") violations.push(`packageJson version is ${packageJson.version}, expected 0.6.0`);
+// 当前双语言发布版本；插件服务模型的旧启停 API 由上面的边界规则拒绝。
+if (packageJson.version !== "0.6.1") violations.push(`packageJson version is ${packageJson.version}, expected 0.6.1`);
 const exports = Object.keys(packageJson.exports ?? {});
 for (const entry of [".", "./advanced", "./react", "./testing"]) if (!exports.includes(entry)) violations.push(`package.json is missing export ${entry}`);
 for (const entry of exports) if (![".", "./advanced", "./react", "./testing"].includes(entry)) violations.push(`package.json exposes non-v4 entry ${entry}`);

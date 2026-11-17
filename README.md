@@ -1,6 +1,6 @@
 # WebLoom
 
-WebLoom 是一个只面向浏览器的插件 Runtime 框架。0.6.0 管理真实的
+WebLoom 提供浏览器 TypeScript 与 Go 插件 Runtime，双语言发布版本为 0.6.1。浏览器侧管理真实的
 `window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、依赖图、
 ResourceScope、权限租约、typed capability、服务桥和资源缓存；路由、存储、日志、
 国际化等产品能力由插件或下游应用注入。
@@ -233,3 +233,7 @@ Go 后台插件入口位于 [`go/`](go/)，使用方法见
 [Go 后台与产品传输](docs/api.md#go-后台与既有产品传输)。可运行的前后台记事本
 示例分别位于 [`examples/notes/frontend.ts`](examples/notes/frontend.ts) 和
 [`go/examples/notes/main.go`](go/examples/notes/main.go)。Go module 当前未发布。
+
+## Go
+
+Go 模块为 `github.com/bsv8/WebLoom/go`，版本 `v0.6.1`（标签 `go/v0.6.1`），与 npm `webloom-framework@0.6.1` 对齐。通过 `go get github.com/bsv8/WebLoom/go@v0.6.1` 安装。支持进程内服务、RPC、依赖排序、调用取消和逆序关闭；按完整 Runtime 启停，尚不支持单插件热重启或 stream。
