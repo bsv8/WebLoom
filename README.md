@@ -1,6 +1,6 @@
 # WebLoom
 
-WebLoom 提供浏览器 TypeScript 与 Go 插件 Runtime，双语言发布版本为 0.6.1。浏览器侧管理真实的
+WebLoom 提供浏览器 TypeScript 与 Go 插件 Runtime，双语言发布版本为 0.6.2。浏览器侧管理真实的
 `window-main` 和 `shared-worker` JavaScript realm、插件运行单元、实例、依赖图、
 ResourceScope、权限租约、typed capability、服务桥和资源缓存；路由、存储、日志、
 国际化等产品能力由插件或下游应用注入。
@@ -236,4 +236,4 @@ Go 后台插件入口位于 [`go/`](go/)，使用方法见
 
 ## Go
 
-Go 模块为 `github.com/bsv8/WebLoom/go`，版本 `v0.6.1`（标签 `go/v0.6.1`），与 npm `webloom-framework@0.6.1` 对齐。通过 `go get github.com/bsv8/WebLoom/go@v0.6.1` 安装。支持进程内服务、RPC、依赖排序、调用取消和逆序关闭；按完整 Runtime 启停，尚不支持单插件热重启或 stream。
+Go 模块为 `github.com/bsv8/WebLoom/go`，版本 `v0.6.2`（标签 `go/v0.6.2`），与 npm `webloom-framework@0.6.2` 对齐；`v0.6.2` 相对 `v0.6.1` 无 Go 代码改动，仅为保持双语言版本一致。通过 `go get github.com/bsv8/WebLoom/go@v0.6.2` 安装。支持进程内服务、RPC、依赖排序、调用取消和逆序关闭；按完整 Runtime 启停，尚不支持单插件热重启或 stream。

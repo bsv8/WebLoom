@@ -477,11 +477,83 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
   const stopping = new Map<string, Promise<void>>();
   let start: (pluginId: string) => Promise<void>;
 
+  /** 明确加载批次：批次开始时固定名单，每批最多发一次。 */
+  interface LoadBatch {
+    readonly batchId: string;
+    readonly pluginIds: readonly string[];
+    settled: boolean;
+    scheduled: boolean;
+  }
+  const loadBatches = new Map<string, LoadBatch>();
+  const LOAD_SETTLED_BUS_TYPE = "webloom.plugin-load.settled";
+  const makeBatchId = (): string => {
+    try {
+      if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return `load:${crypto.randomUUID()}`;
+    } catch { /* fallback */ }
+    return `load:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
+  };
+  const loadUnitResultFor = (pluginId: string): import("../contracts/plugin.js").PluginLoadUnitResult | undefined => {
+    const record = records.get(pluginId);
+    if (!record) return { pluginId, outcome: "blocked", reason: "unknown plugin" };
+    const unitId = record.unitId ?? record.manifest.units?.[0]?.id;
+    if (record.state === "enabled") return unitId ? { pluginId, unitId, outcome: "success" } : { pluginId, outcome: "success" };
+    if (record.state === "failed") {
+      const reason = record.error ?? "plugin failed";
+      return unitId ? { pluginId, unitId, outcome: "load-failure", reason } : { pluginId, outcome: "load-failure", reason };
+    }
+    if (record.state === "blocked") {
+      const reason = record.blockedBy?.join("; ") ?? record.error ?? "blocked";
+      return unitId ? { pluginId, unitId, outcome: "blocked", reason } : { pluginId, outcome: "blocked", reason };
+    }
+    return undefined;
+  };
+  /**
+   * 结算检查只做编排，实际发出永远异步：`startLoadBatch()` 必定先返回批次标识，
+   * 调用方拿到标识之后事件才可能到达，不存在返回前同步结算漏事件的情况。
+   * 发出前复核一次终态；期间有单元离开终态则取消本次发出，等待下一次检查。
+   */
+  const settleLoadBatch = (batch: LoadBatch): void => {
+    batch.scheduled = false;
+    if (batch.settled || disposed) return;
+    const results: import("../contracts/plugin.js").PluginLoadUnitResult[] = [];
+    for (const pluginId of batch.pluginIds) {
+      const result = loadUnitResultFor(pluginId);
+      if (!result) return;
+      results.push(result);
+    }
+    batch.settled = true;
+    try { console.error("[tmp-diag] batch settled", batch.batchId, JSON.stringify(results.map(r => `${r.pluginId}:${r.outcome}`))); } catch {}
+    const detail: import("../contracts/plugin.js").PluginLoadSettledDetail = Object.freeze({
+      batchId: batch.batchId,
+      runtimeInstanceId,
+      results: Object.freeze(results),
+    });
+    // 唯一的批次结束交付路径：根 MessageBus。插件经由自己的 scoped 视图订阅，
+    // Host 不再保留另一套直接回调，避免两套并存时的顺序与去重分歧。
+    try {
+      (messageBus as MessageBus).publish(LOAD_SETTLED_BUS_TYPE, detail);
+    } catch { /* 观察者隔离：总线失败不影响批次结算。 */ }
+  };
+  const checkLoadBatches = (): void => {
+    if (loadBatches.size === 0 || disposed) return;
+    for (const batch of loadBatches.values()) {
+      if (batch.settled || batch.scheduled) continue;
+      let pending = false;
+      for (const pluginId of batch.pluginIds) {
+        if (!loadUnitResultFor(pluginId)) { pending = true; break; }
+      }
+      if (pending) continue;
+      batch.scheduled = true;
+      void Promise.resolve().then(() => settleLoadBatch(batch));
+    }
+  };
+
   const bump = (): void => {
     versionCounter += 1;
     for (const listener of [...listeners]) {
       try { listener({ version: versionCounter }); } catch { /* observers isolated */ }
     }
+    try { checkLoadBatches(); } catch { /* 批次结算失败不影响版本推进。 */ }
   };
   /**
    * consumer 变更通知与 Host 版本共用同一份状态；这里只是把 Host 的 bump
@@ -1613,6 +1685,15 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
     scope: (pluginId) => records.get(pluginId)?.scope,
     refreshRuntimeUnitSnapshots: bump,
     reconcile,
+    startLoadBatch(pluginIds) {
+      if (disposed) throw new LifecycleScopeRevokedError("Plugin host is disposed");
+      const fixed = [...new Set(pluginIds.filter((id) => typeof id === "string" && id.length > 0))];
+      const batchId = makeBatchId();
+      loadBatches.set(batchId, { batchId, pluginIds: Object.freeze(fixed), settled: false, scheduled: false });
+      try { checkLoadBatches(); } catch { /* 批次结算失败不影响批次创建。 */ }
+      return batchId;
+    },
+
     graph,
     version: () => versionCounter,
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
@@ -1881,4 +1962,12 @@ export interface PluginHost {
   inspect(): HostInspection;
   /** 解释插件或 capability。 */
   explain(target: string | CapabilityDescriptor): { readonly target: string; readonly state?: PluginStateKind; readonly reasons: readonly string[] };
+  /**
+   * 开启一轮明确的业务插件加载批次并返回批次标识。
+   *
+   * 批次开始时固定参与名单；名单内全部收敛为成功、加载失败或被阻塞后，
+   * 通过 `webloom.plugin-load.settled` 消息总线发出一次结束事件（异步交付，
+   * 必定晚于本次返回）。每批次最多发一次；重复 reconcile 不创建新批次。
+   */
+  startLoadBatch(pluginIds: readonly string[]): string;
 }

@@ -186,6 +186,11 @@ await sub.closed;
   同样按这个顺序，而不是按登记顺序倒序。共享提供者不会因为一个消费者被释放而销毁。
 - **失败与恢复分开表达**：初始化失败进入 `failed` 并保留脱敏原因，Runtime 不会因此
   失败；依赖恢复后按正向顺序建立新实例，不重放已发送的业务调用。
+- **加载批次结束事件**：`host.startLoadBatch(pluginIds)` 在调用时固定参与名单；
+  名单内全部收敛为成功（`enabled`）、加载失败（`failed`）或被阻塞（`blocked`）
+  后，通过 `host.onLoadSettled()` 与 `webloom.plugin-load.settled` 消息总线发出一次
+  `PluginLoadSettledDetail`（批次标识、运行实例标识、各单元结果与原因）。每批次最多
+  发一次；重复 `reconcile()` 不创建新批次，旧批次的迟到结果由调用方按批次标识丢弃。
 - **释放是生命周期事件**：`host.revoke(pluginId, reason)` 由可信装配层调用，记录运行
   条件（`blockedBy: ["revoked:<reason>"]`）且不自动重建；条件解除用
   `host.retry(pluginId)`。领域运行条件（锁定、账户切换）也可以通过

@@ -145,6 +145,14 @@ export interface SharedWorkerApp {
   subscribePeerLifecycle(listener: (event: PeerLifecycleEvent) => void): () => void;
   /** 可信领域在完成自己的 owner/session 交接后报告 handoff；框架不选择 owner。 */
   notifyPeerHandoff(peerId: string, handoffRevision?: number): boolean;
+  /**
+   * 开启一轮明确的业务插件加载批次并返回批次标识。
+   *
+   * 参与名单在调用时固定；名单内全部收敛为成功、加载失败或被阻塞后，
+   * 通过 `webloom.plugin-load.settled` 消息总线异步发出一次结束事件。
+   * 每批次最多发一次。
+   */
+  startLoadBatch(pluginIds: readonly string[]): string;
   dispose(reason?: string): Promise<LifecycleDisposeResult>;
 }
 
@@ -637,7 +645,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
     const failedReady = Promise.reject(failure);
     void failedReady.catch(() => undefined);
     const failedInspection = (): HostInspection => ({ runtimeId: options.id, runtimeKind: "shared-worker", runtimeInstanceId, version: 0, pluginCount: 0, peerCount: endpoints.size, pendingCallCount: 0, activeStreamCount: 0, plugins: [] });
-    return { runtimeKind: "shared-worker", runtimeId: options.id, runtimeInstanceId, ready: () => failedReady, reconcile: async () => failedReady, state: localSnapshot, subscribe(listener) { listeners.add(listener); listener(localSnapshot()); return () => listeners.delete(listener); }, inspect: failedInspection, activePeers: () => Object.freeze([]), subscribePeerLifecycle(listener) { peerLifecycleListeners.add(listener); return () => peerLifecycleListeners.delete(listener); }, notifyPeerHandoff: () => false, dispose: async () => ({ scopeId: `runtime:${runtimeInstanceId}`, state: "stopped", attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }) };
+    return { runtimeKind: "shared-worker", runtimeId: options.id, runtimeInstanceId, ready: () => failedReady, reconcile: async () => failedReady, state: localSnapshot, subscribe(listener) { listeners.add(listener); listener(localSnapshot()); return () => listeners.delete(listener); }, inspect: failedInspection, activePeers: () => Object.freeze([]), subscribePeerLifecycle(listener) { peerLifecycleListeners.add(listener); return () => peerLifecycleListeners.delete(listener); }, notifyPeerHandoff: () => false, startLoadBatch: () => { throw new Error("SharedWorker Host is unavailable"); }, dispose: async () => ({ scopeId: `runtime:${runtimeInstanceId}`, state: "stopped", attempted: 0, released: 0, pending: [], errors: [], cleanupIncomplete: false }) };
   }
 
   const ready = host.registerAll(manifests).then(() => {
@@ -663,6 +671,7 @@ function startSharedWorkerAppInternal(options: StartSharedWorkerAppOptions & Pic
       emitPeerLifecycle({ event: "handoff", peerId, binding: endpoint.binding, state: "active", ...(handoffRevision !== undefined ? { handoffRevision } : {}) });
       return true;
     },
+    startLoadBatch(pluginIds) { if (!host) throw new Error("SharedWorker Host is unavailable"); return host.startLoadBatch(pluginIds); },
     dispose(reason = "shared worker runtime disposed") {
       if (disposePromise) return disposePromise;
       accepting = false;

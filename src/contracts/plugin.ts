@@ -389,3 +389,29 @@ export interface RuntimeUnitImplementationRegistry {
   /** 当前 realm 的 capability 定义表；静态 manifest 只含 descriptor。 */
   getCapabilities?(pluginId: string, unitId: string): readonly Capability[] | undefined;
 }
+
+/** 插件加载结果：成功、加载失败或被阻塞（依赖失败/缺失/循环等）。 */
+export type PluginLoadOutcome = "success" | "load-failure" | "blocked";
+
+/** 一个参与单元的加载结果。 */
+export interface PluginLoadUnitResult {
+  /** 插件标识。 */
+  readonly pluginId: string;
+  /** 稳定运行单元标识。 */
+  readonly unitId?: string;
+  /** 本次加载的收敛结果。 */
+  readonly outcome: PluginLoadOutcome;
+  /** 失败或阻塞原因（脱敏）。 */
+  readonly reason?: string;
+}
+
+/** 一次明确加载批次的结束事件。 */
+export interface PluginLoadSettledDetail {
+  /** 本次加载批次标识。 */
+  readonly batchId: string;
+  /** 发出事件的 Runtime 启动实例标识。 */
+  readonly runtimeInstanceId: string;
+  /** 批次开始时固定的参与名单中每个单元的最终结果。 */
+  readonly results: readonly PluginLoadUnitResult[];
+}
+
