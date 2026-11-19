@@ -522,7 +522,6 @@ export function createPluginHost(options: CreatePluginHostOptions = {}): PluginH
       results.push(result);
     }
     batch.settled = true;
-    try { console.error("[tmp-diag] batch settled", batch.batchId, JSON.stringify(results.map(r => `${r.pluginId}:${r.outcome}`))); } catch {}
     const detail: import("../contracts/plugin.js").PluginLoadSettledDetail = Object.freeze({
       batchId: batch.batchId,
       runtimeInstanceId,
