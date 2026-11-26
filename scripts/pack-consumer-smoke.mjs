@@ -94,7 +94,7 @@ function installConsumer(directory, packageName, dependencies, devDependencies =
       ...devDependencies,
     },
   });
-  execFileSync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], {
+  execFileSync("pnpm", ["install", "--ignore-scripts", "--no-frozen-lockfile"], {
     cwd: directory,
     stdio: "inherit",
   });
@@ -143,51 +143,52 @@ function isLocalAbsolutePath(value) {
 
 function assertPackMetadata(packInfo, tarball) {
   if (!packInfo || packInfo.name !== "webloom-framework") {
-    throw new Error(`npm pack 返回了意外的包名：${packInfo?.name ?? "<unknown>"}`);
+    throw new Error(`pnpm pack 返回了意外的包名：${packInfo?.name ?? "<unknown>"}`);
   }
   if (!Array.isArray(packInfo.files) || packInfo.files.length === 0) {
-    throw new Error("npm pack 没有返回文件清单");
+    throw new Error("pnpm pack 没有返回文件清单");
   }
 
   const paths = packInfo.files.map((file) => file?.path);
   const pathSet = new Set(paths);
   if (paths.some((path) => typeof path !== "string" || path.length === 0)) {
-    throw new Error("npm pack 文件清单包含无效路径");
+    throw new Error("pnpm pack 文件清单包含无效路径");
   }
   if (pathSet.size !== paths.length) {
-    throw new Error("npm pack 文件清单包含重复路径");
+    throw new Error("pnpm pack 文件清单包含重复路径");
   }
   for (const path of paths) {
     if (isAbsolute(path) || path.includes("\\") || path.split("/").includes("..")) {
-      throw new Error(`npm pack 文件路径不是安全的相对路径：${path}`);
+      throw new Error(`pnpm pack 文件路径不是安全的相对路径：${path}`);
     }
     if (!allowedPackFiles.some((pattern) => pattern.test(path))) {
-      throw new Error(`npm pack 包含未列入白名单的文件：${path}`);
+      throw new Error(`pnpm pack 包含未列入白名单的文件：${path}`);
     }
   }
   for (const required of requiredPackFiles) {
-    if (!pathSet.has(required)) throw new Error(`npm pack 缺少必需文件：${required}`);
+    if (!pathSet.has(required)) throw new Error(`pnpm pack 缺少必需文件：${required}`);
   }
   if (!paths.some((path) => /^dist\/chunk-[A-Za-z0-9_-]+\.js$/.test(path))) {
-    throw new Error("npm pack 缺少 tsup 共享 JavaScript chunk");
+    throw new Error("pnpm pack 缺少 tsup 共享 JavaScript chunk");
   }
 
   for (const file of packInfo.files) {
-    if (typeof file.size === "number" && file.size > maxPackedFileBytes) {
-      throw new Error(`npm pack 单文件超过体积上限：${file.path} (${file.size} bytes)`);
+    const filePath = resolve(packageRoot, file.path);
+    const size = statSync(filePath).size;
+    if (size > maxPackedFileBytes) {
+      throw new Error(`pnpm pack 单文件超过体积上限：${file.path} (${size} bytes)`);
     }
   }
   const tarballBytes = statSync(tarball).size;
-  const metadataPackedBytes = Number(packInfo.size);
-  const unpackedBytes = Number(packInfo.unpackedSize);
-  if (!Number.isFinite(metadataPackedBytes) || metadataPackedBytes !== tarballBytes) {
-    throw new Error(`npm pack 元数据与实际 tarball 体积不一致：${packInfo.size} / ${tarballBytes} bytes`);
-  }
+  const unpackedBytes = packInfo.files.reduce(
+    (total, file) => total + statSync(resolve(packageRoot, file.path)).size,
+    0,
+  );
   if (tarballBytes > maxTarballBytes) {
-    throw new Error(`npm pack tarball 超过体积上限：${tarballBytes} bytes`);
+    throw new Error(`pnpm pack tarball 超过体积上限：${tarballBytes} bytes`);
   }
   if (!Number.isFinite(unpackedBytes) || unpackedBytes > maxUnpackedBytes) {
-    throw new Error(`npm pack 解包内容超过体积上限：${packInfo.unpackedSize} bytes`);
+    throw new Error(`pnpm pack 解包内容超过体积上限：${unpackedBytes} bytes`);
   }
   console.log(`tarball gate passed: ${paths.length} files, ${tarballBytes} packed bytes, ${unpackedBytes} unpacked bytes`);
   return paths;
@@ -238,10 +239,11 @@ function assertPackedGeneratedFiles(packageDirectory, paths) {
 try {
   const packDirectory = join(smokeRoot, "pack");
   mkdirSync(packDirectory);
-  const packOutput = execFileSync("npm", [
+  const packOutput = execFileSync("pnpm", [
+    "--config.ignore-scripts=true",
     "pack",
     "--json",
-    "--ignore-scripts",
+    "--skip-manifest-obfuscation",
     "--pack-destination",
     packDirectory,
   ], {
@@ -252,17 +254,19 @@ try {
   try {
     packResults = JSON.parse(packOutput);
   } catch (error) {
-    throw new Error(`无法解析 npm pack --json 输出：${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`无法解析 pnpm pack --json 输出：${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!Array.isArray(packResults) || packResults.length !== 1) {
-    throw new Error("npm pack --json 必须返回一个包结果");
+  const packInfo = Array.isArray(packResults)
+    ? packResults.length === 1 ? packResults[0] : undefined
+    : packResults;
+  if (!packInfo || typeof packInfo !== "object") {
+    throw new Error("pnpm pack --json 必须返回一个包结果");
   }
-  const packInfo = packResults[0];
   const tarballName = typeof packInfo.filename === "string"
-    ? packInfo.filename
+    ? basename(packInfo.filename)
     : readdirSync(packDirectory).find((name) => name.endsWith(".tgz"));
   if (!tarballName || basename(tarballName) !== tarballName) {
-    throw new Error("npm pack 没有生成安全的 WebLoom tarball 文件名");
+    throw new Error("pnpm pack 没有生成安全的 WebLoom tarball 文件名");
   }
   const tarball = join(packDirectory, tarballName);
   const packPaths = assertPackMetadata(packInfo, tarball);

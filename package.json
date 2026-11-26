@@ -54,7 +54,7 @@
     "test:browser": "pnpm run test:browser:install && node scripts/real-browser-runtime-smoke.mjs",
     "test:ablation": "node scripts/check-v4-ablation.mjs",
     "prepack": "pnpm test:types && pnpm test && pnpm build && pnpm lint:boundaries && pnpm lint:v4",
-    "pack": "npm pack",
+    "pack": "pnpm pack",
     "pack:consumer": "pnpm run prepack && node scripts/pack-consumer-smoke.mjs"
   },
   "peerDependencies": {
